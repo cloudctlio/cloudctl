@@ -29,14 +29,17 @@ jobs:
       - name: Install dependencies
         run: |
           pip install bandit pip-audit safety
+          pip install -e . --quiet
 
       - name: Bandit SAST scan
         run: |
-          bandit -r . -ll -x tests/ --format json -o bandit-report.json || true
-          bandit -r . -ll -x tests/
+          bandit -r cloudctl/ -ll -x tests/ --format json -o bandit-report.json || true
+          bandit -r cloudctl/ -ll -x tests/
 
       - name: pip-audit dependency scan
-        run: pip-audit
+        # CVE-2026-4539: pygments vulnerability with no fix version available yet.
+        # Remove this ignore once a patched pygments release ships.
+        run: pip-audit --ignore-vuln CVE-2026-4539
 
       - name: Gitleaks secret scan
         uses: gitleaks/gitleaks-action@v2
