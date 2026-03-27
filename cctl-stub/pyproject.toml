@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cctl"
+version = "0.1.0"
+description = "Universal cloud CLI — one command for AWS, Azure, and GCP"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Harish Guttikonda", email = "cloudctlhq@gmail.com" }
+]
+keywords = [
+    "cloud", "cli", "aws", "azure", "gcp",
+    "multicloud", "devops", "sre", "cloudctl"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+
+# Minimal dependencies for stub — full deps added in v0.2.0
+dependencies = []
+
+[project.scripts]
+cloudctl = "cctl.main:main"
+
+[project.urls]
+Homepage   = "https://github.com/cloudctlio/cloudctl"
+Repository = "https://github.com/cloudctlio/cloudctl"
+Issues     = "https://github.com/cloudctlio/cloudctl/issues"
+Changelog  = "https://github.com/cloudctlio/cloudctl/releases"
