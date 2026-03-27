@@ -1,0 +1,63 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install bandit pip-audit safety
+          pip install -e . --quiet
+
+      - name: Bandit SAST scan
+        run: |
+          bandit -r cloudctl/ -ll -x tests/ --format json -o bandit-report.json || true
+          bandit -r cloudctl/ -ll -x tests/
+
+      - name: pip-audit dependency scan
+        # CVE-2026-4539: pygments vulnerability with no fix version available yet.
+        # Remove this ignore once a patched pygments release ships.
+        run: pip-audit --ignore-vuln CVE-2026-4539
+
+      - name: Gitleaks secret scan
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz | tar -xz
+          ./gitleaks detect --source . --verbose --redact
+
+      - name: Semgrep SAST
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/secrets
+            p/owasp-top-ten
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
