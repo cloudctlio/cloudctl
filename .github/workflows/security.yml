@@ -33,7 +33,7 @@ jobs:
 
       - name: Bandit SAST scan
         run: |
-          bandit -r cloudctl/ -ll -x tests/ --format json -o bandit-report.json || true
+          bandit -r cloudctl/ -ll -x tests/ --format json -o /tmp/bandit-report.json || true
           bandit -r cloudctl/ -ll -x tests/
 
       - name: pip-audit dependency scan
@@ -60,4 +60,4 @@ jobs:
         with:
           name: security-reports
           path: |
-            bandit-report.json
+            /tmp/bandit-report.json

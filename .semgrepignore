@@ -1,0 +1,11 @@
+# Generated reports — not source code
+bandit-report.json
+*.json
+*.lock
+
+# Dependencies and environment
+.venv/
+node_modules/
+
+# Git internals
+.git/
