@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main, develop]
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: "0 6 * * 1" # Every Monday 6 AM — weekly full scan
 
 jobs:
   security:
@@ -19,34 +19,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # full history required for Gitleaks + SonarQube
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install bandit pip-audit safety
-          pip install -e . --quiet
+      - name: Install tools
+        run: pip install bandit pip-audit safety
 
-      - name: Bandit SAST scan
+      # ── 1. SAST — Bandit (Python-specific, fast) ──────────────
+      - name: Bandit SAST
         run: |
-          bandit -r cloudctl/ -ll -x tests/ --format json -o /tmp/bandit-report.json || true
+          bandit -r cloudctl/ -ll -x tests/ -f json -o bandit.json || true
           bandit -r cloudctl/ -ll -x tests/
 
-      - name: pip-audit dependency scan
-        # CVE-2026-4539: pygments vulnerability with no fix version available yet.
-        # Remove this ignore once a patched pygments release ships.
-        run: pip-audit --ignore-vuln CVE-2026-4539
-
-      - name: Gitleaks secret scan
-        run: |
-          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz | tar -xz
-          ./gitleaks detect --source . --verbose --redact
-
-      - name: Semgrep SAST
+      # ── 2. SAST — Semgrep (OWASP Top 10, runs on all branches) ──
+      - name: Semgrep
         uses: semgrep/semgrep-action@v1
         with:
           config: >-
@@ -54,10 +44,55 @@ jobs:
             p/secrets
             p/owasp-top-ten
 
+      # ── 3. SAST — SonarQube (main branch only — free tier limit) ─
+      - name: SonarQube Scan
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # ── 4. Dependencies — pip-audit
+      - name: pip-audit dependency scan
+        # CVE-2026-4539: pygments vulnerability with no fix version available yet.
+        # Remove this ignore once a patched pygments release ships.
+        run: pip-audit --ignore-vuln CVE-2026-4539
+
+      # ── 5. Dependencies — Safety
+      - name: Safety
+        run: safety check --json -o safety.json || true
+
+      # ── 6. Secrets — Gitleaks
+      - name: Gitleaks secret scan
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz | tar -xz
+          ./gitleaks detect --source . --verbose --redact
+
+      # ── 7. Image — Trivy (filesystem + IaC + containers) ──────
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.24.0
+        with:
+          scan-type: fs
+          scan-ref: "."
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # ── 8. IaC — Checkov (Terraform/CDK/Dockerfile) ───────────
+      - name: Checkov IaC scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra/
+          framework: cloudformation,dockerfile,terraform
+          soft_fail: true
+
+      # ── Upload all reports as artifacts ───────────────────────
       - name: Upload security reports
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: security-reports
+          name: security-reports-${{ github.run_number }}
           path: |
-            /tmp/bandit-report.json
+            bandit.json
+            pip-audit.json
+            safety.json
+          retention-days: 30
