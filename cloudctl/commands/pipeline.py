@@ -40,7 +40,7 @@ def pipeline_list(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Azure DevOps Pipelines coming in Day 8.")
+        warn("[Azure] Azure DevOps Pipelines require AZURE_DEVOPS_ORG_URL + AZURE_DEVOPS_PAT — coming in Day 9.")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
         warn("[GCP] Cloud Build coming in Day 10.")

@@ -32,6 +32,35 @@ try:
 except ImportError:
     _MYSQL_AVAILABLE = False
 
+try:
+    from azure.mgmt.monitor import MonitorManagementClient
+    _MONITOR_AVAILABLE = True
+except ImportError:
+    _MONITOR_AVAILABLE = False
+
+try:
+    from azure.mgmt.servicebus import ServiceBusManagementClient
+    _SERVICEBUS_AVAILABLE = True
+except ImportError:
+    _SERVICEBUS_AVAILABLE = False
+
+try:
+    from azure.mgmt.eventhub import EventHubManagementClient
+    _EVENTHUB_AVAILABLE = True
+except ImportError:
+    _EVENTHUB_AVAILABLE = False
+
+try:
+    import datetime
+    from azure.mgmt.costmanagement import CostManagementClient
+    from azure.mgmt.costmanagement.models import (
+        QueryDefinition, QueryTimePeriod, QueryDataset,
+        QueryAggregation, QueryGrouping,
+    )
+    _COST_AVAILABLE = True
+except ImportError:
+    _COST_AVAILABLE = False
+
 
 class AzureProvider(CloudProvider):
     """Azure provider — uses credentials from `az login`."""
@@ -286,3 +315,156 @@ class AzureProvider(CloudProvider):
 
     def describe_database(self, account: str, db_id: str, region: Optional[str] = None) -> DatabaseResource:
         raise NotImplementedError("Use list_databases() to find the database first")
+
+    # ── Cost ─────────────────────────────────────────────────────────────────
+
+    def cost_summary(self, account: str, days: int = 30) -> list[dict]:
+        """Return monthly cost totals for the last N days via Cost Management API."""
+        if not _COST_AVAILABLE:
+            return [{"account": account, "period": "—", "cost": "—", "currency": "—",
+                     "note": "Install azure-mgmt-costmanagement"}]
+        import datetime as _dt
+        results = []
+        end = _dt.datetime.utcnow()
+        start = end - _dt.timedelta(days=days)
+        for sub_id in self._subscriptions:
+            try:
+                client = CostManagementClient(self._cred)
+                scope = f"/subscriptions/{sub_id}"
+                query = QueryDefinition(
+                    type="ActualCost",
+                    timeframe="Custom",
+                    time_period=QueryTimePeriod(from_property=start, to=end),
+                    dataset=QueryDataset(
+                        granularity="Monthly",
+                        aggregation={"TotalCost": QueryAggregation(name="Cost", function="Sum")},
+                    ),
+                )
+                result = client.query.usage(scope, query)
+                col_names = [c["name"] for c in (result.columns or [])]
+                cost_idx = col_names.index("Cost") if "Cost" in col_names else 0
+                curr_idx = col_names.index("Currency") if "Currency" in col_names else 1
+                period_idx = next((i for i, n in enumerate(col_names)
+                                   if "Month" in n or "Date" in n), 2)
+                for row in (result.rows or []):
+                    results.append({
+                        "account": account,
+                        "period": str(row[period_idx])[:7],
+                        "cost": f"{float(row[cost_idx]):.2f}",
+                        "currency": str(row[curr_idx]),
+                    })
+            except Exception:
+                pass
+        return results
+
+    def cost_by_service(self, account: str, days: int = 30) -> list[dict]:
+        """Return cost breakdown by Azure service for the last N days."""
+        if not _COST_AVAILABLE:
+            return [{"account": account, "service": "—", "period": "—", "cost": "—",
+                     "note": "Install azure-mgmt-costmanagement"}]
+        import datetime as _dt
+        results = []
+        end = _dt.datetime.utcnow()
+        start = end - _dt.timedelta(days=days)
+        for sub_id in self._subscriptions:
+            try:
+                client = CostManagementClient(self._cred)
+                scope = f"/subscriptions/{sub_id}"
+                query = QueryDefinition(
+                    type="ActualCost",
+                    timeframe="Custom",
+                    time_period=QueryTimePeriod(from_property=start, to=end),
+                    dataset=QueryDataset(
+                        granularity="None",
+                        aggregation={"TotalCost": QueryAggregation(name="Cost", function="Sum")},
+                        grouping=[QueryGrouping(type="Dimension", name="ServiceName")],
+                    ),
+                )
+                result = client.query.usage(scope, query)
+                col_names = [c["name"] for c in (result.columns or [])]
+                cost_idx = col_names.index("Cost") if "Cost" in col_names else 0
+                svc_idx = col_names.index("ServiceName") if "ServiceName" in col_names else 1
+                for row in (result.rows or []):
+                    results.append({
+                        "account": account,
+                        "service": str(row[svc_idx]),
+                        "period": f"last {days}d",
+                        "cost": f"{float(row[cost_idx]):.2f}",
+                    })
+            except Exception:
+                pass
+        return results
+
+    # ── Monitoring ───────────────────────────────────────────────────────────
+
+    def list_monitor_alerts(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List Azure Monitor metric alert rules across all subscriptions."""
+        if not _MONITOR_AVAILABLE:
+            return [{"account": account, "name": "azure-mgmt-monitor not installed",
+                     "state": "—", "severity": "—", "region": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = MonitorManagementClient(self._cred, sub_id)
+                for alert in client.metric_alerts.list_by_subscription():
+                    if region and alert.location != region:
+                        continue
+                    results.append({
+                        "account": account,
+                        "name": alert.name,
+                        "state": "enabled" if alert.enabled else "disabled",
+                        "severity": str(alert.severity) if alert.severity is not None else "—",
+                        "region": alert.location or "global",
+                        "description": (alert.description or "")[:60],
+                    })
+            except Exception:
+                pass
+        return results
+
+    # ── Messaging ────────────────────────────────────────────────────────────
+
+    def list_service_bus_namespaces(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List Azure Service Bus namespaces."""
+        if not _SERVICEBUS_AVAILABLE:
+            return [{"account": account, "name": "azure-mgmt-servicebus not installed",
+                     "sku": "—", "state": "—", "region": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = ServiceBusManagementClient(self._cred, sub_id)
+                for ns in client.namespaces.list():
+                    if region and ns.location != region:
+                        continue
+                    results.append({
+                        "account": account,
+                        "name": ns.name,
+                        "sku": ns.sku.name if ns.sku else "—",
+                        "state": ns.status or "—",
+                        "region": ns.location or "unknown",
+                    })
+            except Exception:
+                pass
+        return results
+
+    def list_event_hub_namespaces(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List Azure Event Hub namespaces."""
+        if not _EVENTHUB_AVAILABLE:
+            return [{"account": account, "name": "azure-mgmt-eventhub not installed",
+                     "sku": "—", "state": "—", "region": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = EventHubManagementClient(self._cred, sub_id)
+                for ns in client.namespaces.list():
+                    if region and ns.location != region:
+                        continue
+                    results.append({
+                        "account": account,
+                        "name": ns.name,
+                        "sku": ns.sku.name if ns.sku else "—",
+                        "state": ns.status or "—",
+                        "region": ns.location or "unknown",
+                    })
+            except Exception:
+                pass
+        return results

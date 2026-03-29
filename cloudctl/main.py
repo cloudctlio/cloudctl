@@ -15,6 +15,8 @@ from cloudctl.commands import cost as cost_cmd
 from cloudctl.commands import database as database_cmd
 from cloudctl.commands import iam as iam_cmd
 from cloudctl.commands import network as network_cmd
+from cloudctl.commands import messaging as messaging_cmd
+from cloudctl.commands import monitoring as monitoring_cmd
 from cloudctl.commands import pipeline as pipeline_cmd
 from cloudctl.commands import security as security_cmd
 from cloudctl.commands import storage as storage_cmd
@@ -37,6 +39,8 @@ app.add_typer(iam_cmd.app, name="iam")
 app.add_typer(cost_cmd.app, name="cost")
 app.add_typer(security_cmd.app, name="security")
 app.add_typer(pipeline_cmd.app, name="pipeline")
+app.add_typer(monitoring_cmd.app, name="monitoring")
+app.add_typer(messaging_cmd.app, name="messaging")
 app.add_typer(config_cmd.app, name="config")
 
 
