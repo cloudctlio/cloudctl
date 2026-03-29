@@ -5,7 +5,7 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, require_init
+from cloudctl.commands._helpers import console, get_aws_provider, get_azure_provider, require_init
 from cloudctl.output.formatter import cloud_label, print_table, warn
 
 app = typer.Typer(help="Security posture checks across cloud accounts.")
@@ -41,7 +41,16 @@ def security_audit(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Defender for Cloud audit coming in Day 7.")
+        try:
+            for f in get_azure_provider(account).security_audit(account=account or "azure"):
+                color = _SEVERITY_COLOR.get(f["severity"], "")
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": f["account"],
+                    "Severity": f"[{color}]{f['severity']}[/{color}]",
+                    "Resource": f["resource"], "Issue": f["issue"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
         warn("[GCP] Security Command Center audit coming in Day 9.")
@@ -75,7 +84,14 @@ def security_public_resources(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Public resource check coming in Day 7.")
+        try:
+            for r in get_azure_provider(account).list_public_resources(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": r["account"],
+                    "Type": r["type"], "ID": r["id"], "Region": r["region"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
         warn("[GCP] Public resource check coming in Day 9.")

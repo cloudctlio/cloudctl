@@ -32,6 +32,36 @@ try:
 except ImportError:
     _MYSQL_AVAILABLE = False
 
+try:
+    from azure.mgmt.network import NetworkManagementClient
+    _NETWORK_AVAILABLE = True
+except ImportError:
+    _NETWORK_AVAILABLE = False
+
+try:
+    from azure.mgmt.authorization import AuthorizationManagementClient
+    _AUTH_AVAILABLE = True
+except ImportError:
+    _AUTH_AVAILABLE = False
+
+try:
+    from azure.mgmt.keyvault import KeyVaultManagementClient
+    _KEYVAULT_AVAILABLE = True
+except ImportError:
+    _KEYVAULT_AVAILABLE = False
+
+try:
+    from azure.mgmt.msi import ManagedServiceIdentityClient
+    _MSI_AVAILABLE = True
+except ImportError:
+    _MSI_AVAILABLE = False
+
+try:
+    from azure.mgmt.security import SecurityCenter
+    _SECURITY_AVAILABLE = True
+except ImportError:
+    _SECURITY_AVAILABLE = False
+
 
 class AzureProvider(CloudProvider):
     """Azure provider — uses credentials from `az login`."""
@@ -286,3 +316,227 @@ class AzureProvider(CloudProvider):
 
     def describe_database(self, account: str, db_id: str, region: Optional[str] = None) -> DatabaseResource:
         raise NotImplementedError("Use list_databases() to find the database first")
+
+    # ── Network ──────────────────────────────────────────────────────────────
+
+    def list_vnets(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List Azure Virtual Networks across all subscriptions."""
+        if not _NETWORK_AVAILABLE:
+            return [{"account": account, "id": "—", "name": "azure-mgmt-network not installed",
+                     "cidr": "—", "state": "—", "default": False, "region": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = NetworkManagementClient(self._cred, sub_id)
+                for vnet in client.virtual_networks.list_all():
+                    if region and vnet.location != region:
+                        continue
+                    prefixes = vnet.address_space.address_prefixes if vnet.address_space else []
+                    results.append({
+                        "account": account,
+                        "id": vnet.id or vnet.name,
+                        "name": vnet.name,
+                        "cidr": ", ".join(prefixes) if prefixes else "—",
+                        "state": "available",
+                        "default": False,
+                        "region": vnet.location or "unknown",
+                    })
+            except Exception:
+                pass
+        return results
+
+    def list_nsgs(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List Azure Network Security Groups across all subscriptions."""
+        if not _NETWORK_AVAILABLE:
+            return [{"account": account, "id": "—", "name": "azure-mgmt-network not installed",
+                     "vpc_id": "—", "inbound_rules": 0, "outbound_rules": 0, "region": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = NetworkManagementClient(self._cred, sub_id)
+                for nsg in client.network_security_groups.list_all():
+                    if region and nsg.location != region:
+                        continue
+                    inbound = sum(
+                        1 for r in (nsg.security_rules or []) if r.direction == "Inbound"
+                    )
+                    outbound = sum(
+                        1 for r in (nsg.security_rules or []) if r.direction == "Outbound"
+                    )
+                    results.append({
+                        "account": account,
+                        "id": nsg.id or nsg.name,
+                        "name": nsg.name,
+                        "vpc_id": "—",
+                        "inbound_rules": inbound,
+                        "outbound_rules": outbound,
+                        "region": nsg.location or "unknown",
+                    })
+            except Exception:
+                pass
+        return results
+
+    # ── IAM ──────────────────────────────────────────────────────────────────
+
+    def list_rbac_assignments(self, account: str) -> list[dict]:
+        """List RBAC role assignments across all subscriptions."""
+        if not _AUTH_AVAILABLE:
+            return [{"account": account, "name": "azure-mgmt-authorization not installed",
+                     "id": "—", "path": "—", "created": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = AuthorizationManagementClient(self._cred, sub_id)
+                # Build role definition name map to avoid per-assignment API calls
+                role_map: dict[str, str] = {}
+                try:
+                    for rd in client.role_definitions.list(scope=f"/subscriptions/{sub_id}"):
+                        if rd.name and rd.role_name:
+                            role_map[rd.name] = rd.role_name
+                except Exception:
+                    pass
+                for assignment in client.role_assignments.list_for_subscription():
+                    role_def_uuid = (assignment.role_definition_id or "").split("/")[-1]
+                    role_name = role_map.get(role_def_uuid, role_def_uuid or "—")
+                    results.append({
+                        "account": account,
+                        "name": role_name,
+                        "id": assignment.principal_id or "—",
+                        "path": assignment.scope or "—",
+                        "created": str(assignment.created_on)[:10] if assignment.created_on else "—",
+                    })
+            except Exception:
+                pass
+        return results
+
+    def list_key_vaults(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List Azure Key Vaults across all subscriptions."""
+        if not _KEYVAULT_AVAILABLE:
+            return [{"account": account, "name": "azure-mgmt-keyvault not installed",
+                     "id": "—", "sku": "—", "uri": "—", "region": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = KeyVaultManagementClient(self._cred, sub_id)
+                for vault_ref in client.vaults.list():
+                    _, rg, name = self._parse_arm_id(vault_ref.id)
+                    if region:
+                        # vault_ref only has id/name/type/location — check location
+                        if hasattr(vault_ref, "location") and vault_ref.location != region:
+                            continue
+                    try:
+                        vault = client.vaults.get(rg, name)
+                        sku = vault.properties.sku.name if vault.properties and vault.properties.sku else "—"
+                        uri = vault.properties.vault_uri if vault.properties else "—"
+                        loc = vault.location or "unknown"
+                    except Exception:
+                        sku, uri, loc = "—", "—", "unknown"
+                    results.append({
+                        "account": account,
+                        "name": name,
+                        "id": vault_ref.id or name,
+                        "sku": sku,
+                        "uri": uri,
+                        "region": loc,
+                    })
+            except Exception:
+                pass
+        return results
+
+    def list_managed_identities(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List user-assigned managed identities across all subscriptions."""
+        if not _MSI_AVAILABLE:
+            return [{"account": account, "username": "azure-mgmt-msi not installed",
+                     "id": "—", "created": "—", "last_login": "—"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = ManagedServiceIdentityClient(self._cred, sub_id)
+                for identity in client.user_assigned_identities.list_by_subscription():
+                    if region and identity.location != region:
+                        continue
+                    results.append({
+                        "account": account,
+                        "username": identity.name,
+                        "id": identity.client_id or identity.principal_id or "—",
+                        "created": "—",
+                        "last_login": "—",
+                    })
+            except Exception:
+                pass
+        return results
+
+    # ── Security ─────────────────────────────────────────────────────────────
+
+    def security_audit(self, account: str) -> list[dict]:
+        """Run Defender for Cloud assessments and return unhealthy findings."""
+        if not _SECURITY_AVAILABLE:
+            return [{"account": account, "severity": "INFO",
+                     "resource": "azure-mgmt-security",
+                     "issue": "Install azure-mgmt-security for Defender for Cloud checks"}]
+        results = []
+        for sub_id in self._subscriptions:
+            try:
+                client = SecurityCenter(self._cred, sub_id)
+                for assessment in client.assessments.list(scope=f"/subscriptions/{sub_id}"):
+                    if not assessment.status or assessment.status.code != "Unhealthy":
+                        continue
+                    severity = "MEDIUM"
+                    try:
+                        meta = client.assessments_metadata.get(assessment_name=assessment.name)
+                        if meta and meta.severity:
+                            severity = str(meta.severity).upper()
+                    except Exception:
+                        pass
+                    resource_id = ""
+                    if hasattr(assessment, "resource_details") and assessment.resource_details:
+                        resource_id = getattr(assessment.resource_details, "id", "") or ""
+                    results.append({
+                        "account": account,
+                        "severity": severity,
+                        "resource": resource_id or assessment.name,
+                        "issue": assessment.display_name or assessment.name,
+                    })
+            except Exception:
+                pass
+        return results
+
+    def list_public_resources(self, account: str) -> list[dict]:
+        """List publicly accessible Azure resources (public blobs, open NSGs)."""
+        results = []
+        for sub_id in self._subscriptions:
+            # Public storage accounts (blob public access enabled)
+            try:
+                storage_client = StorageManagementClient(self._cred, sub_id)
+                for sa in storage_client.storage_accounts.list():
+                    if sa.allow_blob_public_access:
+                        results.append({
+                            "account": account,
+                            "type": "Storage Account (Public Blob)",
+                            "id": sa.name,
+                            "region": sa.location or "unknown",
+                        })
+            except Exception:
+                pass
+            # NSGs with open inbound rules (any port from internet)
+            if _NETWORK_AVAILABLE:
+                try:
+                    net_client = NetworkManagementClient(self._cred, sub_id)
+                    for nsg in net_client.network_security_groups.list_all():
+                        for rule in (nsg.security_rules or []):
+                            if (
+                                rule.access == "Allow"
+                                and rule.direction == "Inbound"
+                                and rule.source_address_prefix in ("*", "Internet", "0.0.0.0/0")
+                                and rule.destination_port_range in ("*", "0-65535")
+                            ):
+                                results.append({
+                                    "account": account,
+                                    "type": f"NSG (Open Rule: {rule.name})",
+                                    "id": nsg.name,
+                                    "region": nsg.location or "unknown",
+                                })
+                                break
+                except Exception:
+                    pass
+        return results

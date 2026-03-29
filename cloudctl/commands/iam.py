@@ -5,7 +5,7 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, require_init
+from cloudctl.commands._helpers import console, get_aws_provider, get_azure_provider, require_init
 from cloudctl.output.formatter import cloud_label, error, print_table, warn
 
 app = typer.Typer(help="Inspect IAM roles, users, and permissions.")
@@ -38,7 +38,15 @@ def iam_roles(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] RBAC listing coming in Day 7 — azure IAM commands not yet implemented.")
+        try:
+            for role in get_azure_provider(account).list_rbac_assignments(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": role["account"],
+                    "Name": role["name"], "ID": role["id"],
+                    "Path": role["path"], "Created": role["created"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
         warn("[GCP] IAM listing coming in Day 9 — gcp IAM commands not yet implemented.")
@@ -46,7 +54,7 @@ def iam_roles(
     if not rows:
         console.print("[dim]No roles found.[/dim]")
         return
-    print_table(rows, title=f"IAM Roles ({len(rows)})")
+    print_table(rows, title=f"IAM Roles / RBAC Assignments ({len(rows)})")
 
 
 @app.command("users")
@@ -54,7 +62,7 @@ def iam_users(
     cloud:   str           = _CLOUD,
     account: Optional[str] = _ACCOUNT,
 ) -> None:
-    """List IAM users / service principals."""
+    """List IAM users / managed identities / service principals."""
     cfg = require_init()
     rows: list[dict] = []
 
@@ -73,7 +81,15 @@ def iam_users(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Managed Identities listing coming in Day 7.")
+        try:
+            for identity in get_azure_provider(account).list_managed_identities(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": identity["account"],
+                    "Username": identity["username"], "ID": identity["id"],
+                    "Created": identity["created"], "Last Login": identity["last_login"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
         warn("[GCP] Service Accounts listing coming in Day 9.")
@@ -81,7 +97,33 @@ def iam_users(
     if not rows:
         console.print("[dim]No users found.[/dim]")
         return
-    print_table(rows, title=f"IAM Users ({len(rows)})")
+    print_table(rows, title=f"IAM Users / Managed Identities ({len(rows)})")
+
+
+@app.command("key-vaults")
+def iam_key_vaults(
+    account: Optional[str] = _ACCOUNT,
+    region:  Optional[str] = typer.Option(None, "--region", "-r", help="Region / location to query"),
+) -> None:
+    """List Azure Key Vaults. Azure only."""
+    try:
+        vaults = get_azure_provider(account).list_key_vaults(account=account or "azure", region=region)
+    except Exception as e:
+        error(str(e))
+        raise typer.Exit(1)
+
+    if not vaults:
+        console.print("[dim]No Key Vaults found.[/dim]")
+        return
+    rows = [
+        {
+            "Cloud": cloud_label("azure"), "Account": v["account"],
+            "Name": v["name"], "SKU": v["sku"],
+            "URI": v["uri"], "Region": v["region"],
+        }
+        for v in vaults
+    ]
+    print_table(rows, title=f"Key Vaults ({len(rows)})")
 
 
 @app.command("check")
