@@ -5,10 +5,16 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, get_azure_provider, require_init
+from cloudctl.commands._helpers import (
+    console,
+    get_aws_provider,
+    get_azure_provider,
+    get_gcp_provider,
+    require_init,
+)
 from cloudctl.output.formatter import cloud_label, print_table, warn
 
-app = typer.Typer(help="View monitoring alerts and dashboards (CloudWatch, Azure Monitor).")
+app = typer.Typer(help="View monitoring alerts and dashboards (CloudWatch, Azure Monitor, Cloud Monitoring).")
 
 _CLOUD   = typer.Option("aws",  "--cloud",   "-c", help="Cloud provider: aws | azure | gcp | all")
 _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure subscription ID | GCP project ID")
@@ -43,7 +49,7 @@ def monitoring_alerts(
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         try:
-            for alert in get_azure_provider(account).list_monitor_alerts(
+            for alert in get_azure_provider(subscription_id=account).list_monitor_alerts(
                 account=account or "azure", region=region
             ):
                 rows.append({
@@ -55,7 +61,15 @@ def monitoring_alerts(
             warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Cloud Monitoring alerts coming in Day 10.")
+        try:
+            for alert in get_gcp_provider(project_id=account).list_monitoring_alerts(account=account or "gcp"):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": alert["account"],
+                    "Name": alert["name"], "State": alert["state"],
+                    "Metric": alert.get("conditions", "—"), "Region": alert.get("region", "global"),
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No alerts found.[/dim]")
@@ -89,10 +103,10 @@ def monitoring_dashboards(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Azure Monitor dashboards coming in Day 9.")
+        warn("[Azure] Azure portal dashboards are not accessible via ARM API.")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Cloud Monitoring dashboards coming in Day 10.")
+        warn("[GCP] Cloud Monitoring custom dashboards require Monitoring API access.")
 
     if not rows:
         console.print("[dim]No dashboards found.[/dim]")

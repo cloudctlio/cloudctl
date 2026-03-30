@@ -5,7 +5,13 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, get_azure_provider, require_init
+from cloudctl.commands._helpers import (
+    console,
+    get_aws_provider,
+    get_azure_provider,
+    get_gcp_provider,
+    require_init,
+)
 from cloudctl.output.formatter import cloud_label, print_table, warn
 
 app = typer.Typer(help="View cloud costs (AWS Cost Explorer, Azure Cost, GCP Billing).")
@@ -41,7 +47,7 @@ def cost_summary(
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         try:
-            for entry in get_azure_provider(account).cost_summary(account=account or "azure", days=days):
+            for entry in get_azure_provider(subscription_id=account).cost_summary(account=account or "azure", days=days):
                 rows.append({
                     "Cloud": cloud_label("azure"), "Account": entry["account"],
                     "Period": entry["period"], "Total Cost": entry["cost"],
@@ -51,7 +57,15 @@ def cost_summary(
             warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Billing coming in Day 10 — gcp cost commands not yet implemented.")
+        try:
+            for entry in get_gcp_provider(project_id=account).cost_summary(account=account or "gcp", days=days):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": entry["account"],
+                    "Period": entry["period"], "Total Cost": entry["cost"],
+                    "Currency": entry.get("currency", "USD"),
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No cost data found. Ensure Cost Explorer / Cost Management is enabled.[/dim]")
@@ -85,7 +99,7 @@ def cost_by_service(
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         try:
-            for entry in get_azure_provider(account).cost_by_service(account=account or "azure", days=days):
+            for entry in get_azure_provider(subscription_id=account).cost_by_service(account=account or "azure", days=days):
                 rows.append({
                     "Cloud": cloud_label("azure"), "Account": entry["account"],
                     "Service": entry["service"], "Period": entry["period"],
@@ -95,7 +109,15 @@ def cost_by_service(
             warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Cost by service coming in Day 10.")
+        try:
+            for entry in get_gcp_provider(project_id=account).cost_by_service(account=account or "gcp", days=days):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": entry["account"],
+                    "Service": entry["service"], "Period": entry["period"],
+                    "Cost": entry["cost"],
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No cost data found.[/dim]")

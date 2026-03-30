@@ -5,7 +5,12 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, require_init
+from cloudctl.commands._helpers import (
+    console,
+    get_aws_provider,
+    get_gcp_provider,
+    require_init,
+)
 from cloudctl.output.formatter import cloud_label, error, print_table, warn
 
 app = typer.Typer(help="Inspect CI/CD pipelines (CodePipeline, Azure DevOps, Cloud Build).")
@@ -33,17 +38,35 @@ def pipeline_list(
                 for p in get_aws_provider(profile_name, region).list_pipelines(account=profile_name, region=region):
                     rows.append({
                         "Cloud": cloud_label("aws"), "Account": profile_name,
-                        "Name": p["name"], "Version": p["version"],
+                        "Name": p["name"], "Type": "CodePipeline",
                         "Updated": p["updated"], "Region": p["region"],
                     })
             except Exception as e:
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Azure DevOps Pipelines require AZURE_DEVOPS_ORG_URL + AZURE_DEVOPS_PAT — coming in Day 9.")
+        warn("[Azure] Azure DevOps Pipelines require AZURE_DEVOPS_ORG_URL + AZURE_DEVOPS_PAT env vars.")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Cloud Build coming in Day 10.")
+        try:
+            for b in get_gcp_provider(project_id=account).list_cloud_build(
+                account=account or "gcp", region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": b["account"],
+                    "Name": b["name"], "Type": "Cloud Build",
+                    "Updated": b.get("create_time", "—"), "Region": b.get("region", "global"),
+                })
+            for d in get_gcp_provider(project_id=account).list_cloud_deploy(
+                account=account or "gcp", region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": d["account"],
+                    "Name": d["name"], "Type": "Cloud Deploy",
+                    "Updated": d.get("create_time", "—"), "Region": d.get("region", "—"),
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No pipelines found.[/dim]")
