@@ -1,40 +1,34 @@
-"""cloudctl security — audit, public-resources."""
+"""cloudctl security — audit, public-resources across AWS, Azure, and GCP."""
 from __future__ import annotations
 
 from typing import Optional
 
 import typer
-from rich.console import Console
 
-from cloudctl.config.manager import ConfigManager
+from cloudctl.commands._helpers import (
+    console,
+    get_aws_provider,
+    get_azure_provider,
+    get_gcp_provider,
+    require_init,
+)
 from cloudctl.output.formatter import cloud_label, print_table, warn
 
 app = typer.Typer(help="Security posture checks across cloud accounts.")
-console = Console()
 
 _SEVERITY_COLOR = {"HIGH": "bold red", "MEDIUM": "bold yellow", "LOW": "dim"}
 
-
-def _require_init() -> ConfigManager:
-    cfg = ConfigManager()
-    if not cfg.is_initialized:
-        warn("cloudctl not initialized. Run: [cyan]cloudctl init[/cyan]")
-        raise typer.Exit(1)
-    return cfg
-
-
-def _aws_provider(profile: str):
-    from cloudctl.providers.aws.provider import AWSProvider
-    return AWSProvider(profile=profile)
+_CLOUD   = typer.Option("aws",  "--cloud",   "-c", help="Cloud provider: aws | azure | gcp | all")
+_ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure subscription ID | GCP project ID")
 
 
 @app.command("audit")
 def security_audit(
-    cloud: str = typer.Option("aws", "--cloud", "-c"),
-    account: Optional[str] = typer.Option(None, "--account", "-a"),
+    cloud:   str           = _CLOUD,
+    account: Optional[str] = _ACCOUNT,
 ) -> None:
     """Run security checks: public buckets, open security groups, IAM users without MFA."""
-    cfg = _require_init()
+    cfg = require_init()
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
@@ -42,32 +36,53 @@ def security_audit(
         targets = [p["name"] for p in profiles if not account or p["name"] == account]
         for profile_name in targets:
             try:
-                findings = _aws_provider(profile_name).security_audit(account=profile_name)
-                for f in findings:
+                for f in get_aws_provider(profile_name).security_audit(account=profile_name):
                     color = _SEVERITY_COLOR.get(f["severity"], "")
                     rows.append({
-                        "Cloud": cloud_label("aws"),
-                        "Account": f["account"],
+                        "Cloud": cloud_label("aws"), "Account": f["account"],
                         "Severity": f"[{color}]{f['severity']}[/{color}]",
-                        "Resource": f["resource"],
-                        "Issue": f["issue"],
+                        "Resource": f["resource"], "Issue": f["issue"],
                     })
             except Exception as e:
-                warn(f"[{profile_name}] {e}")
+                warn(f"[AWS/{profile_name}] {e}")
+
+    if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
+        try:
+            for f in get_azure_provider(subscription_id=account).security_audit(account=account or "azure"):
+                color = _SEVERITY_COLOR.get(f["severity"], "")
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": f["account"],
+                    "Severity": f"[{color}]{f['severity']}[/{color}]",
+                    "Resource": f["resource"], "Issue": f["issue"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
+
+    if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
+        try:
+            for f in get_gcp_provider(project_id=account).security_audit(account=account or "gcp"):
+                color = _SEVERITY_COLOR.get(f["severity"], "")
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": f["account"],
+                    "Severity": f"[{color}]{f['severity']}[/{color}]",
+                    "Resource": f["resource"], "Issue": f["issue"],
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[bold green]No security issues found.[/bold green]")
         return
-    print_table(rows, title="Security Audit Findings")
+    print_table(rows, title=f"Security Audit Findings ({len(rows)})")
 
 
 @app.command("public-resources")
 def security_public_resources(
-    cloud: str = typer.Option("aws", "--cloud", "-c"),
-    account: Optional[str] = typer.Option(None, "--account", "-a"),
+    cloud:   str           = _CLOUD,
+    account: Optional[str] = _ACCOUNT,
 ) -> None:
     """List all publicly accessible resources."""
-    cfg = _require_init()
+    cfg = require_init()
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
@@ -75,19 +90,35 @@ def security_public_resources(
         targets = [p["name"] for p in profiles if not account or p["name"] == account]
         for profile_name in targets:
             try:
-                resources = _aws_provider(profile_name).list_public_resources(account=profile_name)
-                for r in resources:
+                for r in get_aws_provider(profile_name).list_public_resources(account=profile_name):
                     rows.append({
-                        "Cloud": cloud_label("aws"),
-                        "Account": r["account"],
-                        "Type": r["type"],
-                        "ID": r["id"],
-                        "Region": r["region"],
+                        "Cloud": cloud_label("aws"), "Account": r["account"],
+                        "Type": r["type"], "ID": r["id"], "Region": r["region"],
                     })
             except Exception as e:
-                warn(f"[{profile_name}] {e}")
+                warn(f"[AWS/{profile_name}] {e}")
+
+    if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
+        try:
+            for r in get_azure_provider(subscription_id=account).list_public_resources(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": r["account"],
+                    "Type": r["type"], "ID": r["id"], "Region": r["region"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
+
+    if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
+        try:
+            for r in get_gcp_provider(project_id=account).list_public_resources(account=account or "gcp"):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": r["account"],
+                    "Type": r["type"], "ID": r["id"], "Region": r["region"],
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[bold green]No public resources found.[/bold green]")
         return
-    print_table(rows, title="Publicly Accessible Resources")
+    print_table(rows, title=f"Publicly Accessible Resources ({len(rows)})")

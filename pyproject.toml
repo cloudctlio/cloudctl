@@ -37,6 +37,59 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+azure = [
+    # Core
+    "azure-identity>=1.16",
+    "azure-mgmt-compute>=32.0",
+    "azure-mgmt-storage>=21.0",
+    "azure-mgmt-subscription>=3.0",
+    "azure-mgmt-resource>=23.0",
+    # Database
+    "azure-mgmt-rdbms>=10.0",
+    "azure-mgmt-sql>=3.0",
+    "azure-mgmt-cosmosdb>=9.0",
+    "azure-mgmt-redis>=14.0",
+    # Compute extras
+    "azure-mgmt-containerservice>=30.0",
+    "azure-mgmt-containerinstance>=10.0",
+    "azure-mgmt-web>=7.0",
+    # Network
+    "azure-mgmt-network>=25.0",
+    "azure-mgmt-dns>=8.0",
+    "azure-mgmt-apimanagement>=10.0",
+    # IAM / Security
+    "azure-mgmt-authorization>=4.0",
+    "azure-mgmt-keyvault>=10.0",
+    "azure-mgmt-msi>=7.0",
+    "azure-mgmt-security>=5.0",
+    # Containers / DevOps
+    "azure-mgmt-containerregistry>=10.0",
+    # Monitoring
+    "azure-mgmt-monitor>=6.0",
+    # Messaging / Integration
+    "azure-mgmt-servicebus>=8.0",
+    "azure-mgmt-eventhub>=10.0",
+    "azure-mgmt-logic>=9.0",
+    # AI / Analytics
+    "azure-mgmt-cognitiveservices>=13.0",
+    "azure-mgmt-synapse>=2.0",
+    "azure-mgmt-datafactory>=4.0",
+    # Cost
+    "azure-mgmt-costmanagement>=4.0",
+    # Backup
+    "azure-mgmt-recoveryservices>=3.0",
+]
+gcp = [
+    "google-auth>=2.0",
+    "google-api-python-client>=2.0",
+    "google-cloud-storage>=2.0",
+    "google-cloud-resource-manager>=1.10",
+]
+all-clouds = [
+    "cctl[azure,gcp]",
+]
+
 [project.scripts]
 cloudctl = "cloudctl.main:main"
 

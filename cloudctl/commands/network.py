@@ -1,39 +1,34 @@
-"""cloudctl network — VPCs, security groups."""
+"""cloudctl network — VPCs, security groups across AWS, Azure, and GCP."""
 from __future__ import annotations
 
 from typing import Optional
 
 import typer
-from rich.console import Console
 
-from cloudctl.config.manager import ConfigManager
-from cloudctl.output.formatter import cloud_label, error, print_table, warn
+from cloudctl.commands._helpers import (
+    console,
+    get_aws_provider,
+    get_azure_provider,
+    get_gcp_provider,
+    require_init,
+)
+from cloudctl.output.formatter import cloud_label, print_table, warn
 
 app = typer.Typer(help="Inspect cloud networking (VPCs, security groups).")
-console = Console()
 
-
-def _require_init() -> ConfigManager:
-    cfg = ConfigManager()
-    if not cfg.is_initialized:
-        warn("cloudctl not initialized. Run: [cyan]cloudctl init[/cyan]")
-        raise typer.Exit(1)
-    return cfg
-
-
-def _aws_provider(profile: str, region: Optional[str] = None):
-    from cloudctl.providers.aws.provider import AWSProvider
-    return AWSProvider(profile=profile, region=region)
+_CLOUD   = typer.Option("aws",  "--cloud",   "-c", help="Cloud provider: aws | azure | gcp | all")
+_ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure subscription ID | GCP project ID")
+_REGION  = typer.Option(None,   "--region",  "-r", help="Region / location to query")
 
 
 @app.command("vpcs")
 def network_vpcs(
-    cloud: str = typer.Option("aws", "--cloud", "-c"),
-    account: Optional[str] = typer.Option(None, "--account", "-a"),
-    region: Optional[str] = typer.Option(None, "--region", "-r"),
+    cloud:   str           = _CLOUD,
+    account: Optional[str] = _ACCOUNT,
+    region:  Optional[str] = _REGION,
 ) -> None:
-    """List VPCs."""
-    cfg = _require_init()
+    """List VPCs / virtual networks."""
+    cfg = require_init()
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
@@ -41,36 +36,57 @@ def network_vpcs(
         targets = [p["name"] for p in profiles if not account or p["name"] == account]
         for profile_name in targets:
             try:
-                vpcs = _aws_provider(profile_name, region).list_vpcs(account=profile_name, region=region)
-                for v in vpcs:
+                for v in get_aws_provider(profile_name, region).list_vpcs(account=profile_name, region=region):
                     rows.append({
-                        "Cloud": cloud_label("aws"),
-                        "Account": v["account"],
-                        "VPC ID": v["id"],
-                        "Name": v["name"],
-                        "CIDR": v["cidr"],
-                        "State": v["state"],
+                        "Cloud": cloud_label("aws"), "Account": v["account"],
+                        "VPC ID": v["id"], "Name": v["name"],
+                        "CIDR": v["cidr"], "State": v["state"],
                         "Default": "yes" if v["default"] else "no",
                         "Region": v["region"],
                     })
             except Exception as e:
-                warn(f"[{profile_name}] {e}")
+                warn(f"[AWS/{profile_name}] {e}")
+
+    if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
+        try:
+            for v in get_azure_provider(subscription_id=account).list_vnets(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": v["account"],
+                    "VPC ID": v["id"], "Name": v["name"],
+                    "CIDR": v["cidr"], "State": v["state"],
+                    "Default": "no", "Region": v["region"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
+
+    if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
+        try:
+            for v in get_gcp_provider(project_id=account).list_vpcs(account=account or "gcp"):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": v["account"],
+                    "VPC ID": v["id"], "Name": v["name"],
+                    "CIDR": v["cidr"], "State": v["state"],
+                    "Default": "yes" if v["default"] else "no",
+                    "Region": v["region"],
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No VPCs found.[/dim]")
         return
-    print_table(rows, title="VPCs")
+    print_table(rows, title=f"VPCs ({len(rows)})")
 
 
 @app.command("security-groups")
 def network_security_groups(
-    cloud: str = typer.Option("aws", "--cloud", "-c"),
-    account: Optional[str] = typer.Option(None, "--account", "-a"),
-    region: Optional[str] = typer.Option(None, "--region", "-r"),
-    vpc_id: Optional[str] = typer.Option(None, "--vpc", help="Filter by VPC ID."),
+    cloud:   str           = _CLOUD,
+    account: Optional[str] = _ACCOUNT,
+    region:  Optional[str] = _REGION,
+    vpc_id:  Optional[str] = typer.Option(None, "--vpc", help="Filter by VPC ID. AWS only."),
 ) -> None:
-    """List security groups."""
-    cfg = _require_init()
+    """List security groups / NSGs / firewall rules."""
+    cfg = require_init()
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
@@ -78,24 +94,51 @@ def network_security_groups(
         targets = [p["name"] for p in profiles if not account or p["name"] == account]
         for profile_name in targets:
             try:
-                sgs = _aws_provider(profile_name, region).list_security_groups(
+                for sg in get_aws_provider(profile_name, region).list_security_groups(
                     account=profile_name, region=region, vpc_id=vpc_id
-                )
-                for sg in sgs:
+                ):
                     rows.append({
-                        "Cloud": cloud_label("aws"),
-                        "Account": sg["account"],
-                        "ID": sg["id"],
-                        "Name": sg["name"],
+                        "Cloud": cloud_label("aws"), "Account": sg["account"],
+                        "ID": sg["id"], "Name": sg["name"],
                         "VPC": sg["vpc_id"],
                         "Inbound": sg["inbound_rules"],
                         "Outbound": sg["outbound_rules"],
                         "Region": sg["region"],
                     })
             except Exception as e:
-                warn(f"[{profile_name}] {e}")
+                warn(f"[AWS/{profile_name}] {e}")
+
+    if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
+        try:
+            for nsg in get_azure_provider(subscription_id=account).list_nsgs(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": nsg["account"],
+                    "ID": nsg["id"], "Name": nsg["name"],
+                    "VPC": nsg.get("vpc_id", "—"),
+                    "Inbound": nsg["inbound_rules"],
+                    "Outbound": nsg["outbound_rules"],
+                    "Region": nsg["region"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
+
+    if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
+        try:
+            for fw in get_gcp_provider(project_id=account).list_security_groups(
+                account=account or "gcp", vpc_id=vpc_id
+            ):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": fw["account"],
+                    "ID": fw["id"], "Name": fw["name"],
+                    "VPC": fw["vpc_id"],
+                    "Inbound": fw["inbound_rules"],
+                    "Outbound": fw["outbound_rules"],
+                    "Region": fw["region"],
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No security groups found.[/dim]")
         return
-    print_table(rows, title="Security Groups")
+    print_table(rows, title=f"Security Groups ({len(rows)})")
