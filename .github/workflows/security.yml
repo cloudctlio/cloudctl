@@ -47,7 +47,7 @@ jobs:
       # ── 3. SAST — SonarQube (main branch only — free tier limit) ─
       - name: SonarQube Scan
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: SonarSource/sonarqube-scan-action@v4
+        uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
