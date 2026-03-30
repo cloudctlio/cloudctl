@@ -17,11 +17,12 @@ from cloudctl.providers.base import (
 class AWSProvider(CloudProvider):
     def __init__(self, profile: str, region: Optional[str] = None) -> None:
         self._profile = profile
-        self._region = region
         try:
             self._session = boto3.Session(profile_name=profile, region_name=region)
         except ProfileNotFound as e:
             raise ValueError(f"AWS profile '{profile}' not found: {e}") from e
+        # Use the explicitly passed region, or fall back to what the profile defines
+        self._region = region or self._session.region_name or "us-east-1"
 
     def _client(self, service: str, region: Optional[str] = None):
         return self._session.client(service, region_name=region or self._region)

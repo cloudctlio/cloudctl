@@ -5,7 +5,7 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, require_init
+from cloudctl.commands._helpers import console, get_aws_provider, get_azure_provider, require_init
 from cloudctl.output.formatter import cloud_label, print_table, warn
 
 app = typer.Typer(help="View cloud costs (AWS Cost Explorer, Azure Cost, GCP Billing).")
@@ -40,13 +40,21 @@ def cost_summary(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Cost Management coming in Day 8 — azure cost commands not yet implemented.")
+        try:
+            for entry in get_azure_provider(account).cost_summary(account=account or "azure", days=days):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": entry["account"],
+                    "Period": entry["period"], "Total Cost": entry["cost"],
+                    "Currency": entry.get("currency", "USD"),
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
         warn("[GCP] Billing coming in Day 10 — gcp cost commands not yet implemented.")
 
     if not rows:
-        console.print("[dim]No cost data found. Ensure Cost Explorer is enabled.[/dim]")
+        console.print("[dim]No cost data found. Ensure Cost Explorer / Cost Management is enabled.[/dim]")
         return
     print_table(rows, title=f"Cost Summary (last {days} days)")
 
@@ -76,7 +84,15 @@ def cost_by_service(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] Cost by service coming in Day 8.")
+        try:
+            for entry in get_azure_provider(account).cost_by_service(account=account or "azure", days=days):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": entry["account"],
+                    "Service": entry["service"], "Period": entry["period"],
+                    "Cost": entry["cost"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
         warn("[GCP] Cost by service coming in Day 10.")
