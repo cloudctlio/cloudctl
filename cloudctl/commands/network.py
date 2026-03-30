@@ -5,7 +5,13 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, require_init
+from cloudctl.commands._helpers import (
+    console,
+    get_aws_provider,
+    get_azure_provider,
+    get_gcp_provider,
+    require_init,
+)
 from cloudctl.output.formatter import cloud_label, print_table, warn
 
 app = typer.Typer(help="Inspect cloud networking (VPCs, security groups).")
@@ -42,10 +48,29 @@ def network_vpcs(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] VNet listing coming in Day 7 — azure network commands not yet implemented.")
+        try:
+            for v in get_azure_provider(subscription_id=account).list_vnets(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": v["account"],
+                    "VPC ID": v["id"], "Name": v["name"],
+                    "CIDR": v["cidr"], "State": v["state"],
+                    "Default": "no", "Region": v["region"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] VPC listing coming in Day 9 — gcp network commands not yet implemented.")
+        try:
+            for v in get_gcp_provider(project_id=account).list_vpcs(account=account or "gcp"):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": v["account"],
+                    "VPC ID": v["id"], "Name": v["name"],
+                    "CIDR": v["cidr"], "State": v["state"],
+                    "Default": "yes" if v["default"] else "no",
+                    "Region": v["region"],
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No VPCs found.[/dim]")
@@ -84,10 +109,34 @@ def network_security_groups(
                 warn(f"[AWS/{profile_name}] {e}")
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        warn("[Azure] NSG listing coming in Day 7 — azure network commands not yet implemented.")
+        try:
+            for nsg in get_azure_provider(subscription_id=account).list_nsgs(account=account or "azure"):
+                rows.append({
+                    "Cloud": cloud_label("azure"), "Account": nsg["account"],
+                    "ID": nsg["id"], "Name": nsg["name"],
+                    "VPC": nsg.get("vpc_id", "—"),
+                    "Inbound": nsg["inbound_rules"],
+                    "Outbound": nsg["outbound_rules"],
+                    "Region": nsg["region"],
+                })
+        except Exception as e:
+            warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Firewall listing coming in Day 9 — gcp network commands not yet implemented.")
+        try:
+            for fw in get_gcp_provider(project_id=account).list_security_groups(
+                account=account or "gcp", vpc_id=vpc_id
+            ):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": fw["account"],
+                    "ID": fw["id"], "Name": fw["name"],
+                    "VPC": fw["vpc_id"],
+                    "Inbound": fw["inbound_rules"],
+                    "Outbound": fw["outbound_rules"],
+                    "Region": fw["region"],
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No security groups found.[/dim]")

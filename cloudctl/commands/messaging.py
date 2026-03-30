@@ -5,7 +5,13 @@ from typing import Optional
 
 import typer
 
-from cloudctl.commands._helpers import console, get_aws_provider, get_azure_provider, require_init
+from cloudctl.commands._helpers import (
+    console,
+    get_aws_provider,
+    get_azure_provider,
+    get_gcp_provider,
+    require_init,
+)
 from cloudctl.output.formatter import cloud_label, print_table, warn
 
 app = typer.Typer(help="Inspect messaging services (SQS/SNS/Kinesis, Service Bus, Pub/Sub).")
@@ -21,7 +27,7 @@ def messaging_queues(
     account: Optional[str] = _ACCOUNT,
     region:  Optional[str] = _REGION,
 ) -> None:
-    """List queues (SQS, Service Bus namespaces)."""
+    """List queues (SQS, Service Bus namespaces, Cloud Tasks)."""
     cfg = require_init()
     rows: list[dict] = []
 
@@ -43,7 +49,7 @@ def messaging_queues(
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         try:
-            for ns in get_azure_provider(account).list_service_bus_namespaces(
+            for ns in get_azure_provider(subscription_id=account).list_service_bus_namespaces(
                 account=account or "azure", region=region
             ):
                 rows.append({
@@ -55,7 +61,17 @@ def messaging_queues(
             warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Pub/Sub topics coming in Day 10.")
+        try:
+            for q in get_gcp_provider(project_id=account).list_cloud_tasks(
+                account=account or "gcp", region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": q["account"],
+                    "Type": "Cloud Tasks", "Name": q["name"],
+                    "Messages": q.get("size", "—"), "Region": q.get("region", "—"),
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No queues found.[/dim]")
@@ -69,7 +85,7 @@ def messaging_topics(
     account: Optional[str] = _ACCOUNT,
     region:  Optional[str] = _REGION,
 ) -> None:
-    """List topics (SNS, EventBridge buses)."""
+    """List topics (SNS, EventBridge buses, Pub/Sub topics)."""
     cfg = require_init()
     rows: list[dict] = []
 
@@ -99,7 +115,14 @@ def messaging_topics(
         warn("[Azure] Service Bus topics are nested under namespaces — use: cloudctl messaging queues --cloud azure")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Pub/Sub topics coming in Day 10.")
+        try:
+            for t in get_gcp_provider(project_id=account).list_pubsub_topics(account=account or "gcp"):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": t["account"],
+                    "Type": "Pub/Sub", "Name": t["name"], "Region": "global",
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No topics found.[/dim]")
@@ -113,7 +136,7 @@ def messaging_streams(
     account: Optional[str] = _ACCOUNT,
     region:  Optional[str] = _REGION,
 ) -> None:
-    """List data streams (Kinesis, Event Hubs, MSK)."""
+    """List data streams (Kinesis, Event Hubs, MSK, Pub/Sub subscriptions)."""
     cfg = require_init()
     rows: list[dict] = []
 
@@ -143,7 +166,7 @@ def messaging_streams(
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         try:
-            for ns in get_azure_provider(account).list_event_hub_namespaces(
+            for ns in get_azure_provider(subscription_id=account).list_event_hub_namespaces(
                 account=account or "azure", region=region
             ):
                 rows.append({
@@ -155,7 +178,15 @@ def messaging_streams(
             warn(f"[Azure] {e}")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        warn("[GCP] Dataflow/Pub/Sub streams coming in Day 10.")
+        try:
+            for sub in get_gcp_provider(project_id=account).list_pubsub_subscriptions(account=account or "gcp"):
+                rows.append({
+                    "Cloud": cloud_label("gcp"), "Account": sub["account"],
+                    "Type": "Pub/Sub Sub", "Name": sub["name"],
+                    "State": sub.get("topic", "—"), "Region": "global",
+                })
+        except Exception as e:
+            warn(f"[GCP] {e}")
 
     if not rows:
         console.print("[dim]No streams found.[/dim]")
