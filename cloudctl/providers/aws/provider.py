@@ -268,6 +268,23 @@ class AWSProvider(CloudProvider):
 
     # ── S3 ───────────────────────────────────────────────────────────────────
 
+    def _s3_bucket_region(self, s3, name: str) -> str:
+        try:
+            loc = s3.get_bucket_location(Bucket=name)
+            return loc.get("LocationConstraint") or "us-east-1"
+        except ClientError:
+            return "—"
+
+    def _s3_bucket_is_public(self, s3, name: str) -> bool:
+        try:
+            acl = s3.get_bucket_acl(Bucket=name)
+            for grant in acl.get("Grants", []):
+                if grant.get("Grantee", {}).get("URI", "").endswith("AllUsers"):
+                    return True
+        except ClientError:
+            pass
+        return False
+
     def list_storage(
         self,
         account: str,
@@ -279,20 +296,8 @@ class AWSProvider(CloudProvider):
         for bucket in buckets:
             name = bucket["Name"]
             created = bucket.get("CreationDate")
-            try:
-                loc = s3.get_bucket_location(Bucket=name)
-                region = loc.get("LocationConstraint") or "us-east-1"
-            except ClientError:
-                region = "—"
-            is_public = False
-            try:
-                acl = s3.get_bucket_acl(Bucket=name)
-                for grant in acl.get("Grants", []):
-                    if grant.get("Grantee", {}).get("URI", "").endswith("AllUsers"):
-                        is_public = True
-                        break
-            except ClientError:
-                pass
+            region = self._s3_bucket_region(s3, name)
+            is_public = self._s3_bucket_is_public(s3, name)
             if public_only and not is_public:
                 continue
             results.append(StorageResource(
@@ -313,15 +318,7 @@ class AWSProvider(CloudProvider):
             region = loc.get("LocationConstraint") or "us-east-1"
         except ClientError as e:
             raise ValueError(f"Bucket '{bucket_name}' not found: {e}") from e
-        is_public = False
-        try:
-            acl = s3.get_bucket_acl(Bucket=bucket_name)
-            for grant in acl.get("Grants", []):
-                if grant.get("Grantee", {}).get("URI", "").endswith("AllUsers"):
-                    is_public = True
-                    break
-        except ClientError:
-            pass
+        is_public = self._s3_bucket_is_public(s3, bucket_name)
         return StorageResource(
             id=bucket_name, name=bucket_name, region=region,
             cloud="aws", account=account, public=is_public,
@@ -711,28 +708,23 @@ class AWSProvider(CloudProvider):
 
     # ── KMS ───────────────────────────────────────────────────────────────────
 
-    def list_kms_keys(self, account: str, region: Optional[str] = None) -> list[dict]:
-        kms = self._client("kms", region)
-        paginator = kms.get_paginator("list_keys")
-        results = []
-        for page in paginator.paginate():
-            for k in page.get("Keys", []):
-                try:
-                    meta = kms.describe_key(KeyId=k["KeyId"])["KeyMetadata"]
-                    if meta.get("KeyManager") == "AWS":
-                        continue  # skip AWS-managed keys
-                    results.append({
-                        "id": meta["KeyId"],
-                        "alias": "—",
-                        "state": meta.get("KeyState", "—"),
-                        "usage": meta.get("KeyUsage", "—"),
-                        "spec": meta.get("KeySpec", "—"),
-                        "region": region or self._region or "—",
-                        "account": account,
-                    })
-                except Exception:
-                    continue
-        # Enrich with aliases
+    def _kms_key_entry(self, kms, key_id: str, account: str, region: Optional[str]) -> Optional[dict]:
+        """Return a key-info dict for a customer-managed KMS key, or None to skip."""
+        meta = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+        if meta.get("KeyManager") == "AWS":
+            return None
+        return {
+            "id": meta["KeyId"],
+            "alias": "—",
+            "state": meta.get("KeyState", "—"),
+            "usage": meta.get("KeyUsage", "—"),
+            "spec": meta.get("KeySpec", "—"),
+            "region": region or self._region or "—",
+            "account": account,
+        }
+
+    def _kms_enrich_aliases(self, kms, results: list[dict]) -> None:
+        """Mutate *results* in-place, filling the alias field from KMS alias list."""
         try:
             for alias in kms.list_aliases().get("Aliases", []):
                 kid = alias.get("TargetKeyId")
@@ -741,6 +733,20 @@ class AWSProvider(CloudProvider):
                         r["alias"] = alias.get("AliasName", "—")
         except Exception:
             pass
+
+    def list_kms_keys(self, account: str, region: Optional[str] = None) -> list[dict]:
+        kms = self._client("kms", region)
+        paginator = kms.get_paginator("list_keys")
+        results = []
+        for page in paginator.paginate():
+            for k in page.get("Keys", []):
+                try:
+                    entry = self._kms_key_entry(kms, k["KeyId"], account, region)
+                    if entry is not None:
+                        results.append(entry)
+                except Exception:
+                    continue
+        self._kms_enrich_aliases(kms, results)
         return results
 
     # ── Secrets Manager ──────────────────────────────────────────────────────
@@ -1418,7 +1424,7 @@ class AWSProvider(CloudProvider):
 
     # ── Security ──────────────────────────────────────────────────────────────
 
-    def security_audit(self, account: str) -> list[dict]:
+    def _audit_public_s3(self, account: str) -> list[dict]:
         findings = []
         try:
             for b in self.list_storage(account=account):
@@ -1429,6 +1435,10 @@ class AWSProvider(CloudProvider):
                     })
         except Exception:
             pass
+        return findings
+
+    def _audit_open_security_groups(self, account: str) -> list[dict]:
+        findings = []
         try:
             ec2 = self._ec2()
             for sg in ec2.describe_security_groups().get("SecurityGroups", []):
@@ -1444,6 +1454,10 @@ class AWSProvider(CloudProvider):
                                 })
         except Exception:
             pass
+        return findings
+
+    def _audit_iam_mfa(self, account: str) -> list[dict]:
+        findings = []
         try:
             iam = self._client("iam")
             for user in iam.list_users().get("Users", []):
@@ -1455,6 +1469,13 @@ class AWSProvider(CloudProvider):
                     })
         except Exception:
             pass
+        return findings
+
+    def security_audit(self, account: str) -> list[dict]:
+        findings = []
+        findings.extend(self._audit_public_s3(account))
+        findings.extend(self._audit_open_security_groups(account))
+        findings.extend(self._audit_iam_mfa(account))
         return findings
 
     def list_public_resources(self, account: str) -> list[dict]:

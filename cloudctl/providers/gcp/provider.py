@@ -100,6 +100,41 @@ class GCPProvider(CloudProvider):
 
     # ── Compute — GCE Instances ───────────────────────────────────────────────
 
+    def _inst_network_ips(self, inst: dict) -> tuple:
+        """Return (public_ip, private_ip) extracted from instance network interfaces."""
+        ifaces = inst.get("networkInterfaces", [])
+        public_ip = private_ip = None
+        if ifaces:
+            private_ip = ifaces[0].get("networkIP")
+            acs = ifaces[0].get("accessConfigs", [])
+            if acs:
+                public_ip = acs[0].get("natIP")
+        return public_ip, private_ip
+
+    def _compute_from_zone(
+        self, svc, zone: str, account: str,
+        state: Optional[str], tags: Optional[dict],
+    ) -> list[ComputeResource]:
+        """Return matching ComputeResource entries for a single GCP zone."""
+        resp = svc.instances().list(project=self._project, zone=zone).execute()
+        results = []
+        for inst in resp.get("items", []):
+            vm_state = _STATE_MAP.get(inst.get("status", ""), "unknown")
+            if state and vm_state != state:
+                continue
+            inst_tags = dict(inst.get("labels", {}))
+            if tags and not all(inst_tags.get(k) == v for k, v in tags.items()):
+                continue
+            public_ip, private_ip = self._inst_network_ips(inst)
+            results.append(ComputeResource(
+                id=str(inst.get("id", inst["name"])), name=inst["name"],
+                state=vm_state, type=inst.get("machineType", "").split("/")[-1],
+                region=zone, cloud="gcp", account=account,
+                public_ip=public_ip, private_ip=private_ip,
+                tags=inst_tags, launched_at=inst.get("creationTimestamp"),
+            ))
+        return results
+
     def list_compute(
         self,
         account: str,
@@ -114,28 +149,7 @@ class GCPProvider(CloudProvider):
         results = []
         for zone in zones:
             try:
-                resp = svc.instances().list(project=self._project, zone=zone).execute()
-                for inst in resp.get("items", []):
-                    vm_state = _STATE_MAP.get(inst.get("status", ""), "unknown")
-                    if state and vm_state != state:
-                        continue
-                    inst_tags = dict(inst.get("labels", {}))
-                    if tags and not all(inst_tags.get(k) == v for k, v in tags.items()):
-                        continue
-                    ifaces = inst.get("networkInterfaces", [])
-                    public_ip = private_ip = None
-                    if ifaces:
-                        private_ip = ifaces[0].get("networkIP")
-                        acs = ifaces[0].get("accessConfigs", [])
-                        if acs:
-                            public_ip = acs[0].get("natIP")
-                    results.append(ComputeResource(
-                        id=str(inst.get("id", inst["name"])), name=inst["name"],
-                        state=vm_state, type=inst.get("machineType", "").split("/")[-1],
-                        region=zone, cloud="gcp", account=account,
-                        public_ip=public_ip, private_ip=private_ip,
-                        tags=inst_tags, launched_at=inst.get("creationTimestamp"),
-                    ))
+                results.extend(self._compute_from_zone(svc, zone, account, state, tags))
             except Exception:
                 continue
         return results
@@ -148,13 +162,7 @@ class GCPProvider(CloudProvider):
             zone, name = self._find_instance_zone(svc, instance_id), instance_id
         inst = svc.instances().get(project=self._project, zone=zone, instance=name).execute()
         vm_state = _STATE_MAP.get(inst.get("status", ""), "unknown")
-        ifaces = inst.get("networkInterfaces", [])
-        public_ip = private_ip = None
-        if ifaces:
-            private_ip = ifaces[0].get("networkIP")
-            acs = ifaces[0].get("accessConfigs", [])
-            if acs:
-                public_ip = acs[0].get("natIP")
+        public_ip, private_ip = self._inst_network_ips(inst)
         return ComputeResource(
             id=str(inst.get("id", inst["name"])), name=inst["name"],
             state=vm_state, type=inst.get("machineType", "").split("/")[-1],
@@ -896,39 +904,52 @@ class GCPProvider(CloudProvider):
             pass
         return results
 
+    def _public_gcs_buckets(self, account: str) -> list[dict]:
+        """Return entries for publicly accessible GCS buckets."""
+        results = []
+        try:
+            client = gcs.Client(project=self._project, credentials=self._creds)
+            for bucket in client.list_buckets():
+                if self._bucket_is_public(bucket):
+                    results.append({
+                        "account": account, "type": "GCS Bucket (Public)",
+                        "id": bucket.name, "region": (bucket.location or "unknown").lower(),
+                    })
+        except Exception:
+            pass
+        return results
+
+    def _open_firewall_rules(self, account: str) -> list[dict]:
+        """Return entries for firewall rules open to the internet (0.0.0.0/0)."""
+        results = []
+        try:
+            svc = self._svc("compute", "v1")
+            resp = svc.firewalls().list(project=self._project).execute()
+            for rule in resp.get("items", []):
+                is_open_ingress = (
+                    rule.get("direction") == "INGRESS"
+                    and "0.0.0.0/0" in rule.get("sourceRanges", [])
+                    and not rule.get("disabled", False)
+                )
+                if is_open_ingress:
+                    ports = rule.get("allowed", [{}])[0].get("ports", ["all"])
+                    results.append({
+                        "account": account,
+                        "type": f"Firewall Rule (Open: {', '.join(ports[:3])})",
+                        "id": rule["name"],
+                        "region": "global",
+                    })
+        except Exception:
+            pass
+        return results
+
     def list_public_resources(self, account: str) -> list[dict]:
         """List publicly accessible GCP resources."""
         results = []
-        # Public GCS buckets
         if _GCS_AVAILABLE:
-            try:
-                client = gcs.Client(project=self._project, credentials=self._creds)
-                for bucket in client.list_buckets():
-                    if self._bucket_is_public(bucket):
-                        results.append({
-                            "account": account, "type": "GCS Bucket (Public)",
-                            "id": bucket.name, "region": (bucket.location or "unknown").lower(),
-                        })
-            except Exception:
-                pass
-        # Firewall rules open to internet
+            results.extend(self._public_gcs_buckets(account))
         if _GAPI_AVAILABLE:
-            try:
-                svc = self._svc("compute", "v1")
-                resp = svc.firewalls().list(project=self._project).execute()
-                for rule in resp.get("items", []):
-                    if rule.get("direction") == "INGRESS" and \
-                       "0.0.0.0/0" in rule.get("sourceRanges", []) and \
-                       not rule.get("disabled", False):
-                        ports = rule.get("allowed", [{}])[0].get("ports", ["all"])
-                        results.append({
-                            "account": account,
-                            "type": f"Firewall Rule (Open: {', '.join(ports[:3])})",
-                            "id": rule["name"],
-                            "region": "global",
-                        })
-            except Exception:
-                pass
+            results.extend(self._open_firewall_rules(account))
         return results
 
     # ── DevOps — Cloud Build ──────────────────────────────────────────────────
