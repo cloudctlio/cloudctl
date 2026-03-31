@@ -19,6 +19,98 @@ app = typer.Typer(help="Inspect IAM roles, users, and permissions.")
 _CLOUD   = typer.Option("aws",  "--cloud",   "-c", help="Cloud provider: aws | azure | gcp | all")
 _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure subscription ID | GCP project ID")
 
+_LAST_LOGIN = "Last Login"
+
+
+def _aws_iam_roles_rows(cfg, account) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for role in get_aws_provider(profile_name).list_iam_roles(account=profile_name):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": role["account"],
+                    "Name": role["name"], "ID": role["id"],
+                    "Path": role["path"], "Created": role["created"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_iam_roles_rows(account) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for r in get_azure_provider(subscription_id=account).list_rbac_assignments(account=account or "azure"):
+            rows.append({
+                "Cloud": cloud_label("azure"), "Account": r["account"],
+                "Name": r["role"] if "role" in r else r["name"], "ID": r["id"],
+                "Path": r.get("scope", "—"), "Created": r.get("principal_type", "—"),
+            })
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_iam_roles_rows(account) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for role in get_gcp_provider(project_id=account).list_roles(account=account or "gcp"):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": role["account"],
+                "Name": role["name"], "ID": role["id"],
+                "Path": role.get("stage", "—"), "Created": role.get("description", "—"),
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
+
+def _aws_iam_users_rows(cfg, account) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for user in get_aws_provider(profile_name).list_iam_users(account=profile_name):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": user["account"],
+                    "Username": user["username"], "ID": user["id"],
+                    "Created": user["created"], _LAST_LOGIN: user["last_login"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_iam_users_rows(account) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for mi in get_azure_provider(subscription_id=account).list_managed_identities(account=account or "azure"):
+            rows.append({
+                "Cloud": cloud_label("azure"), "Account": mi["account"],
+                "Username": mi["name"], "ID": mi["id"],
+                "Created": mi.get("type", "—"), _LAST_LOGIN: mi.get("region", "—"),
+            })
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_iam_users_rows(account) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for sa in get_gcp_provider(project_id=account).list_service_accounts(account=account or "gcp"):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": sa["account"],
+                "Username": sa["name"], "ID": sa["email"],
+                "Created": sa.get("description", "—"), _LAST_LOGIN: sa.get("disabled", "—"),
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
 
 @app.command("roles")
 def iam_roles(
@@ -30,40 +122,13 @@ def iam_roles(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for role in get_aws_provider(profile_name).list_iam_roles(account=profile_name):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": role["account"],
-                        "Name": role["name"], "ID": role["id"],
-                        "Path": role["path"], "Created": role["created"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_iam_roles_rows(cfg, account)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for r in get_azure_provider(subscription_id=account).list_rbac_assignments(account=account or "azure"):
-                rows.append({
-                    "Cloud": cloud_label("azure"), "Account": r["account"],
-                    "Name": r["role"], "ID": r["id"],
-                    "Path": r.get("scope", "—"), "Created": r.get("principal_type", "—"),
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_iam_roles_rows(account)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for role in get_gcp_provider(project_id=account).list_roles(account=account or "gcp"):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": role["account"],
-                    "Name": role["name"], "ID": role["id"],
-                    "Path": role.get("stage", "—"), "Created": role.get("description", "—"),
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_iam_roles_rows(account)
 
     if not rows:
         console.print("[dim]No roles found.[/dim]")
@@ -81,40 +146,13 @@ def iam_users(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for user in get_aws_provider(profile_name).list_iam_users(account=profile_name):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": user["account"],
-                        "Username": user["username"], "ID": user["id"],
-                        "Created": user["created"], "Last Login": user["last_login"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_iam_users_rows(cfg, account)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for mi in get_azure_provider(subscription_id=account).list_managed_identities(account=account or "azure"):
-                rows.append({
-                    "Cloud": cloud_label("azure"), "Account": mi["account"],
-                    "Username": mi["name"], "ID": mi["id"],
-                    "Created": mi.get("type", "—"), "Last Login": mi.get("region", "—"),
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_iam_users_rows(account)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for sa in get_gcp_provider(project_id=account).list_service_accounts(account=account or "gcp"):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": sa["account"],
-                    "Username": sa["name"], "ID": sa["email"],
-                    "Created": sa.get("description", "—"), "Last Login": sa.get("disabled", "—"),
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_iam_users_rows(account)
 
     if not rows:
         console.print("[dim]No users found.[/dim]")

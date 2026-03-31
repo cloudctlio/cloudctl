@@ -21,6 +21,73 @@ _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure sub
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region / location to query")
 
 
+def _aws_alert_rows(cfg, account, region) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for alarm in get_aws_provider(profile_name, region).list_cloudwatch_alarms(
+                account=profile_name, region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": alarm["account"],
+                    "Name": alarm["name"], "State": alarm["state"],
+                    "Metric": alarm["metric"], "Region": alarm["region"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_alert_rows(account, region) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for alert in get_azure_provider(subscription_id=account).list_monitor_alerts(
+            account=account or "azure", region=region
+        ):
+            rows.append({
+                "Cloud": cloud_label("azure"), "Account": alert["account"],
+                "Name": alert["name"], "State": alert["state"],
+                "Metric": alert.get("description", "—"), "Region": alert["region"],
+            })
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_alert_rows(account) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for alert in get_gcp_provider(project_id=account).list_monitoring_alerts(account=account or "gcp"):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": alert["account"],
+                "Name": alert["name"], "State": alert["state"],
+                "Metric": alert.get("conditions", "—"), "Region": alert.get("region", "global"),
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
+
+def _aws_dashboard_rows(cfg, account, region) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for dash in get_aws_provider(profile_name, region).list_cloudwatch_dashboards(
+                account=profile_name, region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": dash["account"],
+                    "Name": dash["name"], "Modified": dash["modified"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
 @app.command("alerts")
 def monitoring_alerts(
     cloud:   str           = _CLOUD,
@@ -32,44 +99,13 @@ def monitoring_alerts(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for alarm in get_aws_provider(profile_name, region).list_cloudwatch_alarms(
-                    account=profile_name, region=region
-                ):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": alarm["account"],
-                        "Name": alarm["name"], "State": alarm["state"],
-                        "Metric": alarm["metric"], "Region": alarm["region"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_alert_rows(cfg, account, region)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for alert in get_azure_provider(subscription_id=account).list_monitor_alerts(
-                account=account or "azure", region=region
-            ):
-                rows.append({
-                    "Cloud": cloud_label("azure"), "Account": alert["account"],
-                    "Name": alert["name"], "State": alert["state"],
-                    "Metric": alert.get("description", "—"), "Region": alert["region"],
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_alert_rows(account, region)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for alert in get_gcp_provider(project_id=account).list_monitoring_alerts(account=account or "gcp"):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": alert["account"],
-                    "Name": alert["name"], "State": alert["state"],
-                    "Metric": alert.get("conditions", "—"), "Region": alert.get("region", "global"),
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_alert_rows(account)
 
     if not rows:
         console.print("[dim]No alerts found.[/dim]")
@@ -88,19 +124,7 @@ def monitoring_dashboards(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for dash in get_aws_provider(profile_name, region).list_cloudwatch_dashboards(
-                    account=profile_name, region=region
-                ):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": dash["account"],
-                        "Name": dash["name"], "Modified": dash["modified"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_dashboard_rows(cfg, account, region)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         warn("[Azure] Azure portal dashboards are not accessible via ARM API.")

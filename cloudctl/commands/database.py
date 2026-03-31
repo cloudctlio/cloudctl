@@ -21,6 +21,67 @@ _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure sub
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region / location to query")
 
 
+def _aws_database_rows(cfg, account, region, engine) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    if not targets and account:
+        warn(f"No AWS profile matching '{account}'.")
+        return rows
+    for profile_name in targets:
+        try:
+            for db in get_aws_provider(profile_name, region).list_databases(account=profile_name, region=region):
+                if engine and engine.lower() not in db.engine.lower():
+                    continue
+                rows.append({
+                    "Cloud": cloud_label(db.cloud), "Account": db.account,
+                    "ID": db.id, "Engine": db.engine,
+                    "Class": db.instance_class or "—", "State": db.state,
+                    "Region": db.region,
+                    "Multi-AZ": "yes" if db.multi_az else "no",
+                    "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_database_rows(account, region, engine) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for db in get_azure_provider(subscription_id=account).list_databases(
+            account=account or "azure", region=region, engine=engine
+        ):
+            rows.append({
+                "Cloud": cloud_label(db.cloud), "Account": db.account,
+                "ID": db.id, "Engine": db.engine,
+                "Class": db.instance_class or "—", "State": db.state,
+                "Region": db.region, "Multi-AZ": "—",
+                "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
+            })
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_database_rows(account, region, engine) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for db in get_gcp_provider(project_id=account).list_databases(
+            account=account or "gcp", region=region, engine=engine
+        ):
+            rows.append({
+                "Cloud": cloud_label(db.cloud), "Account": db.account,
+                "ID": db.id, "Engine": db.engine,
+                "Class": db.instance_class or "—", "State": db.state,
+                "Region": db.region, "Multi-AZ": "—",
+                "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
+
 @app.command("list")
 def database_list(
     cloud:   str           = _CLOUD,
@@ -33,56 +94,16 @@ def database_list(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        if not targets and cloud == "aws":
-            warn(f"No AWS profile matching '{account}'.")
+        aws_rows = _aws_database_rows(cfg, account, region, engine)
+        if not aws_rows and cloud == "aws" and account:
             raise typer.Exit(1)
-        for profile_name in targets:
-            try:
-                for db in get_aws_provider(profile_name, region).list_databases(account=profile_name, region=region):
-                    if engine and engine.lower() not in db.engine.lower():
-                        continue
-                    rows.append({
-                        "Cloud": cloud_label(db.cloud), "Account": db.account,
-                        "ID": db.id, "Engine": db.engine,
-                        "Class": db.instance_class or "—", "State": db.state,
-                        "Region": db.region,
-                        "Multi-AZ": "yes" if db.multi_az else "no",
-                        "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += aws_rows
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for db in get_azure_provider(subscription_id=account).list_databases(
-                account=account or "azure", region=region, engine=engine
-            ):
-                rows.append({
-                    "Cloud": cloud_label(db.cloud), "Account": db.account,
-                    "ID": db.id, "Engine": db.engine,
-                    "Class": db.instance_class or "—", "State": db.state,
-                    "Region": db.region, "Multi-AZ": "—",
-                    "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_database_rows(account, region, engine)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for db in get_gcp_provider(project_id=account).list_databases(
-                account=account or "gcp", region=region, engine=engine
-            ):
-                rows.append({
-                    "Cloud": cloud_label(db.cloud), "Account": db.account,
-                    "ID": db.id, "Engine": db.engine,
-                    "Class": db.instance_class or "—", "State": db.state,
-                    "Region": db.region, "Multi-AZ": "—",
-                    "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_database_rows(account, region, engine)
 
     if not rows:
         console.print("[dim]No databases found.[/dim]")

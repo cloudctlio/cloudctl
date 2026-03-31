@@ -20,6 +20,66 @@ _CLOUD   = typer.Option("aws",  "--cloud",   "-c", help="Cloud provider: aws | a
 _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure subscription ID | GCP project ID")
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region / location to query")
 
+_PUBLIC_IP = "Public IP"
+_NO_AWS_PROFILE = "No AWS profile configured."
+
+
+def _aws_compute_rows(cfg, account, region, state, tag_filter) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    if not targets and account:
+        warn(f"No AWS profile matching '{account}'. Run: cloudctl accounts list")
+        return rows
+    for profile_name in targets:
+        try:
+            for inst in get_aws_provider(profile_name, region).list_compute(
+                account=profile_name, region=region, state=state, tags=tag_filter
+            ):
+                rows.append({
+                    "Cloud": cloud_label(inst.cloud), "Account": inst.account,
+                    "ID": inst.id, "Name": inst.name, "Type": inst.type,
+                    "State": inst.state, "Region": inst.region,
+                    _PUBLIC_IP: inst.public_ip or "—",
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_compute_rows(account, region, state) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for inst in get_azure_provider(subscription_id=account).list_compute(
+            account=account or "azure", region=region, state=state
+        ):
+            rows.append({
+                "Cloud": cloud_label(inst.cloud), "Account": inst.account,
+                "ID": inst.id, "Name": inst.name, "Type": inst.type,
+                "State": inst.state, "Region": inst.region,
+                _PUBLIC_IP: inst.public_ip or "—",
+            })
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_compute_rows(account, region, state) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for inst in get_gcp_provider(project_id=account).list_compute(
+            account=account or "gcp", region=region, state=state
+        ):
+            rows.append({
+                "Cloud": cloud_label(inst.cloud), "Account": inst.account,
+                "ID": inst.id, "Name": inst.name, "Type": inst.type,
+                "State": inst.state, "Region": inst.region,
+                _PUBLIC_IP: inst.public_ip or "—",
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
 
 @app.command("list")
 def compute_list(
@@ -43,52 +103,16 @@ def compute_list(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        if not targets and cloud == "aws":
-            warn(f"No AWS profile matching '{account}'. Run: cloudctl accounts list")
+        aws_rows = _aws_compute_rows(cfg, account, region, state, tag_filter)
+        if not aws_rows and cloud == "aws" and account:
             raise typer.Exit(1)
-        for profile_name in targets:
-            try:
-                for inst in get_aws_provider(profile_name, region).list_compute(
-                    account=profile_name, region=region, state=state, tags=tag_filter
-                ):
-                    rows.append({
-                        "Cloud": cloud_label(inst.cloud), "Account": inst.account,
-                        "ID": inst.id, "Name": inst.name, "Type": inst.type,
-                        "State": inst.state, "Region": inst.region,
-                        "Public IP": inst.public_ip or "—",
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += aws_rows
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for inst in get_azure_provider(subscription_id=account).list_compute(
-                account=account or "azure", region=region, state=state
-            ):
-                rows.append({
-                    "Cloud": cloud_label(inst.cloud), "Account": inst.account,
-                    "ID": inst.id, "Name": inst.name, "Type": inst.type,
-                    "State": inst.state, "Region": inst.region,
-                    "Public IP": inst.public_ip or "—",
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_compute_rows(account, region, state)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for inst in get_gcp_provider(project_id=account).list_compute(
-                account=account or "gcp", region=region, state=state
-            ):
-                rows.append({
-                    "Cloud": cloud_label(inst.cloud), "Account": inst.account,
-                    "ID": inst.id, "Name": inst.name, "Type": inst.type,
-                    "State": inst.state, "Region": inst.region,
-                    "Public IP": inst.public_ip or "—",
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_compute_rows(account, region, state)
 
     if not rows:
         console.print("[dim]No instances found.[/dim]")
@@ -109,7 +133,7 @@ def compute_describe(
     if cloud == "aws":
         profile = account or next((p["name"] for p in cfg.accounts.get("aws", [])), None)
         if not profile:
-            error("No AWS profile configured.")
+            error(_NO_AWS_PROFILE)
             raise typer.Exit(1)
         provider = get_aws_provider(profile, region)
         acct = profile
@@ -132,7 +156,7 @@ def compute_describe(
     print_table([{"Field": k, "Value": str(v)} for k, v in {
         "Cloud": cloud_label(inst.cloud), "ID": inst.id, "Name": inst.name,
         "State": inst.state, "Type": inst.type, "Region": inst.region,
-        "Account": inst.account, "Public IP": inst.public_ip or "—",
+        "Account": inst.account, _PUBLIC_IP: inst.public_ip or "—",
         "Private IP": inst.private_ip or "—", "Launched": inst.launched_at or "—",
         "Tags": ", ".join(f"{k}={v}" for k, v in inst.tags.items()) or "—",
     }.items()], title=f"Instance: {instance_id}")
@@ -154,7 +178,7 @@ def compute_stop(
     if cloud == "aws":
         profile = account or next((p["name"] for p in cfg.accounts.get("aws", [])), None)
         if not profile:
-            error("No AWS profile configured.")
+            error(_NO_AWS_PROFILE)
             raise typer.Exit(1)
         provider, acct = get_aws_provider(profile, region), profile
     elif cloud == "azure":
@@ -189,7 +213,7 @@ def compute_start(
     if cloud == "aws":
         profile = account or next((p["name"] for p in cfg.accounts.get("aws", [])), None)
         if not profile:
-            error("No AWS profile configured.")
+            error(_NO_AWS_PROFILE)
             raise typer.Exit(1)
         provider, acct = get_aws_provider(profile, region), profile
     elif cloud == "azure":

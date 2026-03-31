@@ -88,7 +88,7 @@ class GCPProvider(CloudProvider):
             time.sleep(5)
         raise TimeoutError(f"Operation {op_name} timed out")
 
-    def _gcp_locations(self, svc, api_name: str) -> list[str]:
+    def _gcp_locations(self, svc) -> list[str]:
         """List available locations for a regional GCP service."""
         try:
             resp = svc.projects().locations().list(
@@ -186,7 +186,7 @@ class GCPProvider(CloudProvider):
         results = []
         try:
             svc = self._svc("run", "v2")
-            locations = [region] if region else self._gcp_locations(svc, "run")
+            locations = [region] if region else self._gcp_locations(svc)
             for loc in locations:
                 try:
                     resp = svc.projects().locations().services().list(
@@ -445,7 +445,6 @@ class GCPProvider(CloudProvider):
                 net_name = rule.get("network", "").split("/")[-1]
                 if vpc_id and net_name != vpc_id:
                     continue
-                key = f"{net_name}:{rule.get('direction', 'INGRESS')}"
                 if net_name not in rules:
                     rules[net_name] = {"inbound": 0, "outbound": 0, "net": net_name, "id": str(rule.get("id", ""))}
                 if rule.get("direction") == "INGRESS":
