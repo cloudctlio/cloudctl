@@ -29,6 +29,13 @@ jobs:
       - name: Install tools
         run: pip install bandit pip-audit safety
 
+      # ── 0. Tests + Coverage (required for SonarCloud) ─────────
+      - name: Install package and test dependencies
+        run: pip install -e . pytest pytest-cov
+
+      - name: Run tests with coverage
+        run: pytest tests/ --cov=cloudctl --cov-report=xml:coverage.xml -q
+
       # ── 1. SAST — Bandit (Python-specific, fast) ──────────────
       - name: Bandit SAST
         run: |
@@ -95,4 +102,5 @@ jobs:
             bandit.json
             pip-audit.json
             safety.json
+            coverage.xml
           retention-days: 30
