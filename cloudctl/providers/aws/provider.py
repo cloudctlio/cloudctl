@@ -1437,21 +1437,29 @@ class AWSProvider(CloudProvider):
             pass
         return findings
 
+    @staticmethod
+    def _rule_has_open_cidr(rule: dict) -> bool:
+        if rule.get("FromPort", -1) != -1:
+            return False
+        return any(ip.get("CidrIp") == "0.0.0.0/0" for ip in rule.get("IpRanges", []))
+
+    @staticmethod
+    def _sg_open_finding(sg: dict, account: str) -> dict:
+        return {
+            "severity": "HIGH",
+            "resource": f"sg/{sg['GroupId']} ({sg.get('GroupName', '')})",
+            "issue": "Security group allows all inbound traffic (0.0.0.0/0)",
+            "account": account,
+        }
+
     def _audit_open_security_groups(self, account: str) -> list[dict]:
         findings = []
         try:
             ec2 = self._ec2()
             for sg in ec2.describe_security_groups().get("SecurityGroups", []):
                 for rule in sg.get("IpPermissions", []):
-                    if rule.get("FromPort", -1) == -1:
-                        for ip in rule.get("IpRanges", []):
-                            if ip.get("CidrIp") == "0.0.0.0/0":
-                                findings.append({
-                                    "severity": "HIGH",
-                                    "resource": f"sg/{sg['GroupId']} ({sg.get('GroupName', '')})",
-                                    "issue": "Security group allows all inbound traffic (0.0.0.0/0)",
-                                    "account": account,
-                                })
+                    if self._rule_has_open_cidr(rule):
+                        findings.append(self._sg_open_finding(sg, account))
         except Exception:
             pass
         return findings
