@@ -27,9 +27,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install tools
-        run: pip install bandit pip-audit safety pytest pytest-cov
+        run: pip install bandit pip-audit safety
 
       # ── 0. Tests + Coverage (required for SonarCloud) ─────────
+      - name: Install package and test dependencies
+        run: pip install -e . pytest pytest-cov
+
       - name: Run tests with coverage
         run: pytest tests/ --cov=cloudctl --cov-report=xml:coverage.xml -q
 
