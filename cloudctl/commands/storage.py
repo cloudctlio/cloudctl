@@ -24,6 +24,26 @@ _PUBLIC_YES = "[bold red]YES[/bold red]"
 _NO_AWS_PROFILE = "No AWS profile configured."
 
 
+def _format_bytes(size: int) -> str:
+    """Format a byte count as a human-readable string."""
+    if size >= 1048576:
+        return f"{size / 1048576:.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size:,} B"
+
+
+def _format_total_bytes(total_bytes: int) -> str:
+    """Format a total byte count choosing GB, MB, or B."""
+    gb = total_bytes / (1024 ** 3)
+    mb = total_bytes / (1024 ** 2)
+    if gb >= 1:
+        return f"{gb:.2f} GB"
+    if mb >= 1:
+        return f"{mb:.2f} MB"
+    return f"{total_bytes:,} B"
+
+
 def _storage_row(b) -> dict:
     return {
         "Cloud": cloud_label(b.cloud), "Account": b.account,
@@ -167,7 +187,7 @@ def storage_ls(
                 size = obj.get("Size", 0)
                 rows.append({
                     "Type": "object", "Key": obj["Key"],
-                    "Size": f"{size/1048576:.1f} MB" if size >= 1048576 else f"{size/1024:.1f} KB" if size >= 1024 else f"{size:,} B",
+                    "Size": _format_bytes(size),
                     "Last Modified": str(obj.get("LastModified", ""))[:19],
                 })
             for pfx in page.get("CommonPrefixes", []):
@@ -210,9 +230,7 @@ def storage_du(
         error(str(e))
         raise typer.Exit(1)
 
-    gb = total_bytes / (1024 ** 3)
-    mb = total_bytes / (1024 ** 2)
-    size_str = f"{gb:.2f} GB" if gb >= 1 else f"{mb:.2f} MB" if mb >= 1 else f"{total_bytes:,} B"
+    size_str = _format_total_bytes(total_bytes)
     print_table([{
         "Path": f"s3://{bucket}/{prefix or ''}",
         "Objects": f"{total_objects:,}",

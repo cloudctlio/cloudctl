@@ -215,6 +215,16 @@ class AzureProvider(CloudProvider):
 
     # ── Compute — Virtual Machines ───────────────────────────────────────────
 
+    def _vm_matches_filters(
+        self, vm, region: Optional[str], tags: Optional[dict],
+    ) -> bool:
+        """Return True if the VM passes the optional region and tags filters."""
+        if region and vm.location != region:
+            return False
+        if tags and not all((vm.tags or {}).get(k) == v for k, v in tags.items()):
+            return False
+        return True
+
     def _compute_from_sub(
         self, sub_id: str, account: str,
         region: Optional[str], state: Optional[str], tags: Optional[dict],
@@ -222,9 +232,7 @@ class AzureProvider(CloudProvider):
         results = []
         client = ComputeManagementClient(self._cred, sub_id)
         for vm in client.virtual_machines.list_all():
-            if region and vm.location != region:
-                continue
-            if tags and not all((vm.tags or {}).get(k) == v for k, v in tags.items()):
+            if not self._vm_matches_filters(vm, region, tags):
                 continue
             vm_state = self._vm_power_state(client, vm)
             if state and vm_state != state:
@@ -711,6 +719,29 @@ class AzureProvider(CloudProvider):
 
     # ── Network — VPN Gateways ────────────────────────────────────────────────
 
+    def _vpn_gateways_from_sub(
+        self, sub_id: str, account: str, region: Optional[str],
+    ) -> list[dict]:
+        """Return VPN gateway entries for a single subscription."""
+        client = NetworkManagementClient(self._cred, sub_id)
+        # list_all is not always available; fall back to empty iterator
+        gateway_iter = (
+            client.virtual_network_gateways.list_all()
+            if hasattr(client.virtual_network_gateways, "list_all")
+            else []
+        )
+        entries = []
+        for vgw in gateway_iter:
+            if region and vgw.location != region:
+                continue
+            entries.append({
+                "account": account, "name": vgw.name,
+                "type": str(vgw.gateway_type) if vgw.gateway_type else "—",
+                "state": vgw.provisioning_state or "—",
+                "region": vgw.location or "unknown",
+            })
+        return entries
+
     def list_vpn_gateways(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Virtual Network (VPN) Gateways."""
         if not _NETWORK_AVAILABLE:
@@ -718,27 +749,30 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = NetworkManagementClient(self._cred, sub_id)
-                for rg_obj in ComputeManagementClient(self._cred, sub_id).resource_groups.list() \
-                        if False else []:
-                    pass
-                # list all VPN gateways requires iterating by resource group;
-                # use a broader list approach
-                for vgw in client.virtual_network_gateways.list_all() \
-                        if hasattr(client.virtual_network_gateways, "list_all") else []:
-                    if region and vgw.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": vgw.name,
-                        "type": str(vgw.gateway_type) if vgw.gateway_type else "—",
-                        "state": vgw.provisioning_state or "—",
-                        "region": vgw.location or "unknown",
-                    })
+                results.extend(self._vpn_gateways_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Network — API Management ──────────────────────────────────────────────
+
+    def _apim_from_sub(
+        self, sub_id: str, account: str, region: Optional[str],
+    ) -> list[dict]:
+        """Return API Management entries for a single subscription."""
+        client = ApiManagementClient(self._cred, sub_id)
+        entries = []
+        for svc in client.api_management_service.list():
+            if region and svc.location != region:
+                continue
+            entries.append({
+                "account": account, "name": svc.name,
+                "sku": svc.sku.name if svc.sku else "—",
+                "gateway_url": svc.gateway_url or "—",
+                "state": svc.provisioning_state or "—",
+                "region": svc.location or "unknown",
+            })
+        return entries
 
     def list_api_management(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List API Management services."""
@@ -747,17 +781,7 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ApiManagementClient(self._cred, sub_id)
-                for svc in client.api_management_service.list():
-                    if region and svc.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": svc.name,
-                        "sku": svc.sku.name if svc.sku else "—",
-                        "gateway_url": svc.gateway_url or "—",
-                        "state": svc.provisioning_state or "—",
-                        "region": svc.location or "unknown",
-                    })
+                results.extend(self._apim_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
@@ -782,6 +806,23 @@ class AzureProvider(CloudProvider):
             results = [r for r in results if engine.lower() in r.engine.lower()]
         return results
 
+    def _sql_dbs_from_server(self, client, server, account: str) -> list[DatabaseResource]:
+        """Return DatabaseResource entries for all non-master databases on a SQL server."""
+        _, rg, _ = self._parse_arm_id(server.id)
+        entries = []
+        for db in client.databases.list_by_server(rg, server.name):
+            if db.name == "master":
+                continue
+            entries.append(DatabaseResource(
+                id=db.id or db.name, name=f"{server.name}/{db.name}",
+                engine="Azure SQL", state=db.status or "unknown",
+                region=server.location or "unknown", cloud="azure", account=account,
+                instance_class=db.sku.name if db.sku else None,
+                storage_gb=int(db.max_size_bytes / (1024 ** 3)) if db.max_size_bytes else None,
+                tags=dict(db.tags or {}),
+            ))
+        return entries
+
     def _list_azure_sql(self, sub_id, account, region):
         try:
             client = SqlManagementClient(self._cred, sub_id)
@@ -789,18 +830,7 @@ class AzureProvider(CloudProvider):
             for server in client.servers.list():
                 if region and server.location != region:
                     continue
-                _, rg, _ = self._parse_arm_id(server.id)
-                for db in client.databases.list_by_server(rg, server.name):
-                    if db.name == "master":
-                        continue
-                    results.append(DatabaseResource(
-                        id=db.id or db.name, name=f"{server.name}/{db.name}",
-                        engine="Azure SQL", state=db.status or "unknown",
-                        region=server.location or "unknown", cloud="azure", account=account,
-                        instance_class=db.sku.name if db.sku else None,
-                        storage_gb=int(db.max_size_bytes / (1024 ** 3)) if db.max_size_bytes else None,
-                        tags=dict(db.tags or {}),
-                    ))
+                results.extend(self._sql_dbs_from_server(client, server, account))
             return results
         except Exception:
             return []
