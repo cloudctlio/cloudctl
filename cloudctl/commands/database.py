@@ -21,29 +21,36 @@ _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure sub
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region / location to query")
 
 
-def _aws_database_rows(cfg, account, region, engine) -> list[dict]:
+def _db_row(db) -> dict:
+    return {
+        "Cloud": cloud_label(db.cloud), "Account": db.account,
+        "ID": db.id, "Engine": db.engine,
+        "Class": db.instance_class or "—", "State": db.state,
+        "Region": db.region,
+        "Multi-AZ": "yes" if db.multi_az else "no",
+        "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
+    }
+
+
+def _aws_dbs_for_profile(profile_name: str, region, engine) -> list[dict]:
     rows: list[dict] = []
+    try:
+        for db in get_aws_provider(profile_name, region).list_databases(account=profile_name, region=region):
+            if engine and engine.lower() not in db.engine.lower():
+                continue
+            rows.append(_db_row(db))
+    except Exception as e:
+        warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _aws_database_rows(cfg, account, region, engine) -> list[dict]:
     profiles = cfg.accounts.get("aws", [])
     targets = [p["name"] for p in profiles if not account or p["name"] == account]
     if not targets and account:
         warn(f"No AWS profile matching '{account}'.")
-        return rows
-    for profile_name in targets:
-        try:
-            for db in get_aws_provider(profile_name, region).list_databases(account=profile_name, region=region):
-                if engine and engine.lower() not in db.engine.lower():
-                    continue
-                rows.append({
-                    "Cloud": cloud_label(db.cloud), "Account": db.account,
-                    "ID": db.id, "Engine": db.engine,
-                    "Class": db.instance_class or "—", "State": db.state,
-                    "Region": db.region,
-                    "Multi-AZ": "yes" if db.multi_az else "no",
-                    "Storage": f"{db.storage_gb} GB" if db.storage_gb else "—",
-                })
-        except Exception as e:
-            warn(f"[AWS/{profile_name}] {e}")
-    return rows
+        return []
+    return [row for profile_name in targets for row in _aws_dbs_for_profile(profile_name, region, engine)]
 
 
 def _azure_database_rows(account, region, engine) -> list[dict]:
