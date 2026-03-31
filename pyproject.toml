@@ -89,15 +89,13 @@ gcp = [
 all-clouds = [
     "cctl[azure,gcp]",
 ]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [project.scripts]
 cloudctl = "cloudctl.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cloudctl"]
-
-[project.optional-dependencies.dev]
-dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
