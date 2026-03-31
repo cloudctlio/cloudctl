@@ -127,6 +127,20 @@ class AWSProvider(CloudProvider):
 
     # ── EKS ──────────────────────────────────────────────────────────────────
 
+    def _describe_eks_cluster(self, eks, name: str, account: str, region: Optional[str]) -> Optional[dict]:
+        try:
+            c = eks.describe_cluster(name=name)["cluster"]
+            return {
+                "name": c["name"],
+                "version": c.get("version", "—"),
+                "status": c.get("status", "—"),
+                "endpoint": c.get("endpoint", "—"),
+                "region": region or self._region or "—",
+                "account": account,
+            }
+        except Exception:
+            return None
+
     def list_eks_clusters(self, account: str, region: Optional[str] = None) -> list[dict]:
         eks = self._client("eks", region)
         paginator = eks.get_paginator("list_clusters")
@@ -135,18 +149,9 @@ class AWSProvider(CloudProvider):
             names.extend(page.get("clusters", []))
         results = []
         for name in names:
-            try:
-                c = eks.describe_cluster(name=name)["cluster"]
-                results.append({
-                    "name": c["name"],
-                    "version": c.get("version", "—"),
-                    "status": c.get("status", "—"),
-                    "endpoint": c.get("endpoint", "—"),
-                    "region": region or self._region or "—",
-                    "account": account,
-                })
-            except Exception:
-                continue
+            entry = self._describe_eks_cluster(eks, name, account, region)
+            if entry is not None:
+                results.append(entry)
         return results
 
     # ── Auto Scaling ─────────────────────────────────────────────────────────
@@ -191,25 +196,30 @@ class AWSProvider(CloudProvider):
 
     # ── EBS ──────────────────────────────────────────────────────────────────
 
+    def _ebs_volume_to_dict(self, vol: dict, account: str, region: Optional[str]) -> dict:
+        tags = {t["Key"]: t["Value"] for t in vol.get("Tags", [])}
+        attachments = vol.get("Attachments", [])
+        attached_to = attachments[0]["InstanceId"] if attachments else "—"
+        return {
+            "id": vol["VolumeId"],
+            "name": tags.get("Name", "—"),
+            "type": vol.get("VolumeType", "—"),
+            "size_gb": vol.get("Size"),
+            "state": vol.get("State", "—"),
+            "iops": vol.get("Iops"),
+            "encrypted": vol.get("Encrypted", False),
+            "attached_to": attached_to,
+            "region": region or self._region or "—",
+            "account": account,
+        }
+
     def list_ebs_volumes(self, account: str, region: Optional[str] = None) -> list[dict]:
         ec2 = self._ec2(region)
         paginator = ec2.get_paginator("describe_volumes")
         results = []
         for page in paginator.paginate():
             for vol in page.get("Volumes", []):
-                tags = {t["Key"]: t["Value"] for t in vol.get("Tags", [])}
-                results.append({
-                    "id": vol["VolumeId"],
-                    "name": tags.get("Name", "—"),
-                    "type": vol.get("VolumeType", "—"),
-                    "size_gb": vol.get("Size"),
-                    "state": vol.get("State", "—"),
-                    "iops": vol.get("Iops"),
-                    "encrypted": vol.get("Encrypted", False),
-                    "attached_to": vol["Attachments"][0]["InstanceId"] if vol.get("Attachments") else "—",
-                    "region": region or self._region or "—",
-                    "account": account,
-                })
+                results.append(self._ebs_volume_to_dict(vol, account, region))
         return results
 
     # ── EFS ──────────────────────────────────────────────────────────────────
@@ -340,7 +350,7 @@ class AWSProvider(CloudProvider):
             raise ValueError(f"Database '{db_id}' not found")
         return self._to_database(instances[0], account, region or self._region or "")
 
-    def list_snapshots(self, account: str, db_id: Optional[str] = None, region: Optional[str] = None) -> list[dict]:
+    def list_snapshots(self, _account: str, db_id: Optional[str] = None, region: Optional[str] = None) -> list[dict]:
         rds = self._client("rds", region)
         kwargs = {}
         if db_id:
@@ -690,7 +700,7 @@ class AWSProvider(CloudProvider):
                 })
         return results
 
-    def check_iam_permission(self, account: str, action: str, resource: str = "*") -> dict:
+    def check_iam_permission(self, _account: str, action: str, resource: str = "*") -> dict:
         iam = self._client("iam")
         arn = self._client("sts").get_caller_identity()["Arn"]
         resp = iam.simulate_principal_policy(
@@ -826,7 +836,6 @@ class AWSProvider(CloudProvider):
 
     def list_waf_web_acls(self, account: str, region: Optional[str] = None) -> list[dict]:
         try:
-            waf = self._client("wafv2", region)
             results = []
             for scope in ("REGIONAL", "CLOUDFRONT"):
                 if scope == "CLOUDFRONT" and (region or self._region) not in (None, "us-east-1"):
@@ -922,7 +931,7 @@ class AWSProvider(CloudProvider):
                 })
         return results
 
-    def list_ssm_parameters(self, account: str, region: Optional[str] = None, path: str = "/") -> list[dict]:
+    def list_ssm_parameters(self, account: str, region: Optional[str] = None, _path: str = "/") -> list[dict]:
         ssm = self._client("ssm", region)
         paginator = ssm.get_paginator("describe_parameters")
         results = []

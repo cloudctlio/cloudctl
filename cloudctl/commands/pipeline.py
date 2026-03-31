@@ -20,6 +20,47 @@ _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure sub
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region to query")
 
 
+def _aws_pipeline_rows(cfg, account, region) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for p in get_aws_provider(profile_name, region).list_pipelines(account=profile_name, region=region):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": profile_name,
+                    "Name": p["name"], "Type": "CodePipeline",
+                    "Updated": p["updated"], "Region": p["region"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _gcp_pipeline_rows(account, region) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for b in get_gcp_provider(project_id=account).list_cloud_build(
+            account=account or "gcp", region=region
+        ):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": b["account"],
+                "Name": b["name"], "Type": "Cloud Build",
+                "Updated": b.get("create_time", "—"), "Region": b.get("region", "global"),
+            })
+        for d in get_gcp_provider(project_id=account).list_cloud_deploy(
+            account=account or "gcp", region=region
+        ):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": d["account"],
+                "Name": d["name"], "Type": "Cloud Deploy",
+                "Updated": d.get("create_time", "—"), "Region": d.get("region", "—"),
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
+
 @app.command("list")
 def pipeline_list(
     cloud:   str           = _CLOUD,
@@ -31,42 +72,13 @@ def pipeline_list(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for p in get_aws_provider(profile_name, region).list_pipelines(account=profile_name, region=region):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": profile_name,
-                        "Name": p["name"], "Type": "CodePipeline",
-                        "Updated": p["updated"], "Region": p["region"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_pipeline_rows(cfg, account, region)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         warn("[Azure] Azure DevOps Pipelines require AZURE_DEVOPS_ORG_URL + AZURE_DEVOPS_PAT env vars.")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for b in get_gcp_provider(project_id=account).list_cloud_build(
-                account=account or "gcp", region=region
-            ):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": b["account"],
-                    "Name": b["name"], "Type": "Cloud Build",
-                    "Updated": b.get("create_time", "—"), "Region": b.get("region", "global"),
-                })
-            for d in get_gcp_provider(project_id=account).list_cloud_deploy(
-                account=account or "gcp", region=region
-            ):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": d["account"],
-                    "Name": d["name"], "Type": "Cloud Deploy",
-                    "Updated": d.get("create_time", "—"), "Region": d.get("region", "—"),
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_pipeline_rows(account, region)
 
     if not rows:
         console.print("[dim]No pipelines found.[/dim]")

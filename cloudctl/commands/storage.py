@@ -20,6 +20,58 @@ _CLOUD   = typer.Option("aws",  "--cloud",   "-c", help="Cloud provider: aws | a
 _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure subscription ID | GCP project ID")
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region / location to query")
 
+_PUBLIC_YES = "[bold red]YES[/bold red]"
+_NO_AWS_PROFILE = "No AWS profile configured."
+
+
+def _storage_row(b) -> dict:
+    return {
+        "Cloud": cloud_label(b.cloud), "Account": b.account,
+        "Name": b.name, "Region": b.region,
+        "Public": _PUBLIC_YES if b.public else "no",
+        "Created": b.created_at[:10] if b.created_at else "—",
+    }
+
+
+def _aws_storage_rows(cfg, account, public_only) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    if not targets and account:
+        warn(f"No AWS profile matching '{account}'.")
+        return rows
+    for profile_name in targets:
+        try:
+            for b in get_aws_provider(profile_name).list_storage(account=profile_name, public_only=public_only):
+                rows.append(_storage_row(b))
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_storage_rows(account, region, public_only) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for b in get_azure_provider(subscription_id=account).list_storage(
+            account=account or "azure", region=region, public_only=public_only
+        ):
+            rows.append(_storage_row(b))
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_storage_rows(account, region, public_only) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for b in get_gcp_provider(project_id=account).list_storage(
+            account=account or "gcp", region=region, public_only=public_only
+        ):
+            rows.append(_storage_row(b))
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
 
 @app.command("list")
 def storage_list(
@@ -33,50 +85,16 @@ def storage_list(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        if not targets and cloud == "aws":
-            warn(f"No AWS profile matching '{account}'.")
+        aws_rows = _aws_storage_rows(cfg, account, public_only)
+        if not aws_rows and cloud == "aws" and account:
             raise typer.Exit(1)
-        for profile_name in targets:
-            try:
-                for b in get_aws_provider(profile_name).list_storage(account=profile_name, public_only=public_only):
-                    rows.append({
-                        "Cloud": cloud_label(b.cloud), "Account": b.account,
-                        "Name": b.name, "Region": b.region,
-                        "Public": "[bold red]YES[/bold red]" if b.public else "no",
-                        "Created": b.created_at[:10] if b.created_at else "—",
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += aws_rows
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for b in get_azure_provider(subscription_id=account).list_storage(
-                account=account or "azure", region=region, public_only=public_only
-            ):
-                rows.append({
-                    "Cloud": cloud_label(b.cloud), "Account": b.account,
-                    "Name": b.name, "Region": b.region,
-                    "Public": "[bold red]YES[/bold red]" if b.public else "no",
-                    "Created": b.created_at[:10] if b.created_at else "—",
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_storage_rows(account, region, public_only)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for b in get_gcp_provider(project_id=account).list_storage(
-                account=account or "gcp", region=region, public_only=public_only
-            ):
-                rows.append({
-                    "Cloud": cloud_label(b.cloud), "Account": b.account,
-                    "Name": b.name, "Region": b.region,
-                    "Public": "[bold red]YES[/bold red]" if b.public else "no",
-                    "Created": b.created_at[:10] if b.created_at else "—",
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_storage_rows(account, region, public_only)
 
     if not rows:
         console.print("[dim]No buckets / containers found.[/dim]")
@@ -96,7 +114,7 @@ def storage_describe(
     if cloud == "aws":
         profile = account or next((p["name"] for p in cfg.accounts.get("aws", [])), None)
         if not profile:
-            error("No AWS profile configured.")
+            error(_NO_AWS_PROFILE)
             raise typer.Exit(1)
         provider, acct = get_aws_provider(profile), profile
     elif cloud == "azure":
@@ -130,7 +148,7 @@ def storage_ls(
     cfg = require_init()
     profile = account or next((p["name"] for p in cfg.accounts.get("aws", [])), None)
     if not profile:
-        error("No AWS profile configured.")
+        error(_NO_AWS_PROFILE)
         raise typer.Exit(1)
 
     parts = path.strip("/").split("/", 1)
@@ -174,7 +192,7 @@ def storage_du(
     cfg = require_init()
     profile = account or next((p["name"] for p in cfg.accounts.get("aws", [])), None)
     if not profile:
-        error("No AWS profile configured.")
+        error(_NO_AWS_PROFILE)
         raise typer.Exit(1)
 
     try:

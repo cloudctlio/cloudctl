@@ -21,6 +21,152 @@ _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure sub
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region / location to query")
 
 
+def _aws_queue_rows(cfg, account, region) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for q in get_aws_provider(profile_name, region).list_sqs_queues(
+                account=profile_name, region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": q["account"],
+                    "Type": "SQS", "Name": q["name"],
+                    "Messages": q.get("messages", "—"), "Region": q["region"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_queue_rows(account, region) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for ns in get_azure_provider(subscription_id=account).list_service_bus_namespaces(
+            account=account or "azure", region=region
+        ):
+            rows.append({
+                "Cloud": cloud_label("azure"), "Account": ns["account"],
+                "Type": f"Service Bus ({ns['sku']})", "Name": ns["name"],
+                "Messages": "—", "Region": ns["region"],
+            })
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_queue_rows(account, region) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for q in get_gcp_provider(project_id=account).list_cloud_tasks(
+            account=account or "gcp", region=region
+        ):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": q["account"],
+                "Type": "Cloud Tasks", "Name": q["name"],
+                "Messages": q.get("size", "—"), "Region": q.get("region", "—"),
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
+
+def _aws_topic_rows(cfg, account, region) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for t in get_aws_provider(profile_name, region).list_sns_topics(
+                account=profile_name, region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": t["account"],
+                    "Type": "SNS", "Name": t["name"], "Region": t["region"],
+                })
+            for b in get_aws_provider(profile_name, region).list_eventbridge_buses(
+                account=profile_name, region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": b["account"],
+                    "Type": "EventBridge", "Name": b["name"], "Region": b["region"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _gcp_topic_rows(account) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for t in get_gcp_provider(project_id=account).list_pubsub_topics(account=account or "gcp"):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": t["account"],
+                "Type": "Pub/Sub", "Name": t["name"], "Region": "global",
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
+
+def _aws_stream_rows(cfg, account, region) -> list[dict]:
+    rows: list[dict] = []
+    profiles = cfg.accounts.get("aws", [])
+    targets = [p["name"] for p in profiles if not account or p["name"] == account]
+    for profile_name in targets:
+        try:
+            for s in get_aws_provider(profile_name, region).list_kinesis_streams(
+                account=profile_name, region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": s["account"],
+                    "Type": "Kinesis", "Name": s["name"],
+                    "State": s["state"], "Region": s["region"],
+                })
+            for m in get_aws_provider(profile_name, region).list_msk_clusters(
+                account=profile_name, region=region
+            ):
+                rows.append({
+                    "Cloud": cloud_label("aws"), "Account": m["account"],
+                    "Type": "MSK", "Name": m["name"],
+                    "State": m["state"], "Region": m["region"],
+                })
+        except Exception as e:
+            warn(f"[AWS/{profile_name}] {e}")
+    return rows
+
+
+def _azure_stream_rows(account, region) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for ns in get_azure_provider(subscription_id=account).list_event_hub_namespaces(
+            account=account or "azure", region=region
+        ):
+            rows.append({
+                "Cloud": cloud_label("azure"), "Account": ns["account"],
+                "Type": f"Event Hubs ({ns['sku']})", "Name": ns["name"],
+                "State": ns["state"], "Region": ns["region"],
+            })
+    except Exception as e:
+        warn(f"[Azure] {e}")
+    return rows
+
+
+def _gcp_stream_rows(account) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        for sub in get_gcp_provider(project_id=account).list_pubsub_subscriptions(account=account or "gcp"):
+            rows.append({
+                "Cloud": cloud_label("gcp"), "Account": sub["account"],
+                "Type": "Pub/Sub Sub", "Name": sub["name"],
+                "State": sub.get("topic", "—"), "Region": "global",
+            })
+    except Exception as e:
+        warn(f"[GCP] {e}")
+    return rows
+
+
 @app.command("queues")
 def messaging_queues(
     cloud:   str           = _CLOUD,
@@ -32,46 +178,13 @@ def messaging_queues(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for q in get_aws_provider(profile_name, region).list_sqs_queues(
-                    account=profile_name, region=region
-                ):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": q["account"],
-                        "Type": "SQS", "Name": q["name"],
-                        "Messages": q.get("messages", "—"), "Region": q["region"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_queue_rows(cfg, account, region)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for ns in get_azure_provider(subscription_id=account).list_service_bus_namespaces(
-                account=account or "azure", region=region
-            ):
-                rows.append({
-                    "Cloud": cloud_label("azure"), "Account": ns["account"],
-                    "Type": f"Service Bus ({ns['sku']})", "Name": ns["name"],
-                    "Messages": "—", "Region": ns["region"],
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_queue_rows(account, region)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for q in get_gcp_provider(project_id=account).list_cloud_tasks(
-                account=account or "gcp", region=region
-            ):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": q["account"],
-                    "Type": "Cloud Tasks", "Name": q["name"],
-                    "Messages": q.get("size", "—"), "Region": q.get("region", "—"),
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_queue_rows(account, region)
 
     if not rows:
         console.print("[dim]No queues found.[/dim]")
@@ -90,39 +203,13 @@ def messaging_topics(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for t in get_aws_provider(profile_name, region).list_sns_topics(
-                    account=profile_name, region=region
-                ):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": t["account"],
-                        "Type": "SNS", "Name": t["name"], "Region": t["region"],
-                    })
-                for b in get_aws_provider(profile_name, region).list_eventbridge_buses(
-                    account=profile_name, region=region
-                ):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": b["account"],
-                        "Type": "EventBridge", "Name": b["name"], "Region": b["region"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_topic_rows(cfg, account, region)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
         warn("[Azure] Service Bus topics are nested under namespaces — use: cloudctl messaging queues --cloud azure")
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for t in get_gcp_provider(project_id=account).list_pubsub_topics(account=account or "gcp"):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": t["account"],
-                    "Type": "Pub/Sub", "Name": t["name"], "Region": "global",
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_topic_rows(account)
 
     if not rows:
         console.print("[dim]No topics found.[/dim]")
@@ -141,52 +228,13 @@ def messaging_streams(
     rows: list[dict] = []
 
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        profiles = cfg.accounts.get("aws", [])
-        targets = [p["name"] for p in profiles if not account or p["name"] == account]
-        for profile_name in targets:
-            try:
-                for s in get_aws_provider(profile_name, region).list_kinesis_streams(
-                    account=profile_name, region=region
-                ):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": s["account"],
-                        "Type": "Kinesis", "Name": s["name"],
-                        "State": s["state"], "Region": s["region"],
-                    })
-                for m in get_aws_provider(profile_name, region).list_msk_clusters(
-                    account=profile_name, region=region
-                ):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": m["account"],
-                        "Type": "MSK", "Name": m["name"],
-                        "State": m["state"], "Region": m["region"],
-                    })
-            except Exception as e:
-                warn(f"[AWS/{profile_name}] {e}")
+        rows += _aws_stream_rows(cfg, account, region)
 
     if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
-        try:
-            for ns in get_azure_provider(subscription_id=account).list_event_hub_namespaces(
-                account=account or "azure", region=region
-            ):
-                rows.append({
-                    "Cloud": cloud_label("azure"), "Account": ns["account"],
-                    "Type": f"Event Hubs ({ns['sku']})", "Name": ns["name"],
-                    "State": ns["state"], "Region": ns["region"],
-                })
-        except Exception as e:
-            warn(f"[Azure] {e}")
+        rows += _azure_stream_rows(account, region)
 
     if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
-        try:
-            for sub in get_gcp_provider(project_id=account).list_pubsub_subscriptions(account=account or "gcp"):
-                rows.append({
-                    "Cloud": cloud_label("gcp"), "Account": sub["account"],
-                    "Type": "Pub/Sub Sub", "Name": sub["name"],
-                    "State": sub.get("topic", "—"), "Region": "global",
-                })
-        except Exception as e:
-            warn(f"[GCP] {e}")
+        rows += _gcp_stream_rows(account)
 
     if not rows:
         console.print("[dim]No streams found.[/dim]")

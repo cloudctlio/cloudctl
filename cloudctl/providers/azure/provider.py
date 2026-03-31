@@ -215,6 +215,28 @@ class AzureProvider(CloudProvider):
 
     # ── Compute — Virtual Machines ───────────────────────────────────────────
 
+    def _compute_from_sub(
+        self, sub_id: str, account: str,
+        region: Optional[str], state: Optional[str], tags: Optional[dict],
+    ) -> list[ComputeResource]:
+        results = []
+        client = ComputeManagementClient(self._cred, sub_id)
+        for vm in client.virtual_machines.list_all():
+            if region and vm.location != region:
+                continue
+            if tags and not all((vm.tags or {}).get(k) == v for k, v in tags.items()):
+                continue
+            vm_state = self._vm_power_state(client, vm)
+            if state and vm_state != state:
+                continue
+            results.append(ComputeResource(
+                id=vm.id or vm.name, name=vm.name, state=vm_state,
+                type=vm.hardware_profile.vm_size if vm.hardware_profile else "unknown",
+                region=vm.location or "unknown", cloud="azure", account=account,
+                tags=dict(vm.tags or {}),
+            ))
+        return results
+
     def list_compute(
         self,
         account: str,
@@ -224,21 +246,7 @@ class AzureProvider(CloudProvider):
     ) -> list[ComputeResource]:
         results = []
         for sub_id in self._subscriptions:
-            client = ComputeManagementClient(self._cred, sub_id)
-            for vm in client.virtual_machines.list_all():
-                if region and vm.location != region:
-                    continue
-                if tags and not all((vm.tags or {}).get(k) == v for k, v in tags.items()):
-                    continue
-                vm_state = self._vm_power_state(client, vm)
-                if state and vm_state != state:
-                    continue
-                results.append(ComputeResource(
-                    id=vm.id or vm.name, name=vm.name, state=vm_state,
-                    type=vm.hardware_profile.vm_size if vm.hardware_profile else "unknown",
-                    region=vm.location or "unknown", cloud="azure", account=account,
-                    tags=dict(vm.tags or {}),
-                ))
+            results.extend(self._compute_from_sub(sub_id, account, region, state, tags))
         return results
 
     def _vm_power_state(self, client, vm) -> str:
@@ -279,27 +287,49 @@ class AzureProvider(CloudProvider):
 
     # ── Compute — VM Scale Sets ───────────────────────────────────────────────
 
+    def _vmss_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = ComputeManagementClient(self._cred, sub_id)
+        for vmss in client.virtual_machine_scale_sets.list_all():
+            if region and vmss.location != region:
+                continue
+            results.append({
+                "account": account, "name": vmss.name,
+                "sku": vmss.sku.name if vmss.sku else "—",
+                "capacity": vmss.sku.capacity if vmss.sku else "—",
+                "state": vmss.provisioning_state or "—",
+                "region": vmss.location or "unknown",
+            })
+        return results
+
     def list_vmss(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Virtual Machine Scale Sets."""
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ComputeManagementClient(self._cred, sub_id)
-                for vmss in client.virtual_machine_scale_sets.list_all():
-                    if region and vmss.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": vmss.name,
-                        "sku": vmss.sku.name if vmss.sku else "—",
-                        "capacity": vmss.sku.capacity if vmss.sku else "—",
-                        "state": vmss.provisioning_state or "—",
-                        "region": vmss.location or "unknown",
-                    })
+                results.extend(self._vmss_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Compute — AKS ─────────────────────────────────────────────────────────
+
+    def _aks_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = ContainerServiceClient(self._cred, sub_id)
+        for cluster in client.managed_clusters.list():
+            if region and cluster.location != region:
+                continue
+            results.append({
+                "account": account, "name": cluster.name,
+                "k8s_version": cluster.kubernetes_version or "—",
+                "node_count": sum(
+                    (p.count or 0) for p in (cluster.agent_pool_profiles or [])
+                ),
+                "state": cluster.provisioning_state or "—",
+                "region": cluster.location or "unknown",
+            })
+        return results
 
     def list_aks_clusters(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Kubernetes Service clusters."""
@@ -308,24 +338,27 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ContainerServiceClient(self._cred, sub_id)
-                for cluster in client.managed_clusters.list():
-                    if region and cluster.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": cluster.name,
-                        "k8s_version": cluster.kubernetes_version or "—",
-                        "node_count": sum(
-                            (p.count or 0) for p in (cluster.agent_pool_profiles or [])
-                        ),
-                        "state": cluster.provisioning_state or "—",
-                        "region": cluster.location or "unknown",
-                    })
+                results.extend(self._aks_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Compute — ACI ─────────────────────────────────────────────────────────
+
+    def _aci_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = ContainerInstanceManagementClient(self._cred, sub_id)
+        for cg in client.container_groups.list():
+            if region and cg.location != region:
+                continue
+            results.append({
+                "account": account, "name": cg.name,
+                "containers": len(cg.containers or []),
+                "os_type": str(cg.os_type) if cg.os_type else "—",
+                "state": cg.provisioning_state or "—",
+                "region": cg.location or "unknown",
+            })
+        return results
 
     def list_container_instances(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Container Instances (container groups)."""
@@ -334,22 +367,29 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ContainerInstanceManagementClient(self._cred, sub_id)
-                for cg in client.container_groups.list():
-                    if region and cg.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": cg.name,
-                        "containers": len(cg.containers or []),
-                        "os_type": str(cg.os_type) if cg.os_type else "—",
-                        "state": cg.provisioning_state or "—",
-                        "region": cg.location or "unknown",
-                    })
+                results.extend(self._aci_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Compute — App Service & Functions ────────────────────────────────────
+
+    def _app_services_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = WebSiteManagementClient(self._cred, sub_id)
+        for app in client.web_apps.list():
+            if region and app.location != region:
+                continue
+            if app.kind and "functionapp" in (app.kind or ""):
+                continue  # skip function apps here
+            results.append({
+                "account": account, "name": app.name,
+                "sku": app.sku if hasattr(app, "sku") else "—",
+                "state": app.state or "—",
+                "url": f"https://{app.default_host_name}" if app.default_host_name else "—",
+                "region": app.location or "unknown",
+            })
+        return results
 
     def list_app_services(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List App Service web apps."""
@@ -358,21 +398,27 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = WebSiteManagementClient(self._cred, sub_id)
-                for app in client.web_apps.list():
-                    if region and app.location != region:
-                        continue
-                    if app.kind and "functionapp" in (app.kind or ""):
-                        continue  # skip function apps here
-                    results.append({
-                        "account": account, "name": app.name,
-                        "sku": app.sku if hasattr(app, "sku") else "—",
-                        "state": app.state or "—",
-                        "url": f"https://{app.default_host_name}" if app.default_host_name else "—",
-                        "region": app.location or "unknown",
-                    })
+                results.extend(self._app_services_from_sub(sub_id, account, region))
             except Exception:
                 pass
+        return results
+
+    def _functions_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = WebSiteManagementClient(self._cred, sub_id)
+        for app in client.web_apps.list():
+            if region and app.location != region:
+                continue
+            if "functionapp" not in (app.kind or ""):
+                continue
+            results.append({
+                "account": account, "name": app.name,
+                "runtime": (app.site_config.linux_fx_version or "—")
+                           if app.site_config else "—",
+                "state": app.state or "—",
+                "url": f"https://{app.default_host_name}" if app.default_host_name else "—",
+                "region": app.location or "unknown",
+            })
         return results
 
     def list_functions(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -382,25 +428,31 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = WebSiteManagementClient(self._cred, sub_id)
-                for app in client.web_apps.list():
-                    if region and app.location != region:
-                        continue
-                    if "functionapp" not in (app.kind or ""):
-                        continue
-                    results.append({
-                        "account": account, "name": app.name,
-                        "runtime": (app.site_config.linux_fx_version or "—")
-                                   if app.site_config else "—",
-                        "state": app.state or "—",
-                        "url": f"https://{app.default_host_name}" if app.default_host_name else "—",
-                        "region": app.location or "unknown",
-                    })
+                results.extend(self._functions_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Storage — Storage Accounts ───────────────────────────────────────────
+
+    def _storage_from_sub(
+        self, sub_id: str, account: str, region: Optional[str], public_only: bool
+    ) -> list[StorageResource]:
+        results = []
+        client = StorageManagementClient(self._cred, sub_id)
+        for sa in client.storage_accounts.list():
+            if region and sa.location != region:
+                continue
+            is_public = bool(sa.allow_blob_public_access)
+            if public_only and not is_public:
+                continue
+            results.append(StorageResource(
+                id=sa.id or sa.name, name=sa.name,
+                region=sa.location or "unknown", cloud="azure", account=account,
+                public=is_public, tags=dict(sa.tags or {}),
+                created_at=sa.creation_time.isoformat() if sa.creation_time else None,
+            ))
+        return results
 
     def list_storage(
         self,
@@ -410,19 +462,7 @@ class AzureProvider(CloudProvider):
     ) -> list[StorageResource]:
         results = []
         for sub_id in self._subscriptions:
-            client = StorageManagementClient(self._cred, sub_id)
-            for sa in client.storage_accounts.list():
-                if region and sa.location != region:
-                    continue
-                is_public = bool(sa.allow_blob_public_access)
-                if public_only and not is_public:
-                    continue
-                results.append(StorageResource(
-                    id=sa.id or sa.name, name=sa.name,
-                    region=sa.location or "unknown", cloud="azure", account=account,
-                    public=is_public, tags=dict(sa.tags or {}),
-                    created_at=sa.creation_time.isoformat() if sa.creation_time else None,
-                ))
+            results.extend(self._storage_from_sub(sub_id, account, region, public_only))
         return results
 
     def describe_storage(self, account: str, storage_name: str) -> StorageResource:
@@ -439,55 +479,80 @@ class AzureProvider(CloudProvider):
 
     # ── Storage — Managed Disks ───────────────────────────────────────────────
 
+    def _managed_disks_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = ComputeManagementClient(self._cred, sub_id)
+        for disk in client.disks.list():
+            if region and disk.location != region:
+                continue
+            results.append({
+                "account": account, "name": disk.name,
+                "size_gb": disk.disk_size_gb or "—",
+                "sku": disk.sku.name if disk.sku else "—",
+                "state": str(disk.disk_state) if disk.disk_state else "—",
+                "attached_to": disk.managed_by.split("/")[-1] if disk.managed_by else "unattached",
+                "region": disk.location or "unknown",
+            })
+        return results
+
     def list_managed_disks(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Managed Disks."""
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ComputeManagementClient(self._cred, sub_id)
-                for disk in client.disks.list():
-                    if region and disk.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": disk.name,
-                        "size_gb": disk.disk_size_gb or "—",
-                        "sku": disk.sku.name if disk.sku else "—",
-                        "state": str(disk.disk_state) if disk.disk_state else "—",
-                        "attached_to": disk.managed_by.split("/")[-1] if disk.managed_by else "unattached",
-                        "region": disk.location or "unknown",
-                    })
+                results.extend(self._managed_disks_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Storage — File Shares ─────────────────────────────────────────────────
 
+    def _file_shares_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        storage_client = StorageManagementClient(self._cred, sub_id)
+        for sa in storage_client.storage_accounts.list():
+            if region and sa.location != region:
+                continue
+            _, rg, _ = self._parse_arm_id(sa.id)
+            try:
+                for share in storage_client.file_shares.list(rg, sa.name):
+                    results.append({
+                        "account": account,
+                        "name": f"{sa.name}/{share.name}",
+                        "quota_gb": share.share_quota or "—",
+                        "state": share.lease_status or "—",
+                        "region": sa.location or "unknown",
+                    })
+            except Exception:
+                pass
+        return results
+
     def list_file_shares(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure File Shares across all storage accounts."""
         results = []
         for sub_id in self._subscriptions:
             try:
-                storage_client = StorageManagementClient(self._cred, sub_id)
-                for sa in storage_client.storage_accounts.list():
-                    if region and sa.location != region:
-                        continue
-                    _, rg, _ = self._parse_arm_id(sa.id)
-                    try:
-                        for share in storage_client.file_shares.list(rg, sa.name):
-                            results.append({
-                                "account": account,
-                                "name": f"{sa.name}/{share.name}",
-                                "quota_gb": share.share_quota or "—",
-                                "state": share.lease_status or "—",
-                                "region": sa.location or "unknown",
-                            })
-                    except Exception:
-                        pass
+                results.extend(self._file_shares_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Network — VNets & NSGs ────────────────────────────────────────────────
+
+    def _vnets_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = NetworkManagementClient(self._cred, sub_id)
+        for vnet in client.virtual_networks.list_all():
+            if region and vnet.location != region:
+                continue
+            prefixes = vnet.address_space.address_prefixes if vnet.address_space else []
+            results.append({
+                "account": account, "id": vnet.id or vnet.name, "name": vnet.name,
+                "cidr": ", ".join(prefixes) if prefixes else "—",
+                "state": "available", "default": False,
+                "region": vnet.location or "unknown",
+            })
+        return results
 
     def list_vnets(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Virtual Networks."""
@@ -496,19 +561,24 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = NetworkManagementClient(self._cred, sub_id)
-                for vnet in client.virtual_networks.list_all():
-                    if region and vnet.location != region:
-                        continue
-                    prefixes = vnet.address_space.address_prefixes if vnet.address_space else []
-                    results.append({
-                        "account": account, "id": vnet.id or vnet.name, "name": vnet.name,
-                        "cidr": ", ".join(prefixes) if prefixes else "—",
-                        "state": "available", "default": False,
-                        "region": vnet.location or "unknown",
-                    })
+                results.extend(self._vnets_from_sub(sub_id, account, region))
             except Exception:
                 pass
+        return results
+
+    def _nsgs_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = NetworkManagementClient(self._cred, sub_id)
+        for nsg in client.network_security_groups.list_all():
+            if region and nsg.location != region:
+                continue
+            inbound = sum(1 for r in (nsg.security_rules or []) if r.direction == "Inbound")
+            outbound = sum(1 for r in (nsg.security_rules or []) if r.direction == "Outbound")
+            results.append({
+                "account": account, "id": nsg.id or nsg.name, "name": nsg.name,
+                "vpc_id": "—", "inbound_rules": inbound, "outbound_rules": outbound,
+                "region": nsg.location or "unknown",
+            })
         return results
 
     def list_nsgs(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -518,22 +588,26 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = NetworkManagementClient(self._cred, sub_id)
-                for nsg in client.network_security_groups.list_all():
-                    if region and nsg.location != region:
-                        continue
-                    inbound = sum(1 for r in (nsg.security_rules or []) if r.direction == "Inbound")
-                    outbound = sum(1 for r in (nsg.security_rules or []) if r.direction == "Outbound")
-                    results.append({
-                        "account": account, "id": nsg.id or nsg.name, "name": nsg.name,
-                        "vpc_id": "—", "inbound_rules": inbound, "outbound_rules": outbound,
-                        "region": nsg.location or "unknown",
-                    })
+                results.extend(self._nsgs_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Network — Load Balancers ──────────────────────────────────────────────
+
+    def _load_balancers_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = NetworkManagementClient(self._cred, sub_id)
+        for lb in client.load_balancers.list_all():
+            if region and lb.location != region:
+                continue
+            results.append({
+                "account": account, "name": lb.name,
+                "sku": lb.sku.name if lb.sku else "—",
+                "state": lb.provisioning_state or "—",
+                "region": lb.location or "unknown",
+            })
+        return results
 
     def list_load_balancers(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Load Balancers."""
@@ -542,16 +616,7 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = NetworkManagementClient(self._cred, sub_id)
-                for lb in client.load_balancers.list_all():
-                    if region and lb.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": lb.name,
-                        "sku": lb.sku.name if lb.sku else "—",
-                        "state": lb.provisioning_state or "—",
-                        "region": lb.location or "unknown",
-                    })
+                results.extend(self._load_balancers_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
@@ -781,6 +846,21 @@ class AzureProvider(CloudProvider):
 
     # ── Database — CosmosDB ───────────────────────────────────────────────────
 
+    def _cosmos_db_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = CosmosDBManagementClient(self._cred, sub_id)
+        for db_account in client.database_accounts.list():
+            if region and db_account.location != region:
+                continue
+            results.append({
+                "account": account, "name": db_account.name,
+                "kind": str(db_account.kind) if db_account.kind else "—",
+                "endpoint": db_account.document_endpoint or "—",
+                "state": db_account.provisioning_state or "—",
+                "region": db_account.location or "unknown",
+            })
+        return results
+
     def list_cosmos_db(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Cosmos DB accounts."""
         if not _COSMOSDB_AVAILABLE:
@@ -788,22 +868,27 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = CosmosDBManagementClient(self._cred, sub_id)
-                for db_account in client.database_accounts.list():
-                    if region and db_account.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": db_account.name,
-                        "kind": str(db_account.kind) if db_account.kind else "—",
-                        "endpoint": db_account.document_endpoint or "—",
-                        "state": db_account.provisioning_state or "—",
-                        "region": db_account.location or "unknown",
-                    })
+                results.extend(self._cosmos_db_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Database — Redis Cache ─────────────────────────────────────────────────
+
+    def _redis_caches_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = RedisManagementClient(self._cred, sub_id)
+        for cache in client.redis.list():
+            if region and cache.location != region:
+                continue
+            results.append({
+                "account": account, "name": cache.name,
+                "sku": f"{cache.sku.name} C{cache.sku.capacity}" if cache.sku else "—",
+                "host": cache.host_name or "—",
+                "state": cache.provisioning_state or "—",
+                "region": cache.location or "unknown",
+            })
+        return results
 
     def list_redis_caches(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Cache for Redis."""
@@ -812,22 +897,37 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = RedisManagementClient(self._cred, sub_id)
-                for cache in client.redis.list():
-                    if region and cache.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": cache.name,
-                        "sku": f"{cache.sku.name} C{cache.sku.capacity}" if cache.sku else "—",
-                        "host": cache.host_name or "—",
-                        "state": cache.provisioning_state or "—",
-                        "region": cache.location or "unknown",
-                    })
+                results.extend(self._redis_caches_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── IAM — RBAC / Key Vault / Managed Identities ───────────────────────────
+
+    def _build_role_map(self, client, sub_id: str) -> dict[str, str]:
+        role_map: dict[str, str] = {}
+        try:
+            for rd in client.role_definitions.list(scope=f"/subscriptions/{sub_id}"):
+                if rd.name and rd.role_name:
+                    role_map[rd.name] = rd.role_name
+        except Exception:
+            pass
+        return role_map
+
+    def _rbac_from_sub(self, sub_id: str, account: str) -> list[dict]:
+        results = []
+        client = AuthorizationManagementClient(self._cred, sub_id)
+        role_map = self._build_role_map(client, sub_id)
+        for assignment in client.role_assignments.list_for_subscription():
+            role_def_uuid = (assignment.role_definition_id or "").split("/")[-1]
+            results.append({
+                "account": account,
+                "name": role_map.get(role_def_uuid, role_def_uuid or "—"),
+                "id": assignment.principal_id or "—",
+                "path": assignment.scope or "—",
+                "created": str(assignment.created_on)[:10] if assignment.created_on else "—",
+            })
+        return results
 
     def list_rbac_assignments(self, account: str) -> list[dict]:
         """List RBAC role assignments."""
@@ -836,25 +936,34 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = AuthorizationManagementClient(self._cred, sub_id)
-                role_map: dict[str, str] = {}
-                try:
-                    for rd in client.role_definitions.list(scope=f"/subscriptions/{sub_id}"):
-                        if rd.name and rd.role_name:
-                            role_map[rd.name] = rd.role_name
-                except Exception:
-                    pass
-                for assignment in client.role_assignments.list_for_subscription():
-                    role_def_uuid = (assignment.role_definition_id or "").split("/")[-1]
-                    results.append({
-                        "account": account,
-                        "name": role_map.get(role_def_uuid, role_def_uuid or "—"),
-                        "id": assignment.principal_id or "—",
-                        "path": assignment.scope or "—",
-                        "created": str(assignment.created_on)[:10] if assignment.created_on else "—",
-                    })
+                results.extend(self._rbac_from_sub(sub_id, account))
             except Exception:
                 pass
+        return results
+
+    def _vault_details(self, client, rg: str, name: str) -> tuple[str, str, str]:
+        try:
+            vault = client.vaults.get(rg, name)
+            sku = vault.properties.sku.name if vault.properties and vault.properties.sku else "—"
+            uri = vault.properties.vault_uri if vault.properties else "—"
+            loc = vault.location or "unknown"
+            return sku, uri, loc
+        except Exception:
+            return "—", "—", "unknown"
+
+    def _key_vaults_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = KeyVaultManagementClient(self._cred, sub_id)
+        for vault_ref in client.vaults.list():
+            _, rg, name = self._parse_arm_id(vault_ref.id)
+            sku, uri, loc = self._vault_details(client, rg, name)
+            if region and loc != region:
+                continue
+            results.append({
+                "account": account, "name": name,
+                "id": vault_ref.id or name, "sku": sku,
+                "uri": uri, "region": loc,
+            })
         return results
 
     def list_key_vaults(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -864,25 +973,23 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = KeyVaultManagementClient(self._cred, sub_id)
-                for vault_ref in client.vaults.list():
-                    _, rg, name = self._parse_arm_id(vault_ref.id)
-                    try:
-                        vault = client.vaults.get(rg, name)
-                        sku = vault.properties.sku.name if vault.properties and vault.properties.sku else "—"
-                        uri = vault.properties.vault_uri if vault.properties else "—"
-                        loc = vault.location or "unknown"
-                    except Exception:
-                        sku, uri, loc = "—", "—", "unknown"
-                    if region and loc != region:
-                        continue
-                    results.append({
-                        "account": account, "name": name,
-                        "id": vault_ref.id or name, "sku": sku,
-                        "uri": uri, "region": loc,
-                    })
+                results.extend(self._key_vaults_from_sub(sub_id, account, region))
             except Exception:
                 pass
+        return results
+
+    def _managed_identities_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = ManagedServiceIdentityClient(self._cred, sub_id)
+        for identity in client.user_assigned_identities.list_by_subscription():
+            if region and identity.location != region:
+                continue
+            results.append({
+                "account": account,
+                "name": identity.name,
+                "id": identity.client_id or identity.principal_id or "—",
+                "created": "—", "last_login": "—",
+            })
         return results
 
     def list_managed_identities(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -892,21 +999,27 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ManagedServiceIdentityClient(self._cred, sub_id)
-                for identity in client.user_assigned_identities.list_by_subscription():
-                    if region and identity.location != region:
-                        continue
-                    results.append({
-                        "account": account,
-                        "username": identity.name,
-                        "id": identity.client_id or identity.principal_id or "—",
-                        "created": "—", "last_login": "—",
-                    })
+                results.extend(self._managed_identities_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Containers — ACR ──────────────────────────────────────────────────────
+
+    def _container_registries_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = ContainerRegistryManagementClient(self._cred, sub_id)
+        for registry in client.registries.list():
+            if region and registry.location != region:
+                continue
+            results.append({
+                "account": account, "name": registry.name,
+                "sku": registry.sku.name if registry.sku else "—",
+                "login_server": registry.login_server or "—",
+                "state": registry.provisioning_state or "—",
+                "region": registry.location or "unknown",
+            })
+        return results
 
     def list_container_registries(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Container Registries."""
@@ -915,22 +1028,38 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ContainerRegistryManagementClient(self._cred, sub_id)
-                for registry in client.registries.list():
-                    if region and registry.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": registry.name,
-                        "sku": registry.sku.name if registry.sku else "—",
-                        "login_server": registry.login_server or "—",
-                        "state": registry.provisioning_state or "—",
-                        "region": registry.location or "unknown",
-                    })
+                results.extend(self._container_registries_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Security — Defender for Cloud ─────────────────────────────────────────
+
+    def _assessment_severity(self, client, assessment) -> str:
+        try:
+            meta = client.assessments_metadata.get(assessment_name=assessment.name)
+            if meta and meta.severity:
+                return str(meta.severity).upper()
+        except Exception:
+            pass
+        return "MEDIUM"
+
+    def _security_audit_from_sub(self, sub_id: str, account: str) -> list[dict]:
+        results = []
+        client = SecurityCenter(self._cred, sub_id)
+        for assessment in client.assessments.list(scope=f"/subscriptions/{sub_id}"):
+            if not assessment.status or assessment.status.code != "Unhealthy":
+                continue
+            severity = self._assessment_severity(client, assessment)
+            resource_id = ""
+            if hasattr(assessment, "resource_details") and assessment.resource_details:
+                resource_id = getattr(assessment.resource_details, "id", "") or ""
+            results.append({
+                "account": account, "severity": severity,
+                "resource": resource_id or assessment.name,
+                "issue": assessment.display_name or assessment.name,
+            })
+        return results
 
     def security_audit(self, account: str) -> list[dict]:
         """Run Defender for Cloud assessments."""
@@ -941,27 +1070,36 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = SecurityCenter(self._cred, sub_id)
-                for assessment in client.assessments.list(scope=f"/subscriptions/{sub_id}"):
-                    if not assessment.status or assessment.status.code != "Unhealthy":
-                        continue
-                    severity = "MEDIUM"
-                    try:
-                        meta = client.assessments_metadata.get(assessment_name=assessment.name)
-                        if meta and meta.severity:
-                            severity = str(meta.severity).upper()
-                    except Exception:
-                        pass
-                    resource_id = ""
-                    if hasattr(assessment, "resource_details") and assessment.resource_details:
-                        resource_id = getattr(assessment.resource_details, "id", "") or ""
-                    results.append({
-                        "account": account, "severity": severity,
-                        "resource": resource_id or assessment.name,
-                        "issue": assessment.display_name or assessment.name,
-                    })
+                results.extend(self._security_audit_from_sub(sub_id, account))
             except Exception:
                 pass
+        return results
+
+    def _public_storage_from_sub(self, sub_id: str, account: str) -> list[dict]:
+        results = []
+        storage_client = StorageManagementClient(self._cred, sub_id)
+        for sa in storage_client.storage_accounts.list():
+            if sa.allow_blob_public_access:
+                results.append({
+                    "account": account, "type": "Storage Account (Public Blob)",
+                    "id": sa.name, "region": sa.location or "unknown",
+                })
+        return results
+
+    def _public_nsgs_from_sub(self, sub_id: str, account: str) -> list[dict]:
+        results = []
+        net_client = NetworkManagementClient(self._cred, sub_id)
+        for nsg in net_client.network_security_groups.list_all():
+            for rule in (nsg.security_rules or []):
+                if (rule.access == "Allow" and rule.direction == "Inbound"
+                        and rule.source_address_prefix in ("*", "Internet", "0.0.0.0/0")
+                        and rule.destination_port_range in ("*", "0-65535")):
+                    results.append({
+                        "account": account,
+                        "type": f"NSG (Open Rule: {rule.name})",
+                        "id": nsg.name, "region": nsg.location or "unknown",
+                    })
+                    break
         return results
 
     def list_public_resources(self, account: str) -> list[dict]:
@@ -969,34 +1107,32 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                storage_client = StorageManagementClient(self._cred, sub_id)
-                for sa in storage_client.storage_accounts.list():
-                    if sa.allow_blob_public_access:
-                        results.append({
-                            "account": account, "type": "Storage Account (Public Blob)",
-                            "id": sa.name, "region": sa.location or "unknown",
-                        })
+                results.extend(self._public_storage_from_sub(sub_id, account))
             except Exception:
                 pass
             if _NETWORK_AVAILABLE:
                 try:
-                    net_client = NetworkManagementClient(self._cred, sub_id)
-                    for nsg in net_client.network_security_groups.list_all():
-                        for rule in (nsg.security_rules or []):
-                            if (rule.access == "Allow" and rule.direction == "Inbound"
-                                    and rule.source_address_prefix in ("*", "Internet", "0.0.0.0/0")
-                                    and rule.destination_port_range in ("*", "0-65535")):
-                                results.append({
-                                    "account": account,
-                                    "type": f"NSG (Open Rule: {rule.name})",
-                                    "id": nsg.name, "region": nsg.location or "unknown",
-                                })
-                                break
+                    results.extend(self._public_nsgs_from_sub(sub_id, account))
                 except Exception:
                     pass
         return results
 
     # ── Monitoring — Azure Monitor ─────────────────────────────────────────────
+
+    def _monitor_alerts_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = MonitorManagementClient(self._cred, sub_id)
+        for alert in client.metric_alerts.list_by_subscription():
+            if region and alert.location != region:
+                continue
+            results.append({
+                "account": account, "name": alert.name,
+                "state": "enabled" if alert.enabled else "disabled",
+                "severity": str(alert.severity) if alert.severity is not None else "—",
+                "description": (alert.description or "")[:60],
+                "region": alert.location or "global",
+            })
+        return results
 
     def list_monitor_alerts(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Monitor metric alert rules."""
@@ -1005,22 +1141,26 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = MonitorManagementClient(self._cred, sub_id)
-                for alert in client.metric_alerts.list_by_subscription():
-                    if region and alert.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": alert.name,
-                        "state": "enabled" if alert.enabled else "disabled",
-                        "severity": str(alert.severity) if alert.severity is not None else "—",
-                        "description": (alert.description or "")[:60],
-                        "region": alert.location or "global",
-                    })
+                results.extend(self._monitor_alerts_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── Messaging — Service Bus / Event Hubs / Logic Apps ─────────────────────
+
+    def _service_bus_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = ServiceBusManagementClient(self._cred, sub_id)
+        for ns in client.namespaces.list():
+            if region and ns.location != region:
+                continue
+            results.append({
+                "account": account, "name": ns.name,
+                "sku": ns.sku.name if ns.sku else "—",
+                "state": ns.status or "—",
+                "region": ns.location or "unknown",
+            })
+        return results
 
     def list_service_bus_namespaces(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Service Bus namespaces."""
@@ -1029,18 +1169,23 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = ServiceBusManagementClient(self._cred, sub_id)
-                for ns in client.namespaces.list():
-                    if region and ns.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": ns.name,
-                        "sku": ns.sku.name if ns.sku else "—",
-                        "state": ns.status or "—",
-                        "region": ns.location or "unknown",
-                    })
+                results.extend(self._service_bus_from_sub(sub_id, account, region))
             except Exception:
                 pass
+        return results
+
+    def _event_hub_namespaces_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = EventHubManagementClient(self._cred, sub_id)
+        for ns in client.namespaces.list():
+            if region and ns.location != region:
+                continue
+            results.append({
+                "account": account, "name": ns.name,
+                "sku": ns.sku.name if ns.sku else "—",
+                "state": ns.status or "—",
+                "region": ns.location or "unknown",
+            })
         return results
 
     def list_event_hub_namespaces(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -1050,18 +1195,22 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = EventHubManagementClient(self._cred, sub_id)
-                for ns in client.namespaces.list():
-                    if region and ns.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": ns.name,
-                        "sku": ns.sku.name if ns.sku else "—",
-                        "state": ns.status or "—",
-                        "region": ns.location or "unknown",
-                    })
+                results.extend(self._event_hub_namespaces_from_sub(sub_id, account, region))
             except Exception:
                 pass
+        return results
+
+    def _logic_apps_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = LogicManagementClient(self._cred, sub_id)
+        for workflow in client.workflows.list_by_subscription():
+            if region and workflow.location != region:
+                continue
+            results.append({
+                "account": account, "name": workflow.name,
+                "state": str(workflow.state) if workflow.state else "—",
+                "region": workflow.location or "unknown",
+            })
         return results
 
     def list_logic_apps(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -1071,20 +1220,29 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = LogicManagementClient(self._cred, sub_id)
-                for workflow in client.workflows.list_by_subscription():
-                    if region and workflow.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": workflow.name,
-                        "state": str(workflow.state) if workflow.state else "—",
-                        "region": workflow.location or "unknown",
-                    })
+                results.extend(self._logic_apps_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
 
     # ── AI / Analytics ────────────────────────────────────────────────────────
+
+    def _cognitive_services_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = CognitiveServicesManagementClient(self._cred, sub_id)
+        for acct in client.accounts.list():
+            if region and acct.location != region:
+                continue
+            results.append({
+                "account": account, "name": acct.name,
+                "kind": acct.kind or "—",
+                "sku": acct.sku.name if acct.sku else "—",
+                "endpoint": (acct.properties.endpoint if acct.properties else None) or "—",
+                "state": (acct.properties.provisioning_state
+                          if acct.properties else None) or "—",
+                "region": acct.location or "unknown",
+            })
+        return results
 
     def list_cognitive_services(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Cognitive Services accounts (includes Azure OpenAI)."""
@@ -1093,21 +1251,22 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = CognitiveServicesManagementClient(self._cred, sub_id)
-                for acct in client.accounts.list():
-                    if region and acct.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": acct.name,
-                        "kind": acct.kind or "—",
-                        "sku": acct.sku.name if acct.sku else "—",
-                        "endpoint": (acct.properties.endpoint if acct.properties else None) or "—",
-                        "state": (acct.properties.provisioning_state
-                                  if acct.properties else None) or "—",
-                        "region": acct.location or "unknown",
-                    })
+                results.extend(self._cognitive_services_from_sub(sub_id, account, region))
             except Exception:
                 pass
+        return results
+
+    def _synapse_workspaces_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = SynapseManagementClient(self._cred, sub_id)
+        for ws in client.workspaces.list():
+            if region and ws.location != region:
+                continue
+            results.append({
+                "account": account, "name": ws.name,
+                "state": ws.provisioning_state or "—",
+                "region": ws.location or "unknown",
+            })
         return results
 
     def list_synapse_workspaces(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -1117,17 +1276,22 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = SynapseManagementClient(self._cred, sub_id)
-                for ws in client.workspaces.list():
-                    if region and ws.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": ws.name,
-                        "state": ws.provisioning_state or "—",
-                        "region": ws.location or "unknown",
-                    })
+                results.extend(self._synapse_workspaces_from_sub(sub_id, account, region))
             except Exception:
                 pass
+        return results
+
+    def _data_factories_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = DataFactoryManagementClient(self._cred, sub_id)
+        for factory in client.factories.list():
+            if region and factory.location != region:
+                continue
+            results.append({
+                "account": account, "name": factory.name,
+                "state": factory.provisioning_state or "—",
+                "region": factory.location or "unknown",
+            })
         return results
 
     def list_data_factories(self, account: str, region: Optional[str] = None) -> list[dict]:
@@ -1137,15 +1301,7 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = DataFactoryManagementClient(self._cred, sub_id)
-                for factory in client.factories.list():
-                    if region and factory.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": factory.name,
-                        "state": factory.provisioning_state or "—",
-                        "region": factory.location or "unknown",
-                    })
+                results.extend(self._data_factories_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
@@ -1224,6 +1380,20 @@ class AzureProvider(CloudProvider):
 
     # ── Backup ────────────────────────────────────────────────────────────────
 
+    def _backup_vaults_from_sub(self, sub_id: str, account: str, region: Optional[str]) -> list[dict]:
+        results = []
+        client = RecoveryServicesClient(self._cred, sub_id)
+        for vault in client.vaults.list_by_subscription_id():
+            if region and vault.location != region:
+                continue
+            results.append({
+                "account": account, "name": vault.name,
+                "sku": vault.sku.name if vault.sku else "—",
+                "state": vault.properties.provisioning_state if vault.properties else "—",
+                "region": vault.location or "unknown",
+            })
+        return results
+
     def list_backup_vaults(self, account: str, region: Optional[str] = None) -> list[dict]:
         """List Azure Recovery Services (Backup) Vaults."""
         if not _BACKUP_AVAILABLE:
@@ -1231,17 +1401,7 @@ class AzureProvider(CloudProvider):
         results = []
         for sub_id in self._subscriptions:
             try:
-                client = RecoveryServicesClient(self._cred, sub_id)
-                for vault in client.vaults.list_by_subscription_id():
-                    if region and vault.location != region:
-                        continue
-                    results.append({
-                        "account": account, "name": vault.name,
-                        "sku": vault.sku.name if vault.sku else "—",
-                        "state": vault.properties.provisioning_state
-                                 if vault.properties else "—",
-                        "region": vault.location or "unknown",
-                    })
+                results.extend(self._backup_vaults_from_sub(sub_id, account, region))
             except Exception:
                 pass
         return results
