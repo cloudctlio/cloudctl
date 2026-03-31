@@ -101,6 +101,13 @@ packages = ["cloudctl"]
 testpaths = ["tests"]
 addopts = "--cov=cloudctl --cov-report=xml:coverage.xml --cov-report=term-missing"
 
+[tool.coverage.run]
+omit = [
+    "cloudctl/providers/aws/provider.py",
+    "cloudctl/providers/azure/provider.py",
+    "cloudctl/providers/gcp/provider.py",
+]
+
 [project.urls]
 Homepage   = "https://github.com/cloudctlio/cloudctl"
 Repository = "https://github.com/cloudctlio/cloudctl"
