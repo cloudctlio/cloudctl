@@ -50,7 +50,6 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: https://sonarcloud.io
 
       # ── 4. Dependencies — pip-audit
       - name: pip-audit dependency scan

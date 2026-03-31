@@ -50,15 +50,12 @@ class GCPProvider(CloudProvider):
         return gapi_build(api, version, credentials=self._creds)
 
     def _paginate(self, request_fn, items_key: str = "items") -> list:
-        """Exhaust all pages of a list call."""
+        """Execute a single-page list call (pagination handled per-method)."""
         results = []
         req = request_fn()
-        while req is not None:
+        if req is not None:
             resp = req.execute()
             results.extend(resp.get(items_key, []))
-            req = request_fn.__self__.list_next(req, resp) \
-                if hasattr(request_fn, "__self__") else None
-            break  # discovery API pagination handled per-method below
         return results
 
     def _all_zones(self, svc) -> list[str]:

@@ -1158,7 +1158,7 @@ class AzureProvider(CloudProvider):
             return [{"account": account, "period": "—", "cost": "—", "currency": "—"}]
         import datetime as _dt
         results = []
-        end = _dt.datetime.utcnow()
+        end = _dt.datetime.now(_dt.timezone.utc)
         start = end - _dt.timedelta(days=days)
         for sub_id in self._subscriptions:
             try:
@@ -1194,7 +1194,7 @@ class AzureProvider(CloudProvider):
             return [{"account": account, "service": "—", "period": "—", "cost": "—"}]
         import datetime as _dt
         results = []
-        end = _dt.datetime.utcnow()
+        end = _dt.datetime.now(_dt.timezone.utc)
         start = end - _dt.timedelta(days=days)
         for sub_id in self._subscriptions:
             try:
