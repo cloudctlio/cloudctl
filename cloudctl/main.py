@@ -5,9 +5,12 @@ One command for AWS, Azure, and GCP.
 from __future__ import annotations
 
 import sys
+from typing import Optional
+
 import typer
 from rich.console import Console
 
+from cloudctl.__init__ import __version__
 from cloudctl.commands import accounts as accounts_cmd
 from cloudctl.commands import compute as compute_cmd
 from cloudctl.commands import config as config_cmd
@@ -18,9 +21,12 @@ from cloudctl.commands import network as network_cmd
 from cloudctl.commands import messaging as messaging_cmd
 from cloudctl.commands import monitoring as monitoring_cmd
 from cloudctl.commands import pipeline as pipeline_cmd
+from cloudctl.commands import profile as profile_cmd
 from cloudctl.commands import security as security_cmd
 from cloudctl.commands import storage as storage_cmd
 from cloudctl.config.init_wizard import run_init_wizard
+from cloudctl.config.manager import ConfigManager
+from cloudctl.output.formatter import set_output_format
 
 app = typer.Typer(
     name="cloudctl",
@@ -42,6 +48,53 @@ app.add_typer(pipeline_cmd.app, name="pipeline")
 app.add_typer(monitoring_cmd.app, name="monitoring")
 app.add_typer(messaging_cmd.app, name="messaging")
 app.add_typer(config_cmd.app, name="config")
+app.add_typer(profile_cmd.app, name="profile")
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"cloudctl [bold cyan]{__version__}[/bold cyan]")
+        raise typer.Exit()
+
+
+@app.callback()
+def global_options(
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o",
+        help="Output format: table | json | csv | yaml  (overrides CLOUDCTL_OUTPUT env var)",
+        metavar="FORMAT",
+    ),
+    profile: Optional[str] = typer.Option(
+        None, "--profile", "-p",
+        help="Named profile to use (overrides CLOUDCTL_PROFILE env var)",
+        metavar="PROFILE",
+    ),
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-V",
+        help="Show version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """⚡ Universal Cloud CLI — one command for AWS, Azure, and GCP."""
+    import os
+    # Apply profile defaults first (lowest precedence)
+    active_profile = profile or os.environ.get("CLOUDCTL_PROFILE")
+    if active_profile and active_profile != "default":
+        try:
+            cfg = ConfigManager()
+            pdata = cfg.get_profile(active_profile)
+            if pdata and not output and "output" in pdata:
+                set_output_format(pdata["output"])
+        except Exception:
+            pass
+
+    if output:
+        valid = {"table", "json", "csv", "yaml"}
+        if output.lower() not in valid:
+            console.print(f"[red]Invalid --output '{output}'. Choose from: {', '.join(sorted(valid))}[/red]")
+            raise typer.Exit(1)
+        set_output_format(output)
 
 
 @app.command()

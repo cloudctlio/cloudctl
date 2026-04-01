@@ -14,6 +14,8 @@ _DEFAULT: dict = {
     "clouds": [],
     "default_output": "table",
     "accounts": {},
+    "active_profile": "default",
+    "profiles": {},
 }
 
 
@@ -55,3 +57,38 @@ class ConfigManager:
     def set_accounts(self, accounts: dict) -> None:
         self._data["accounts"] = accounts
         self.save()
+
+    # ── Profile management ─────────────────────────────────────────────────
+
+    @property
+    def active_profile(self) -> str:
+        return os.environ.get("CLOUDCTL_PROFILE") or self._data.get("active_profile", "default")
+
+    @property
+    def profiles(self) -> dict:
+        return self._data.get("profiles", {})
+
+    def get_profile(self, name: str) -> dict | None:
+        return self.profiles.get(name)
+
+    def set_profile(self, name: str, data: dict) -> None:
+        if "profiles" not in self._data:
+            self._data["profiles"] = {}
+        self._data["profiles"][name] = data
+        self.save()
+
+    def delete_profile(self, name: str) -> bool:
+        if name not in self._data.get("profiles", {}):
+            return False
+        del self._data["profiles"][name]
+        if self._data.get("active_profile") == name:
+            self._data["active_profile"] = "default"
+        self.save()
+        return True
+
+    def use_profile(self, name: str) -> bool:
+        if name != "default" and name not in self._data.get("profiles", {}):
+            return False
+        self._data["active_profile"] = name
+        self.save()
+        return True

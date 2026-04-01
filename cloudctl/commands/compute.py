@@ -11,6 +11,7 @@ from cloudctl.commands._helpers import (
     get_azure_provider,
     get_gcp_provider,
     require_init,
+    run_parallel,
 )
 from cloudctl.output.formatter import cloud_label, error, print_table, success, warn
 
@@ -25,13 +26,14 @@ _NO_AWS_PROFILE = "No AWS profile configured."
 
 
 def _aws_compute_rows(cfg, account, region, state, tag_filter) -> list[dict]:
-    rows: list[dict] = []
     profiles = cfg.accounts.get("aws", [])
     targets = [p["name"] for p in profiles if not account or p["name"] == account]
     if not targets and account:
         warn(f"No AWS profile matching '{account}'. Run: cloudctl accounts list")
-        return rows
-    for profile_name in targets:
+        return []
+
+    def _fetch(profile_name: str) -> list[dict]:
+        rows: list[dict] = []
         try:
             for inst in get_aws_provider(profile_name, region).list_compute(
                 account=profile_name, region=region, state=state, tags=tag_filter
@@ -44,7 +46,9 @@ def _aws_compute_rows(cfg, account, region, state, tag_filter) -> list[dict]:
                 })
         except Exception as e:
             warn(f"[AWS/{profile_name}] {e}")
-    return rows
+        return rows
+
+    return run_parallel(_fetch, targets)
 
 
 def _azure_compute_rows(account, region, state) -> list[dict]:
