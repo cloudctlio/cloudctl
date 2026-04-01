@@ -110,6 +110,7 @@ def _gcp_public_resource_rows(account) -> list[dict]:
 def security_audit(
     cloud:   str           = _CLOUD,
     account: Optional[str] = _ACCOUNT,
+    fix:     bool          = typer.Option(False, "--fix", help="Propose and apply AI-generated fixes (requires AI configured)."),
 ) -> None:
     """Run security checks: public buckets, open security groups, IAM users without MFA."""
     cfg = require_init()
@@ -128,6 +129,34 @@ def security_audit(
         console.print("[bold green]No security issues found.[/bold green]")
         return
     print_table(rows, title=f"Security Audit Findings ({len(rows)})")
+
+    if fix and rows:
+        _apply_fixes(cfg, rows)
+
+
+def _apply_fixes(cfg, raw_findings: list[dict]) -> None:
+    """Propose and apply AI fixes for security findings (requires AI configured)."""
+    try:
+        from cloudctl.ai.fixer import AIFixer  # noqa: PLC0415
+    except ImportError:
+        warn("AI module not installed. Run: pip install 'cctl[ai]'")
+        return
+
+    # Convert display rows back to finding dicts by stripping Rich markup
+    import re  # noqa: PLC0415
+    issues = []
+    for row in raw_findings:
+        issues.append({
+            "severity": re.sub(r"\[.*?\]", "", row.get("Severity", "")),
+            "resource":  row.get("Resource", ""),
+            "issue":     row.get("Issue", ""),
+            "account":   row.get("Account", ""),
+        })
+
+    fixer     = AIFixer(cfg)
+    proposals = fixer.propose(issues)
+    proposals = fixer.present_and_confirm(proposals)
+    fixer.apply(proposals)
 
 
 @app.command("public-resources")
