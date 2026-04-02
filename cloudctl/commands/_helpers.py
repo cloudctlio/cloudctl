@@ -1,7 +1,8 @@
 """Shared helpers used by every command module."""
 from __future__ import annotations
 
-from typing import Optional
+import concurrent.futures
+from typing import Callable, Optional
 
 import typer
 from rich.console import Console
@@ -70,3 +71,20 @@ def get_gcp_provider(project_id: Optional[str] = None):
     except Exception as e:
         error(str(e))
         raise typer.Exit(1)
+
+
+def run_parallel(fn: Callable, items: list, max_workers: int = 8) -> list:
+    """Run fn(item) for each item in parallel, preserving order, swallowing exceptions."""
+    results: list = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(fn, item): item for item in items}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+                if isinstance(result, list):
+                    results.extend(result)
+                elif result is not None:
+                    results.append(result)
+            except Exception as exc:
+                warn(f"[parallel] {futures[future]}: {exc}")
+    return results
