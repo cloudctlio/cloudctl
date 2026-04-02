@@ -7,6 +7,14 @@ from cloudctl.commands._helpers import get_aws_provider, get_azure_provider, get
 from cloudctl.config.manager import ConfigManager
 
 
+def _safe_fetch(fn):
+    """Run fn(); return its result, or None on any exception."""
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
 class DataFetcher:
     """Fetches real cloud data for AI context. Never calls AI without fetching first."""
 
@@ -55,43 +63,38 @@ class DataFetcher:
             return data
 
         if "compute" in include:
-            try:
-                data["compute"] = [
-                    {"id": i.id, "name": i.name, "type": i.type, "state": i.state, "region": i.region}
-                    for i in prov.list_compute(account=profile, region=region)
-                ]
-            except Exception:
-                pass
+            val = _safe_fetch(lambda: [
+                {"id": i.id, "name": i.name, "type": i.type, "state": i.state, "region": i.region}
+                for i in prov.list_compute(account=profile, region=region)
+            ])
+            if val is not None:
+                data["compute"] = val
 
         if "storage" in include:
-            try:
-                data["storage"] = [
-                    {"name": b.name, "region": b.region or "global", "public": b.public}
-                    for b in prov.list_storage(account=profile, region=region)
-                ]
-            except Exception:
-                pass
+            val = _safe_fetch(lambda: [
+                {"name": b.name, "region": b.region or "global", "public": b.public}
+                for b in prov.list_storage(account=profile, region=region)
+            ])
+            if val is not None:
+                data["storage"] = val
 
         if "database" in include:
-            try:
-                data["database"] = [
-                    {"id": db.id, "engine": db.engine, "state": db.state, "region": db.region}
-                    for db in prov.list_databases(account=profile, region=region)
-                ]
-            except Exception:
-                pass
+            val = _safe_fetch(lambda: [
+                {"id": db.id, "engine": db.engine, "state": db.state, "region": db.region}
+                for db in prov.list_databases(account=profile, region=region)
+            ])
+            if val is not None:
+                data["database"] = val
 
         if "cost" in include:
-            try:
-                data["cost"] = prov.get_cost_summary(account=profile)
-            except Exception:
-                pass
+            val = _safe_fetch(lambda: prov.get_cost_summary(account=profile))
+            if val is not None:
+                data["cost"] = val
 
         if "security" in include:
-            try:
-                data["security_findings"] = prov.get_security_findings(account=profile)
-            except Exception:
-                pass
+            val = _safe_fetch(lambda: prov.get_security_findings(account=profile))
+            if val is not None:
+                data["security_findings"] = val
 
         return data
 
@@ -169,7 +172,7 @@ class DataFetcher:
 
     # ── Specific fetchers (used by debug engine) ───────────────────────────────
 
-    def fetch_compute_metrics(self, accounts: list[str], days: int = 14) -> dict:
+    def fetch_compute_metrics(self, accounts: list[str]) -> dict:
         """Fetch CloudWatch/Monitor metrics for compute instances."""
         result: dict = {}
         for profile in accounts:
@@ -180,7 +183,7 @@ class DataFetcher:
                 pass
         return result
 
-    def fetch_cost_data(self, accounts: list[str], days: int = 30) -> dict:
+    def fetch_cost_data(self, accounts: list[str]) -> dict:
         """Fetch cost data from Cost Explorer / Cost Management / Billing."""
         result: dict = {}
         for profile in accounts:

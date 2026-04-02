@@ -71,10 +71,12 @@ class AWSS3PublicAccessFixer(BaseFixer):
         bucket   = match.group(1) if match else resource.split("/")[-1]
         account  = issue.get("account", "default")
 
-        session = boto3.Session(profile_name=account)
-        s3      = session.client("s3")
+        session  = boto3.Session(profile_name=account)
+        s3       = session.client("s3")
+        owner_id = session.client("sts").get_caller_identity()["Account"]
         s3.put_public_access_block(
             Bucket=bucket,
+            ExpectedBucketOwner=owner_id,
             PublicAccessBlockConfiguration={
                 "BlockPublicAcls":       True,
                 "IgnorePublicAcls":      True,

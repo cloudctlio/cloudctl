@@ -147,7 +147,7 @@ def _apply_fixes(cfg, raw_findings: list[dict]) -> None:
     issues = []
     for row in raw_findings:
         issues.append({
-            "severity": re.sub(r"\[.*?\]", "", row.get("Severity", "")),
+            "severity": re.sub(r"\[[^\]]*\]", "", row.get("Severity", "")),
             "resource":  row.get("Resource", ""),
             "issue":     row.get("Issue", ""),
             "account":   row.get("Account", ""),
