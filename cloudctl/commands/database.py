@@ -11,6 +11,7 @@ from cloudctl.commands._helpers import (
     get_azure_provider,
     get_gcp_provider,
     require_init,
+    run_parallel,
 )
 from cloudctl.output.formatter import cloud_label, error, print_table, warn
 
@@ -32,11 +33,13 @@ def _db_row(db) -> dict:
     }
 
 
-def _aws_dbs_for_profile(profile_name: str, region, engine) -> list[dict]:
+def _aws_dbs_for_profile(profile_name: str, region, engine, tag_filter=None) -> list[dict]:
     rows: list[dict] = []
     try:
         for db in get_aws_provider(profile_name, region).list_databases(account=profile_name, region=region):
             if engine and engine.lower() not in db.engine.lower():
+                continue
+            if tag_filter and not all(db.tags.get(k) == v for k, v in tag_filter.items()):
                 continue
             rows.append(_db_row(db))
     except Exception as e:
@@ -44,13 +47,13 @@ def _aws_dbs_for_profile(profile_name: str, region, engine) -> list[dict]:
     return rows
 
 
-def _aws_database_rows(cfg, account, region, engine) -> list[dict]:
+def _aws_database_rows(cfg, account, region, engine, tag_filter=None) -> list[dict]:
     profiles = cfg.accounts.get("aws", [])
     targets = [p["name"] for p in profiles if not account or p["name"] == account]
     if not targets and account:
         warn(f"No AWS profile matching '{account}'.")
         return []
-    return [row for profile_name in targets for row in _aws_dbs_for_profile(profile_name, region, engine)]
+    return run_parallel(lambda p: _aws_dbs_for_profile(p, region, engine, tag_filter), targets)
 
 
 def _azure_database_rows(account, region, engine) -> list[dict]:
@@ -95,13 +98,22 @@ def database_list(
     account: Optional[str] = _ACCOUNT,
     region:  Optional[str] = _REGION,
     engine:  Optional[str] = typer.Option(None, "--engine", "-e", help="Filter by engine (e.g. postgres, mysql, Azure SQL)"),
+    tag:     Optional[str] = typer.Option(None, "--tag", "-t", help="Filter by tag Key=Value (AWS only)."),
 ) -> None:
     """List database instances."""
     cfg = require_init()
     rows: list[dict] = []
 
+    tag_filter: Optional[dict] = None
+    if tag:
+        if "=" not in tag:
+            error("--tag must be Key=Value format.")
+            raise typer.Exit(1)
+        k, v = tag.split("=", 1)
+        tag_filter = {k: v}
+
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        aws_rows = _aws_database_rows(cfg, account, region, engine)
+        aws_rows = _aws_database_rows(cfg, account, region, engine, tag_filter)
         if not aws_rows and cloud == "aws" and account:
             raise typer.Exit(1)
         rows += aws_rows

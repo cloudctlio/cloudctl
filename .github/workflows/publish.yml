@@ -3,6 +3,7 @@ name: Publish to PyPI
 on:
   release:
     types: [created]
+  workflow_dispatch:       # allow manual publish from Actions tab
 
 jobs:
   publish:
@@ -25,9 +26,21 @@ jobs:
       - name: Install build tools
         run: pip install build hatchling
 
+      - name: Install package and run tests
+        run: |
+          pip install -e . pytest pytest-cov
+          pytest tests/ -q --no-header
+
       - name: Build package
         run: python -m build
 
+      - name: Check dist
+        run: |
+          pip install twine
+          twine check dist/*
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
         # No API token needed — uses trusted publishing via OIDC

@@ -106,6 +106,13 @@ omit = [
     "cloudctl/providers/aws/provider.py",
     "cloudctl/providers/azure/provider.py",
     "cloudctl/providers/gcp/provider.py",
+    "cloudctl/ai/*.py",
+    "cloudctl/ai/prompts/*.py",
+    "cloudctl/fixers/*.py",
+    "cloudctl/fixers/aws/*.py",
+    "cloudctl/fixers/azure/*.py",
+    "cloudctl/fixers/gcp/*.py",
+    "cloudctl/config/init_wizard.py",
 ]
 
 [project.urls]

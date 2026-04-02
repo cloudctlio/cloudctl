@@ -11,6 +11,7 @@ from cloudctl.commands._helpers import (
     get_azure_provider,
     get_gcp_provider,
     require_init,
+    run_parallel,
 )
 from cloudctl.output.formatter import cloud_label, error, print_table, warn
 
@@ -53,20 +54,27 @@ def _storage_row(b) -> dict:
     }
 
 
-def _aws_storage_rows(cfg, account, public_only) -> list[dict]:
-    rows: list[dict] = []
+def _aws_storage_rows(cfg, account, public_only, tag_filter=None) -> list[dict]:
     profiles = cfg.accounts.get("aws", [])
     targets = [p["name"] for p in profiles if not account or p["name"] == account]
     if not targets and account:
         warn(f"No AWS profile matching '{account}'.")
-        return rows
-    for profile_name in targets:
+        return []
+
+    def _fetch(profile_name: str) -> list[dict]:
+        rows: list[dict] = []
         try:
-            for b in get_aws_provider(profile_name).list_storage(account=profile_name, public_only=public_only):
+            for b in get_aws_provider(profile_name).list_storage(
+                account=profile_name, public_only=public_only
+            ):
+                if tag_filter and not all(b.tags.get(k) == v for k, v in tag_filter.items()):
+                    continue
                 rows.append(_storage_row(b))
         except Exception as e:
             warn(f"[AWS/{profile_name}] {e}")
-    return rows
+        return rows
+
+    return run_parallel(_fetch, targets)
 
 
 def _azure_storage_rows(account, region, public_only) -> list[dict]:
@@ -99,13 +107,22 @@ def storage_list(
     account:     Optional[str] = _ACCOUNT,
     region:      Optional[str] = _REGION,
     public_only: bool          = typer.Option(False, "--public-only", help="Show only publicly accessible buckets."),
+    tag:         Optional[str] = typer.Option(None, "--tag", "-t", help="Filter by tag Key=Value (AWS only)."),
 ) -> None:
     """List storage buckets / containers."""
     cfg = require_init()
     rows: list[dict] = []
 
+    tag_filter: Optional[dict] = None
+    if tag:
+        if "=" not in tag:
+            error("--tag must be Key=Value format.")
+            raise typer.Exit(1)
+        k, v = tag.split("=", 1)
+        tag_filter = {k: v}
+
     if cloud in ("aws", "all") and "aws" in cfg.clouds:
-        aws_rows = _aws_storage_rows(cfg, account, public_only)
+        aws_rows = _aws_storage_rows(cfg, account, public_only, tag_filter)
         if not aws_rows and cloud == "aws" and account:
             raise typer.Exit(1)
         rows += aws_rows

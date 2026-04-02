@@ -1,0 +1,7 @@
+title = "cloudctl gitleaks configuration"
+
+[allowlist]
+  description = "Test fixture files intentionally contain fake credential-shaped strings"
+  paths = [
+    '''(^|/)tests/'''
+  ]
