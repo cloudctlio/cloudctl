@@ -16,7 +16,7 @@ class AzureNSGOpenRuleFixer(BaseFixer):
         resource   = issue.get("resource", "").lower()
         issue_text = issue.get("issue", "").lower()
         return ("nsg" in resource or "security group" in resource) and (
-            "any" in issue_text or "0.0.0.0" in issue_text or "internet" in issue_text
+            "any" in issue_text or "unrestricted" in issue_text or "internet" in issue_text
         )
 
     def apply(self, issue: dict, fix_proposal: dict) -> None:
