@@ -32,7 +32,6 @@ def score(
     *,
     required_keys: Optional[list[str]] = None,
     expected_accounts: int = 1,
-    days_requested: int = 14,
     historical_accuracy: Optional[float] = None,
 ) -> ConfidenceScore:
     """

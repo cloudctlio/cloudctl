@@ -23,6 +23,14 @@ _DAYS    = typer.Option(30,     "--days",    "-d", help="Number of days to look 
 _TOTAL_COST = "Total Cost"
 
 
+def _budget_status_color(status: str) -> str:
+    if status == "ALARM":
+        return "bold red"
+    if status == "WARNING":
+        return "bold yellow"
+    return "green"
+
+
 def _aws_cost_summary_rows(cfg, account, days) -> list[dict]:
     rows: list[dict] = []
     profiles = cfg.accounts.get("aws", [])
@@ -200,7 +208,7 @@ def _aws_budget_rows(cfg, account) -> list[dict]:
                 pct = b.get("pct_used")
                 pct_str = f"{pct:.1f}%" if pct is not None else "—"
                 status = b.get("status", "OK")
-                color = "bold red" if status == "ALARM" else ("bold yellow" if status == "WARNING" else "green")
+                color = _budget_status_color(status)
                 rows.append({
                     "Cloud": cloud_label("aws"), "Account": b["account"],
                     "Budget": b["name"],
@@ -222,7 +230,7 @@ def _azure_budget_rows(account) -> list[dict]:
             pct = b.get("pct_used")
             pct_str = f"{pct:.1f}%" if pct is not None else "—"
             status = b.get("status", "OK")
-            color = "bold red" if status == "ALARM" else ("bold yellow" if status == "WARNING" else "green")
+            color = _budget_status_color(status)
             rows.append({
                 "Cloud": cloud_label("azure"), "Account": b["account"],
                 "Budget": b["name"],

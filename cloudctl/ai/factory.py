@@ -22,6 +22,11 @@ class BaseAI:
         raise NotImplementedError
 
 
+# ── Config key constants ───────────────────────────────────────────────────────
+
+_CFG_TIER     = "ai.tier"
+_CFG_PROVIDER = "ai.provider"
+
 # ── Model ID tables ────────────────────────────────────────────────────────────
 
 _BEDROCK_MODELS = {
@@ -80,7 +85,7 @@ class BedrockAI(BaseAI):
     def __init__(self, cfg: ConfigManager):
         import boto3  # noqa: PLC0415
         region = cfg.get("ai.bedrock_region") or "us-east-1"
-        tier   = cfg.get("ai.tier") or "sonnet"
+        tier   = cfg.get(_CFG_TIER) or "sonnet"
         self._model = cfg.get("ai.bedrock_model") or _BEDROCK_MODELS.get(tier, _BEDROCK_MODELS["sonnet"])
         self._client = boto3.client("bedrock-runtime", region_name=region)
 
@@ -118,7 +123,7 @@ class BedrockAI(BaseAI):
 class AzureFoundryAI(BaseAI):
     def __init__(self, cfg: ConfigManager):
         resource  = cfg.get("ai.azure_foundry_resource") or ""
-        tier      = cfg.get("ai.tier") or "sonnet"
+        tier      = cfg.get(_CFG_TIER) or "sonnet"
         self._model = cfg.get("ai.azure_foundry_model") or _AZURE_MODELS.get(tier, _AZURE_MODELS["sonnet"])
         base_url    = f"https://{resource}.services.ai.azure.com/anthropic"
         api_key     = cfg.get("ai.azure_foundry_api_key")
@@ -173,7 +178,7 @@ class VertexAI(BaseAI):
         import google.auth  # noqa: PLC0415
         _, project = google.auth.default()
         region     = cfg.get("ai.vertex_region") or "us-east5"
-        tier       = cfg.get("ai.tier") or "sonnet"
+        tier       = cfg.get(_CFG_TIER) or "sonnet"
         project_id = cfg.get("ai.vertex_project") or project or ""
         self._model  = cfg.get("ai.vertex_model") or _VERTEX_MODELS.get(tier, _VERTEX_MODELS["sonnet"])
         self._client = AnthropicVertex(region=region, project_id=project_id)
@@ -208,7 +213,7 @@ class AnthropicAI(BaseAI):
     def __init__(self, cfg: ConfigManager):
         from anthropic import Anthropic  # noqa: PLC0415
         api_key     = cfg.get("ai.anthropic_api_key") or ""
-        tier        = cfg.get("ai.tier") or "sonnet"
+        tier        = cfg.get(_CFG_TIER) or "sonnet"
         self._model  = cfg.get("ai.anthropic_model") or _ANTHROPIC_MODELS.get(tier, _ANTHROPIC_MODELS["sonnet"])
         self._client = Anthropic(api_key=api_key)
 
@@ -326,7 +331,7 @@ _PROVIDER_MAP: dict[str, type] = {
 
 def get_ai(cfg: ConfigManager, purpose: str = "default") -> BaseAI:
     """Return configured AI provider instance."""
-    provider = cfg.get("ai.provider") or "none"
+    provider = cfg.get(_CFG_PROVIDER) or "none"
     if provider == "auto":
         provider = _auto_detect_provider(cfg) or "none"
     if purpose == "analysis":
@@ -350,7 +355,7 @@ def get_fix_ai(cfg: ConfigManager) -> BaseAI:
 
 def is_ai_configured(cfg: ConfigManager) -> bool:
     try:
-        provider = cfg.get("ai.provider") or "none"
+        provider = cfg.get(_CFG_PROVIDER) or "none"
         if provider in ("none", "", None):
             return False
         if provider == "auto":
@@ -360,33 +365,38 @@ def is_ai_configured(cfg: ConfigManager) -> bool:
         return False
 
 
-def get_ai_status(cfg: ConfigManager) -> dict:
-    provider = cfg.get("ai.provider") or "none"
-    tier     = cfg.get("ai.tier") or "sonnet"
-    status   = {"provider": provider, "tier": tier}
+def _mask(val: Optional[str]) -> str:
+    if not val or len(val) < 8:
+        return "***"
+    return f"{val[:4]}...{val[-4:]}"
 
-    def _mask(val: Optional[str]) -> str:
-        if not val or len(val) < 8:
-            return "***"
-        return f"{val[:4]}...{val[-4:]}"
 
+def _provider_status_fields(provider: str, cfg: ConfigManager) -> dict:
     if provider == "bedrock":
-        status["region"] = cfg.get("ai.bedrock_region") or "us-east-1"
-    elif provider == "azure":
-        status["resource"] = cfg.get("ai.azure_foundry_resource") or "—"
+        return {"region": cfg.get("ai.bedrock_region") or "us-east-1"}
+    if provider == "azure":
+        fields: dict = {"resource": cfg.get("ai.azure_foundry_resource") or "—"}
         key = cfg.get("ai.azure_foundry_api_key")
         if key:
-            status["api_key"] = _mask(key)
-    elif provider == "vertex":
-        status["region"]  = cfg.get("ai.vertex_region") or "us-east5"
-        status["project"] = cfg.get("ai.vertex_project") or "—"
-    elif provider == "anthropic":
-        status["api_key"] = _mask(cfg.get("ai.anthropic_api_key"))
-    elif provider == "openai":
-        status["api_key"] = _mask(cfg.get("ai.openai_api_key"))
-        status["model"]   = cfg.get("ai.openai_model") or "gpt-4o"
-    elif provider == "ollama":
-        status["host"]  = cfg.get("ai.ollama_host") or "http://localhost:11434"
-        status["model"] = cfg.get("ai.ollama_model") or "llama3"
+            fields["api_key"] = _mask(key)
+        return fields
+    if provider == "vertex":
+        return {"region": cfg.get("ai.vertex_region") or "us-east5",
+                "project": cfg.get("ai.vertex_project") or "—"}
+    if provider == "anthropic":
+        return {"api_key": _mask(cfg.get("ai.anthropic_api_key"))}
+    if provider == "openai":
+        return {"api_key": _mask(cfg.get("ai.openai_api_key")),
+                "model":   cfg.get("ai.openai_model") or "gpt-4o"}
+    if provider == "ollama":
+        return {"host":  cfg.get("ai.ollama_host") or "http://localhost:11434",
+                "model": cfg.get("ai.ollama_model") or "llama3"}
+    return {}
 
+
+def get_ai_status(cfg: ConfigManager) -> dict:
+    provider = cfg.get(_CFG_PROVIDER) or "none"
+    tier     = cfg.get(_CFG_TIER) or "sonnet"
+    status   = {"provider": provider, "tier": tier}
+    status.update(_provider_status_fields(provider, cfg))
     return status

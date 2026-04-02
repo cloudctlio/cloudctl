@@ -24,6 +24,17 @@ _AWS_SERVICES = [
 ]
 
 
+def _calc_used_pct(q: dict) -> str:
+    used  = q.get("used")
+    value = q.get("value")
+    if used is None or not value:
+        return "—"
+    try:
+        return f"{float(used) / float(value) * 100:.0f}%"
+    except (ZeroDivisionError, ValueError):
+        return "—"
+
+
 def _aws_quota_rows(cfg, account, region, service) -> list[dict]:
     profiles = cfg.accounts.get("aws", [])
     targets = [p["name"] for p in profiles if not account or p["name"] == account]
@@ -37,18 +48,11 @@ def _aws_quota_rows(cfg, account, region, service) -> list[dict]:
                 for q in prov.list_service_quotas(
                     account=profile_name, service_code=svc, region=region
                 ):
-                    used_pct = ""
-                    if q.get("used") is not None and q.get("value"):
-                        try:
-                            pct = float(q["used"]) / float(q["value"]) * 100
-                            used_pct = f"{pct:.0f}%"
-                        except (ZeroDivisionError, ValueError):
-                            pass
                     rows.append({
                         "Cloud": cloud_label("aws"), "Account": q["account"],
                         "Service": svc.upper(), "Quota": q["name"],
                         "Limit": q.get("value", "—"), "Used": q.get("used", "—"),
-                        "Used%": used_pct or "—", "Region": q.get("region", region or "—"),
+                        "Used%": _calc_used_pct(q), "Region": q.get("region", region or "—"),
                     })
             except Exception as e:
                 warn(f"[AWS/{profile_name}/{svc}] {e}")

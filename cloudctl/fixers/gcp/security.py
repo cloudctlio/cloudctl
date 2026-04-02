@@ -26,7 +26,7 @@ class GCPOpenFirewallFixer(BaseFixer):
 
         resource = issue.get("resource", "")
         project  = issue.get("account", "")
-        match    = re.search(r"firewall[s]?/([^\s/]+)", resource, re.IGNORECASE)
+        match    = re.search(r"firewalls?/([^\s/]+)", resource, re.IGNORECASE)
         if not match:
             raise ValueError(f"Could not parse firewall rule name from: {resource}")
 

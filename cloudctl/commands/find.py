@@ -26,46 +26,59 @@ def _matches(name: str, query: str) -> bool:
     return query.lower() in name.lower()
 
 
+def _parse_tag_filter(tag: Optional[str]) -> Optional[dict]:
+    if not tag:
+        return None
+    k, _, v = tag.partition("=")
+    return {k: v} if v else None
+
+
+def _aws_compute_rows(prov, profile_name, region, query, tag_filter) -> list[dict]:
+    return [
+        {"Cloud": cloud_label("aws"), "Account": inst.account,
+         "Type": "EC2", "Name": inst.name or inst.id,
+         "State": inst.state, "Region": inst.region}
+        for inst in prov.list_compute(account=profile_name, region=region, tags=tag_filter)
+        if not query or _matches(inst.name or inst.id, query)
+    ]
+
+
+def _aws_storage_rows(prov, profile_name, region, query) -> list[dict]:
+    return [
+        {"Cloud": cloud_label("aws"), "Account": b.account,
+         "Type": "S3", "Name": b.name,
+         "State": "active", "Region": b.region or "global"}
+        for b in prov.list_storage(account=profile_name, region=region)
+        if not query or _matches(b.name, query)
+    ]
+
+
+def _aws_database_rows(prov, profile_name, region, query) -> list[dict]:
+    return [
+        {"Cloud": cloud_label("aws"), "Account": db.account,
+         "Type": f"RDS/{db.engine}", "Name": db.id,
+         "State": db.state, "Region": db.region}
+        for db in prov.list_databases(account=profile_name, region=region)
+        if not query or _matches(db.id, query)
+    ]
+
+
 def _aws_find_rows(cfg, account, region, query, tag) -> list[dict]:
     profiles = cfg.accounts.get("aws", [])
     targets = [p["name"] for p in profiles if not account or p["name"] == account]
 
     def _fetch(profile_name: str) -> list[dict]:
-        rows: list[dict] = []
         try:
             prov = get_aws_provider(profile_name, region)
-            tag_filter = None
-            if tag:
-                k, _, v = tag.partition("=")
-                tag_filter = {k: v} if v else None
-
-            # Compute instances
-            for inst in prov.list_compute(account=profile_name, region=region, tags=tag_filter):
-                if not query or _matches(inst.name or inst.id, query):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": inst.account,
-                        "Type": "EC2", "Name": inst.name or inst.id,
-                        "State": inst.state, "Region": inst.region,
-                    })
-            # S3 buckets
-            for b in prov.list_storage(account=profile_name, region=region):
-                if not query or _matches(b.name, query):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": b.account,
-                        "Type": "S3", "Name": b.name,
-                        "State": "active", "Region": b.region or "global",
-                    })
-            # RDS instances
-            for db in prov.list_databases(account=profile_name, region=region):
-                if not query or _matches(db.id, query):
-                    rows.append({
-                        "Cloud": cloud_label("aws"), "Account": db.account,
-                        "Type": f"RDS/{db.engine}", "Name": db.id,
-                        "State": db.state, "Region": db.region,
-                    })
+            tag_filter = _parse_tag_filter(tag)
+            return (
+                _aws_compute_rows(prov, profile_name, region, query, tag_filter)
+                + _aws_storage_rows(prov, profile_name, region, query)
+                + _aws_database_rows(prov, profile_name, region, query)
+            )
         except Exception as e:
             warn(f"[AWS/{profile_name}] {e}")
-        return rows
+            return []
 
     return run_parallel(_fetch, targets)
 
