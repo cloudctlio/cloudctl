@@ -206,15 +206,13 @@ class TestAWSIAMOldKeyFixer:
         mock_sess = MagicMock()
         mock_sess.client.return_value = mock_iam
 
-        # Low-entropy fake key (FAKE×4, entropy ≈ 2 bits) — not a real credential
-        fake_key = "AKIAFAKEFAKEFAKEFAKE"
         with patch("boto3.Session", return_value=mock_sess):
             self.f.apply(
-                {"resource": fake_key, "account": "prod"},
+                {"resource": "iam/user/alice", "account": "prod", "key_id": "test-key-id"},
                 {},
             )
         mock_iam.update_access_key.assert_called_once_with(
-            AccessKeyId=fake_key, Status="Inactive"
+            AccessKeyId="test-key-id", Status="Inactive"
         )
 
     def test_apply_bad_resource_raises(self):

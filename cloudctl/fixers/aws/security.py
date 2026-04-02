@@ -101,11 +101,13 @@ class AWSIAMOldKeyFixer(BaseFixer):
         import re  # noqa: PLC0415
 
         resource = issue.get("resource", "")
-        match    = re.search(r"AKIA[A-Z0-9]{16}", resource)
-        if not match:
+        # Accept key_id directly from the issue dict (preferred) or parse from resource
+        key_id = issue.get("key_id") or (
+            m.group(0) if (m := re.search(r"AKIA[A-Z0-9]{16}", resource)) else None
+        )
+        if not key_id:
             raise ValueError(f"Could not parse access key ID from: {resource}")
 
-        key_id  = match.group(0)
         account = issue.get("account", "default")
 
         session = boto3.Session(profile_name=account)
