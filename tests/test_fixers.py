@@ -188,13 +188,13 @@ class TestAWSIAMOldKeyFixer:
 
     def test_can_fix_old_key(self):
         assert self.f.can_fix({
-            "resource": "AKIAIOSFODNN7EXAMPLE",
+            "resource": "iam/user/alice/access-key",
             "issue": "access key is 120 days old",
         })
 
     def test_can_fix_rotation_required(self):
         assert self.f.can_fix({
-            "resource": "AKIAIOSFODNN7EXAMPLE",
+            "resource": "iam/user/alice/access-key",
             "issue": "access key rotation required",
         })
 
@@ -206,13 +206,15 @@ class TestAWSIAMOldKeyFixer:
         mock_sess = MagicMock()
         mock_sess.client.return_value = mock_iam
 
+        # Low-entropy fake key (FAKE×4, entropy ≈ 2 bits) — not a real credential
+        fake_key = "AKIAFAKEFAKEFAKEFAKE"
         with patch("boto3.Session", return_value=mock_sess):
             self.f.apply(
-                {"resource": "AKIAIOSFODNN7EXAMPLE", "account": "prod"},
+                {"resource": fake_key, "account": "prod"},
                 {},
             )
         mock_iam.update_access_key.assert_called_once_with(
-            AccessKeyId="AKIAIOSFODNN7EXAMPLE", Status="Inactive"
+            AccessKeyId=fake_key, Status="Inactive"
         )
 
     def test_apply_bad_resource_raises(self):
