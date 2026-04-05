@@ -112,6 +112,39 @@ class TestResolver:
         steps = build_steps("terraform", ["Fix the config"])
         assert any("terraform" in s.lower() for s in steps)
 
+    def test_bicep_steps(self):
+        from cloudctl.debug.resolver import build_steps
+        steps = build_steps("bicep", [])
+        assert any("bicep" in s.lower() for s in steps)
+        assert any("az deployment" in s.lower() for s in steps)
+
+    def test_arm_steps(self):
+        from cloudctl.debug.resolver import build_steps
+        steps = build_steps("arm", [])
+        assert any("arm" in s.lower() for s in steps)
+
+    def test_azure_devops_steps(self):
+        from cloudctl.debug.resolver import build_steps
+        steps = build_steps("azure-devops", [])
+        assert any("azure devops" in s.lower() for s in steps)
+
+    def test_deployment_manager_steps(self):
+        from cloudctl.debug.resolver import build_steps
+        steps = build_steps("deployment-manager", [])
+        assert any("deployment-manager" in s.lower() for s in steps)
+
+    def test_config_connector_steps(self):
+        from cloudctl.debug.resolver import build_steps
+        steps = build_steps("config-connector", [])
+        # Config Connector — must say to edit the Kubernetes CR, not the GCP resource
+        full_text = " ".join(steps).lower()
+        assert "kubectl" in full_text or "kubernetes" in full_text
+
+    def test_cloud_build_steps(self):
+        from cloudctl.debug.resolver import build_steps
+        steps = build_steps("cloud-build", [])
+        assert any("cloud build" in s.lower() for s in steps)
+
     def test_unknown_method(self):
         from cloudctl.debug.resolver import build_steps
         steps = build_steps("unknown", [])
@@ -128,35 +161,134 @@ class TestResolver:
 # ─── deployment_detector ────────────────────────────────────────────────────
 
 class TestDeploymentDetector:
-    def test_terraform_tags(self):
+    # ── AWS tag detection ──────────────────────────────────────────────────
+    def test_aws_terraform_tags(self):
         from cloudctl.debug.deployment_detector import detect
-        method = detect(session=None, resource_tags={"terraform": "true"})
-        assert method == "terraform"
+        assert detect("aws", resource_tags={"terraform": "true"}) == "terraform"
 
-    def test_pulumi_tags(self):
+    def test_aws_pulumi_tags(self):
         from cloudctl.debug.deployment_detector import detect
-        method = detect(session=None, resource_tags={"pulumi:project": "infra"})
-        assert method == "pulumi"
+        assert detect("aws", resource_tags={"pulumi:project": "infra"}) == "pulumi"
 
-    def test_managed_by_terraform(self):
+    def test_aws_managed_by_terraform(self):
         from cloudctl.debug.deployment_detector import detect
-        method = detect(session=None, resource_tags={"managed-by": "terraform"})
-        assert method == "terraform"
+        assert detect("aws", resource_tags={"managed-by": "terraform"}) == "terraform"
 
-    def test_no_tags_unknown(self):
+    def test_aws_no_tags_unknown(self):
         from cloudctl.debug.deployment_detector import detect
-        method = detect(session=None, resource_tags={})
-        assert method == "unknown"
+        assert detect("aws", resource_tags={}) == "unknown"
 
-    def test_iac_drift_warning_cdk(self):
+    # ── Azure tag detection ────────────────────────────────────────────────
+    def test_azure_bicep_tag(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("azure", resource_tags={"bicep-file": "main.bicep"}) == "bicep"
+
+    def test_azure_arm_tag(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("azure", resource_tags={"arm-template": "true"}) == "arm"
+
+    def test_azure_devops_tag(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("azure", resource_tags={"azure-devops": "pipeline-123"}) == "azure-devops"
+
+    def test_azure_managed_by_bicep(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("azure", resource_tags={"managed-by": "bicep"}) == "bicep"
+
+    def test_azure_managed_by_arm(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("azure", resource_tags={"managed-by": "arm"}) == "arm"
+
+    def test_azure_terraform_crosscloud(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("azure", resource_tags={"terraform": "true"}) == "terraform"
+
+    def test_azure_no_tags_unknown(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("azure", resource_tags={}) == "unknown"
+
+    # ── GCP label detection ────────────────────────────────────────────────
+    def test_gcp_config_connector_label(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={"cnrm.cloud.google.com/managed-by-kcc": "true"}) == "config-connector"
+
+    def test_gcp_config_connector_managed_by(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={"managed-by": "config-connector"}) == "config-connector"
+
+    def test_gcp_deployment_manager_label(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={"dm-name": "my-deployment"}) == "deployment-manager"
+
+    def test_gcp_deployment_manager_managed_by(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={"managed-by": "deployment-manager"}) == "deployment-manager"
+
+    def test_gcp_cloud_build_label(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={"cloud-build-id": "abc123"}) == "cloud-build"
+
+    def test_gcp_terraform_crosscloud(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={"terraform": "true"}) == "terraform"
+
+    def test_gcp_no_labels_unknown(self):
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={}) == "unknown"
+
+    # ── Drift warnings ────────────────────────────────────────────────────
+    def test_drift_warning_cdk(self):
         from cloudctl.debug.deployment_detector import iac_drift_warning
-        warning = iac_drift_warning("cdk")
-        assert warning is not None
-        assert "cdk deploy" in warning.lower()
+        w = iac_drift_warning("cdk")
+        assert w is not None and "cdk deploy" in w.lower()
 
-    def test_iac_drift_warning_unknown(self):
+    def test_drift_warning_bicep(self):
+        from cloudctl.debug.deployment_detector import iac_drift_warning
+        w = iac_drift_warning("bicep")
+        assert w is not None and "bicep" in w.lower()
+
+    def test_drift_warning_arm(self):
+        from cloudctl.debug.deployment_detector import iac_drift_warning
+        w = iac_drift_warning("arm")
+        assert w is not None and "arm" in w.lower()
+
+    def test_drift_warning_azure_devops(self):
+        from cloudctl.debug.deployment_detector import iac_drift_warning
+        w = iac_drift_warning("azure-devops")
+        assert w is not None and "azure devops" in w.lower()
+
+    def test_drift_warning_deployment_manager(self):
+        from cloudctl.debug.deployment_detector import iac_drift_warning
+        w = iac_drift_warning("deployment-manager")
+        assert w is not None and "deployment-manager" in w.lower()
+
+    def test_drift_warning_config_connector(self):
+        from cloudctl.debug.deployment_detector import iac_drift_warning
+        w = iac_drift_warning("config-connector")
+        assert w is not None and "config connector" in w.lower()
+
+    def test_drift_warning_cloud_build(self):
+        from cloudctl.debug.deployment_detector import iac_drift_warning
+        w = iac_drift_warning("cloud-build")
+        assert w is not None and "cloud build" in w.lower()
+
+    def test_drift_warning_codepipeline_is_none(self):
+        # CodePipeline and GitHub Actions are CI/CD — no drift warning needed
+        from cloudctl.debug.deployment_detector import iac_drift_warning
+        assert iac_drift_warning("codepipeline") is None
+
+    def test_drift_warning_unknown_is_none(self):
         from cloudctl.debug.deployment_detector import iac_drift_warning
         assert iac_drift_warning("unknown") is None
+
+    def test_all_known_methods_have_resolver_steps(self):
+        """Every non-unknown known method should have resolver steps."""
+        from cloudctl.debug.deployment_detector import KNOWN_METHODS
+        from cloudctl.debug.resolver import _STEPS
+        for method in KNOWN_METHODS:
+            if method == "unknown":
+                continue
+            assert method in _STEPS, f"Missing resolver steps for '{method}'"
 
 
 # ─── renderer (smoke — no assertions on output content) ──────────────────────
