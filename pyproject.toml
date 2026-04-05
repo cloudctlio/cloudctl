@@ -117,9 +117,13 @@ omit = [
     "cloudctl/fixers/gcp/*.py",
     "cloudctl/mcp/*.py",
     "cloudctl/mcp/tools/*.py",
+    "cloudctl/debug/*.py",
+    "cloudctl/agent/*.py",
     "cloudctl/commands/mcp_cmd.py",
     "cloudctl/commands/debug_cmd.py",
     "cloudctl/commands/agent_cmd.py",
+    "cloudctl/commands/ask.py",
+    "cloudctl/commands/feedback_cmd.py",
     "cloudctl/config/init_wizard.py",
 ]
 
