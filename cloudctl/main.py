@@ -14,6 +14,7 @@ from cloudctl.__init__ import __version__
 from cloudctl.commands import accounts as accounts_cmd
 from cloudctl.commands import agent_cmd
 from cloudctl.commands import ai_cmd
+from cloudctl.commands import ask as ask_cmd
 from cloudctl.commands import analytics as analytics_cmd
 from cloudctl.commands import backup as backup_cmd
 from cloudctl.commands import compute as compute_cmd
@@ -23,6 +24,7 @@ from cloudctl.commands import cost as cost_cmd
 from cloudctl.commands import database as database_cmd
 from cloudctl.commands import debug_cmd
 from cloudctl.commands import diff as diff_cmd
+from cloudctl.commands import feedback_cmd
 from cloudctl.commands import find as find_cmd
 from cloudctl.commands import iam as iam_cmd
 from cloudctl.commands import mcp_cmd
@@ -49,6 +51,7 @@ console = Console()
 app.add_typer(accounts_cmd.app,   name="accounts")
 app.add_typer(agent_cmd.app,      name="agent")
 app.add_typer(ai_cmd.app,         name="ai")
+app.add_typer(ask_cmd.app,        name="ask")
 app.add_typer(analytics_cmd.app,  name="analytics")
 app.add_typer(backup_cmd.app,     name="backup")
 app.add_typer(compute_cmd.app,    name="compute")
@@ -58,6 +61,7 @@ app.add_typer(cost_cmd.app,       name="cost")
 app.add_typer(database_cmd.app,   name="database")
 app.add_typer(debug_cmd.app,      name="debug")
 app.add_typer(diff_cmd.app,       name="diff")
+app.add_typer(feedback_cmd.app,   name="feedback")
 app.add_typer(find_cmd.app,       name="find")
 app.add_typer(iam_cmd.app,        name="iam")
 app.add_typer(mcp_cmd.app,        name="mcp")
