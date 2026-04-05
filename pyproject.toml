@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cctl"
-version = "0.2.0a1"
+version = "0.2.0"
 description = "Universal cloud CLI — one command for AWS, Azure, and GCP"
 readme = "README.md"
 license = { text = "MIT" }
@@ -89,10 +89,13 @@ gcp = [
 all-clouds = [
     "cctl[azure,gcp]",
 ]
+mcp = ["mcp>=1.0.0"]
+ai  = ["anthropic>=0.30", "openai>=1.0", "requests>=2.31"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [project.scripts]
-cloudctl = "cloudctl.main:main"
+cloudctl     = "cloudctl.main:main"
+cloudctl-mcp = "cloudctl.mcp.server:sync_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cloudctl"]
@@ -112,6 +115,11 @@ omit = [
     "cloudctl/fixers/aws/*.py",
     "cloudctl/fixers/azure/*.py",
     "cloudctl/fixers/gcp/*.py",
+    "cloudctl/mcp/*.py",
+    "cloudctl/mcp/tools/*.py",
+    "cloudctl/commands/mcp_cmd.py",
+    "cloudctl/commands/debug_cmd.py",
+    "cloudctl/commands/agent_cmd.py",
     "cloudctl/config/init_wizard.py",
 ]
 
