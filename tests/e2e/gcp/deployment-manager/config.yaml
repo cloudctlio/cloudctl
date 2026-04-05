@@ -1,0 +1,68 @@
+# Google Cloud Deployment Manager config
+# Deploys 4 Cloud Run services — one per debug scenario.
+#
+# Deploy:
+#   gcloud deployment-manager deployments create cloudctl-debug-test \
+#     --config config.yaml \
+#     --properties project:<PROJECT_ID>
+#
+# Update:
+#   gcloud deployment-manager deployments update cloudctl-debug-test \
+#     --config config.yaml
+#
+# Delete:
+#   gcloud deployment-manager deployments delete cloudctl-debug-test
+
+imports:
+- path: cloud-run-service.jinja
+
+# Replace YOUR_PROJECT and YOUR_REGISTRY with real values.
+# Build and push the shared image first:
+#   docker build -t gcr.io/YOUR_PROJECT/cloudctl-test-app:latest ../../shared/
+#   docker push gcr.io/YOUR_PROJECT/cloudctl-test-app:latest
+
+resources:
+
+# ── 1. Healthy — always 200 ───────────────────────────────────────────────
+- name: healthy-app
+  type: cloud-run-service.jinja
+  properties:
+    name:         cloudctl-test-healthy
+    project:      YOUR_PROJECT
+    region:       us-central1
+    image:        gcr.io/YOUR_PROJECT/cloudctl-test-app:latest
+    app_mode:     healthy
+    failure_rate: "0"
+
+# ── 2. 5xx — always 500 (DB crash simulation) ─────────────────────────────
+- name: error-5xx-app
+  type: cloud-run-service.jinja
+  properties:
+    name:         cloudctl-test-error-5xx
+    project:      YOUR_PROJECT
+    region:       us-central1
+    image:        gcr.io/YOUR_PROJECT/cloudctl-test-app:latest
+    app_mode:     error-5xx
+    failure_rate: "1"
+
+# ── 3. 4xx — always 403 (IAM / auth failure simulation) ───────────────────
+- name: error-4xx-app
+  type: cloud-run-service.jinja
+  properties:
+    name:         cloudctl-test-error-4xx
+    project:      YOUR_PROJECT
+    region:       us-central1
+    image:        gcr.io/YOUR_PROJECT/cloudctl-test-app:latest
+    app_mode:     error-4xx
+    failure_rate: "0"
+
+# ── 4. Intermittent — 50 % 502 (flapping upstream) ────────────────────────
+- name: intermittent-app
+  type: cloud-run-service.jinja
+  properties:
+    name:         cloudctl-test-intermittent
+    project:      YOUR_PROJECT
+    region:       us-central1
+    image:        gcr.io/YOUR_PROJECT/cloudctl-test-app:latest
+    app_mode:     intermittent
+    failure_rate: "0.5"

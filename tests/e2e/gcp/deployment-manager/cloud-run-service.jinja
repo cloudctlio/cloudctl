@@ -1,0 +1,52 @@
+{#
+  Jinja2 template — deploys a single Cloud Run service.
+  Called once per scenario from config.yaml.
+
+  Parameters:
+    name          : Cloud Run service name
+    project       : GCP project ID
+    region        : GCP region (default: us-central1)
+    image         : Container image URI
+    app_mode      : APP_MODE env var value
+    failure_rate  : FAILURE_RATE env var value (default "0")
+#}
+resources:
+- name: {{ env['name'] }}
+  type: gcp-types/run-v1:projects.locations.services
+  properties:
+    parent: projects/{{ properties['project'] }}/locations/{{ properties.get('region', 'us-central1') }}
+    apiVersion: serving.knative.dev/v1
+    kind: Service
+    metadata:
+      name: {{ properties['name'] }}
+      namespace: {{ properties['project'] }}
+      labels:
+        managed-by: deployment-manager          # picked up by cloudctl detector
+        dm-name: cloudctl-debug-test
+        project: cloudctl-debug-test
+        app-mode: {{ properties['app_mode'] }}
+    spec:
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/minScale: "1"
+            autoscaling.knative.dev/maxScale: "5"
+        spec:
+          containers:
+          - image: {{ properties['image'] }}
+            ports:
+            - containerPort: 8080
+            env:
+            - name: APP_MODE
+              value: {{ properties['app_mode'] }}
+            - name: APP_NAME
+              value: {{ properties['name'] }}
+            - name: FAILURE_RATE
+              value: "{{ properties.get('failure_rate', '0') }}"
+            resources:
+              limits:
+                cpu: "1"
+                memory: "256Mi"
+      traffic:
+      - percent: 100
+        latestRevision: true
