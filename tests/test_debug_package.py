@@ -404,7 +404,8 @@ class TestDeploymentDetector:
     # ── PATCH 3: Azure Activity Log HTTP userAgent ────────────────────────
     def test_azure_activity_log_http_useragent_terraform(self):
         """Terraform detected from HTTP userAgent in Activity Log even with generic caller."""
-        from unittest.mock import MagicMock, patch
+        import sys
+        from unittest.mock import MagicMock
         from cloudctl.debug.deployment_detector import _azure_activity_log
 
         event = MagicMock()
@@ -412,11 +413,21 @@ class TestDeploymentDetector:
         event.http_request = MagicMock()
         event.http_request.__str__ = lambda self: "HashiCorp Terraform/1.7.0 azurerm/3.0"
 
-        mock_client = MagicMock()
-        mock_client.activity_logs.list.return_value = [event]
+        mock_monitor_client = MagicMock()
+        mock_monitor_client.activity_logs.list.return_value = [event]
+        mock_monitor_module = MagicMock()
+        mock_monitor_module.MonitorManagementClient.return_value = mock_monitor_client
 
-        with patch("azure.mgmt.monitor.MonitorManagementClient", return_value=mock_client):
+        sys.modules["azure"] = MagicMock()
+        sys.modules["azure.mgmt"] = MagicMock()
+        sys.modules["azure.mgmt.monitor"] = mock_monitor_module
+
+        try:
             result = _azure_activity_log(MagicMock(), "sub-123", "/subscriptions/sub-123/res")
+        finally:
+            for mod in ("azure", "azure.mgmt", "azure.mgmt.monitor"):
+                sys.modules.pop(mod, None)
+
         assert result == "terraform"
 
     # ── PATCH 4: GCP callerSuppliedUserAgent ──────────────────────────────
@@ -492,7 +503,8 @@ class TestDeploymentDetector:
     # ── PATCH 6: ARM false-positive prevention ────────────────────────────
     def test_azure_arm_deployments_skips_terraform_named_deployment(self):
         """Deployment with 'terraform' in the name is not misidentified as arm."""
-        from unittest.mock import MagicMock, patch
+        import sys
+        from unittest.mock import MagicMock
         from cloudctl.debug.deployment_detector import _azure_arm_deployments
 
         dep = MagicMock()
@@ -500,12 +512,22 @@ class TestDeploymentDetector:
         dep.properties = MagicMock()
         dep.properties.template = None
 
-        mock_client = MagicMock()
-        mock_client.deployments.list_by_resource_group.return_value = [dep]
-        mock_client.deployments.get.return_value = dep
+        mock_rm_client = MagicMock()
+        mock_rm_client.deployments.list_by_resource_group.return_value = [dep]
+        mock_rm_client.deployments.get.return_value = dep
+        mock_resource_module = MagicMock()
+        mock_resource_module.ResourceManagementClient.return_value = mock_rm_client
 
-        with patch("azure.mgmt.resource.ResourceManagementClient", return_value=mock_client):
+        sys.modules["azure"] = MagicMock()
+        sys.modules["azure.mgmt"] = MagicMock()
+        sys.modules["azure.mgmt.resource"] = mock_resource_module
+
+        try:
             result = _azure_arm_deployments(MagicMock(), "sub-123", "my-rg", None)
+        finally:
+            for mod in ("azure", "azure.mgmt", "azure.mgmt.resource"):
+                sys.modules.pop(mod, None)
+
         assert result == "unknown"
 
 
