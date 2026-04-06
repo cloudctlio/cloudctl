@@ -20,13 +20,22 @@ _TF_UA = "hashicorp terraform"
 
 
 def _tool_from_useragent(ua: str) -> str:
-    """Return IaC tool name detected in a useragent string, or empty string."""
+    """Return IaC tool name detected in an AWS CloudTrail userAgent, or empty string."""
     if _TF_UA in ua:
         return "terraform"
     if "pulumi" in ua:
         return "pulumi"
     if "aws-cdk" in ua:
         return "cdk"
+    return ""
+
+
+def _tool_from_http_useragent(ua: str) -> str:
+    """Return IaC tool name from an Azure/GCP HTTP userAgent (no CDK — CDK is AWS-only)."""
+    if _TF_UA in ua:
+        return "terraform"
+    if "pulumi" in ua:
+        return "pulumi"
     return ""
 
 
@@ -336,7 +345,7 @@ def _azure_activity_log(credential, subscription_id: str, resource_id: str) -> s
 
             # HTTP userAgent is definitive — Terraform azurerm always sets it
             if http_request:
-                tool = _tool_from_useragent(str(http_request).lower())
+                tool = _tool_from_http_useragent(str(http_request).lower())
                 if tool:
                     return tool
 
@@ -474,7 +483,7 @@ def _gcp_audit_logs(project: str, resource_name: str) -> str:
                 payload.get("requestMetadata", {})
                        .get("callerSuppliedUserAgent", "") or ""
             ).lower()
-            tool = _tool_from_useragent(ua)
+            tool = _tool_from_http_useragent(ua)
             if tool:
                 return tool
 
