@@ -523,7 +523,7 @@ class TestDeploymentDetector:
         sys.modules["azure.mgmt.resource"] = mock_resource_module
 
         try:
-            result = _azure_arm_deployments(MagicMock(), "sub-123", "my-rg", None)
+            result = _azure_arm_deployments(MagicMock(), "sub-123", "my-rg")
         finally:
             for mod in ("azure", "azure.mgmt", "azure.mgmt.resource"):
                 sys.modules.pop(mod, None)

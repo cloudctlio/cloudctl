@@ -59,7 +59,7 @@ def _one_shot(cfg, question: str, cloud: str, account: Optional[str], region: Op
     agent  = CloudAgent(cfg)
     result = agent.run(question=question, cloud=cloud, account=account, region=region)
 
-    console.print(f"\n[bold]Answer:[/bold]")
+    console.print("\n[bold]Answer:[/bold]")
     console.print(result.answer)
 
     if result.rounds > 1:
@@ -115,9 +115,6 @@ def _interactive(
         # Add user turn
         state.add_turn("user", text)
 
-        # Build context with session history
-        history_ctx = {"conversation_history": state.history_text()}
-
         # Ask agent
         result = agent.run(
             question=text,
@@ -130,7 +127,7 @@ def _interactive(
         state.merge_context(state.context_cache)
         state.add_turn("assistant", result.answer)
 
-        console.print(f"\n[bold]Answer:[/bold]")
+        console.print("\n[bold]Answer:[/bold]")
         console.print(result.answer)
         console.print(f"[dim]Confidence: {result.confidence_level}[/dim]\n")
 

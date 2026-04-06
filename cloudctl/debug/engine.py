@@ -78,7 +78,7 @@ def run(
         all_evidence, context = _fetch_aws(session, sources, hints)
     else:
         section_header("Data Fetch")
-        fetch_skipped(cloud, f"deep debug only supports AWS in this version")
+        fetch_skipped(cloud, "deep debug only supports AWS in this version")
 
     # ── 3. Correlate ──────────────────────────────────────────────
     timeline     = build_timeline(all_evidence)
@@ -138,7 +138,7 @@ def run(
     _render(dr)
 
     # ── 9. Save incident report ───────────────────────────────────
-    dr.incident_path = _save_incident(dr, inflection)
+    dr.incident_path = _save_incident(dr)
     incident_saved(dr.incident_path)
 
     return dr
@@ -163,7 +163,7 @@ def _render(dr: DebugResult) -> None:
         render_drift_warning(dr.deployment_method)
 
 
-def _save_incident(dr: DebugResult, inflection) -> str:
+def _save_incident(dr: DebugResult) -> str:
     """Save a markdown incident report to ~/.cloudctl/incidents/."""
     _INCIDENTS_DIR.mkdir(parents=True, exist_ok=True)
     slug  = dr.symptom[:40].lower().replace(" ", "-").replace("/", "-")
@@ -215,6 +215,16 @@ def _get_aws_session(cfg: ConfigManager, account: Optional[str], region: Optiona
         return None
 
 
+def _collect(evidence: list, context: dict, key: str, evts: list, extend: bool = False) -> None:
+    """Append events to evidence and store under context[key]; extend=True uses setdefault+extend."""
+    if evts:
+        evidence.extend(evts)
+        if extend:
+            context.setdefault(key, []).extend(evts)
+        else:
+            context[key] = evts
+
+
 def _fetch_aws(session, sources: list[str], hints: list[str]) -> tuple[list[dict], dict]:
     """Fetch all planned AWS data sources, return (evidence_list, context_dict)."""
     from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
@@ -232,19 +242,15 @@ def _fetch_aws(session, sources: list[str], hints: list[str]) -> tuple[list[dict
             ("AWS/RDS",            "DatabaseConnections"),
             ("AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count"),
         ]:
-            evts = fetcher.cloudwatch_metrics(namespace=ns, metric_name=metric)
-            if evts:
-                evidence.extend(evts)
-                context.setdefault("metrics", []).extend(evts)
+            _collect(evidence, context, "metrics", fetcher.cloudwatch_metrics(namespace=ns, metric_name=metric), extend=True)
         fetch_item("CloudWatch Metrics", len([e for e in evidence if "CloudWatch" in e.get("source", "")]))
 
     # CloudTrail
     if "cloudtrail" in sources:
         fetch_start("CloudTrail")
         evts = fetcher.cloudtrail(minutes=120)
+        _collect(evidence, context, "cloudtrail_events", evts)
         if evts:
-            evidence.extend(evts)
-            context["cloudtrail_events"] = evts
             fetch_item("CloudTrail", len(evts))
         elif fetcher.availability.get("cloudtrail") is False:
             fetch_skipped("CloudTrail", "not enabled in this region or no permissions")
@@ -257,37 +263,31 @@ def _fetch_aws(session, sources: list[str], hints: list[str]) -> tuple[list[dict
     if "ecs_events" in sources and hints:
         fetch_start("ECS Events")
         for cluster_hint in hints[:2]:
-            evts = fetcher.ecs_events(cluster=cluster_hint, service=cluster_hint)
-            if evts:
-                evidence.extend(evts)
-                context.setdefault("ecs_events", []).extend(evts)
+            _collect(evidence, context, "ecs_events", fetcher.ecs_events(cluster=cluster_hint, service=cluster_hint), extend=True)
         fetch_item("ECS Events", len(context.get("ecs_events", [])))
 
     # RDS Events
     if "rds_events" in sources:
         fetch_start("RDS Events")
         evts = fetcher.rds_events()
+        _collect(evidence, context, "rds_events", evts)
         if evts:
-            evidence.extend(evts)
-            context["rds_events"] = evts
             fetch_item("RDS Events", len(evts))
 
     # CodePipeline
     if "codepipeline" in sources:
         fetch_start("CodePipeline")
         evts = fetcher.codepipeline()
+        _collect(evidence, context, "pipeline_executions", evts)
         if evts:
-            evidence.extend(evts)
-            context["pipeline_executions"] = evts
             fetch_item("CodePipeline", len(evts))
 
     # Network Context
     if "network_context" in sources:
         fetch_start("Network Context")
         evts = fetcher.network_context()
+        _collect(evidence, context, "network_issues", evts)
         if evts:
-            evidence.extend(evts)
-            context["network_issues"] = evts
             fetch_item("Network Context", len(evts))
 
     return evidence, context

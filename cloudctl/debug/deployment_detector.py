@@ -16,6 +16,73 @@ from __future__ import annotations
 
 from typing import Optional
 
+_TF_UA = "hashicorp terraform"
+
+
+def _tool_from_useragent(ua: str) -> str:
+    """Return IaC tool name detected in an AWS CloudTrail userAgent, or empty string."""
+    if _TF_UA in ua:
+        return "terraform"
+    if "pulumi" in ua:
+        return "pulumi"
+    if "aws-cdk" in ua:
+        return "cdk"
+    return ""
+
+
+def _tool_from_http_useragent(ua: str) -> str:
+    """Return IaC tool name from an Azure/GCP HTTP userAgent (no CDK — CDK is AWS-only)."""
+    if _TF_UA in ua:
+        return "terraform"
+    if "pulumi" in ua:
+        return "pulumi"
+    return ""
+
+
+def _tool_from_cloudtrail_username(u: str) -> str:
+    """Return tool detected in a CloudTrail Username field, or empty string."""
+    if "codepipeline" in u:
+        return "codepipeline"
+    if "github-actions" in u or "github.com" in u:
+        return "github-actions"
+    if "terraform" in u:
+        return "terraform"
+    if "pulumi" in u:
+        return "pulumi"
+    return ""
+
+
+def _tool_from_azure_caller(caller: str) -> str:
+    """Return tool detected in an Azure Activity Log caller field, or empty string."""
+    if "vstoken" in caller or "vstfs" in caller or "azure devops" in caller or "azdo" in caller:
+        return "azure-devops"
+    if "github" in caller or "github-actions" in caller:
+        return "github-actions"
+    if "terraform" in caller:
+        return "terraform"
+    if "pulumi" in caller:
+        return "pulumi"
+    if "bicep" in caller:
+        return "bicep"
+    return ""
+
+
+def _tool_from_gcp_email(email: str) -> str:
+    """Return tool detected in a GCP principalEmail, or empty string."""
+    if "cnrm-controller-manager" in email or "cnrm" in email:
+        return "config-connector"
+    if "cloudbuild" in email:
+        return "cloud-build"
+    if "cloudservices" in email:
+        return "deployment-manager"
+    if "terraform" in email:
+        return "terraform"
+    if "pulumi" in email:
+        return "pulumi"
+    if "github" in email:
+        return "github-actions"
+    return ""
+
 
 KNOWN_METHODS = [
     # AWS
@@ -170,22 +237,9 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
             u  = (ev.get("Username") or "").lower()
 
             # userAgent is definitive — cannot be suppressed by the caller
-            if "hashicorp terraform" in ua:
-                return "terraform"
-            if "pulumi" in ua:
-                return "pulumi"
-            if "aws-cdk" in ua:
-                return "cdk"
-
-            # Username as secondary signal (catches named CI roles)
-            if "codepipeline" in u:
-                return "codepipeline"
-            if "github-actions" in u or "github.com" in u:
-                return "github-actions"
-            if "terraform" in u:
-                return "terraform"
-            if "pulumi" in u:
-                return "pulumi"
+            tool = _tool_from_useragent(ua) or _tool_from_cloudtrail_username(u)
+            if tool:
+                return tool
     except Exception:  # noqa: BLE001
         pass
     return "unknown"
@@ -212,7 +266,7 @@ def _detect_azure(
 
     # 2. ARM Deployment history — tells us Bicep vs raw ARM vs other tools
     if resource_group:
-        m = _azure_arm_deployments(credential, subscription_id, resource_group, resource_id)
+        m = _azure_arm_deployments(credential, subscription_id, resource_group)
         if m != "unknown":
             return m
 
@@ -228,7 +282,6 @@ def _detect_azure(
 def _azure_arm_deployments(
     credential, subscription_id: str,
     resource_group: str,
-    resource_id: Optional[str],
 ) -> str:
     """
     ARM Deployment history via ResourceManagementClient.deployments.list_by_resource_group().
@@ -292,23 +345,14 @@ def _azure_activity_log(credential, subscription_id: str, resource_id: str) -> s
 
             # HTTP userAgent is definitive — Terraform azurerm always sets it
             if http_request:
-                http_str = str(http_request).lower()
-                if "hashicorp terraform" in http_str:
-                    return "terraform"
-                if "pulumi" in http_str:
-                    return "pulumi"
+                tool = _tool_from_http_useragent(str(http_request).lower())
+                if tool:
+                    return tool
 
             # caller field as secondary signal
-            if "vstoken" in caller or "vstfs" in caller or "azure devops" in caller or "azdo" in caller:
-                return "azure-devops"
-            if "github" in caller or "github-actions" in caller:
-                return "github-actions"
-            if "terraform" in caller:
-                return "terraform"
-            if "pulumi" in caller:
-                return "pulumi"
-            if "bicep" in caller:
-                return "bicep"
+            tool = _tool_from_azure_caller(caller)
+            if tool:
+                return tool
     except Exception:  # noqa: BLE001
         pass
     return "unknown"
@@ -439,28 +483,17 @@ def _gcp_audit_logs(project: str, resource_name: str) -> str:
                 payload.get("requestMetadata", {})
                        .get("callerSuppliedUserAgent", "") or ""
             ).lower()
-            if "hashicorp terraform" in ua:
-                return "terraform"
-            if "pulumi" in ua:
-                return "pulumi"
+            tool = _tool_from_http_useragent(ua)
+            if tool:
+                return tool
 
             # principalEmail as secondary signal
             email = (
                 payload.get("authenticationInfo", {}).get("principalEmail", "") or ""
             ).lower()
-            if "cnrm-controller-manager" in email or "cnrm" in email:
-                return "config-connector"
-            if "cloudbuild" in email:
-                return "cloud-build"
-            # Deployment Manager uses the Google APIs service account
-            if "cloudservices" in email:
-                return "deployment-manager"
-            if "terraform" in email:
-                return "terraform"
-            if "pulumi" in email:
-                return "pulumi"
-            if "github" in email:
-                return "github-actions"
+            tool = _tool_from_gcp_email(email)
+            if tool:
+                return tool
     except Exception:  # noqa: BLE001
         pass
     return "unknown"

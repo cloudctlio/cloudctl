@@ -5,6 +5,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
 class DebugFetcher:
     """
     Fetches raw evidence from AWS (and stub hooks for Azure/GCP).
@@ -58,7 +61,7 @@ class DebugFetcher:
             )
             events = [
                 {
-                    "time":   dp["Timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "time":   dp["Timestamp"].strftime(_TS_FMT),
                     "source": f"CloudWatch/{namespace}/{metric_name}",
                     "event":  f"avg={dp.get('Average', '—'):.1f} max={dp.get('Maximum', '—'):.1f}",
                     "value":  dp.get("Average", 0),
@@ -98,7 +101,7 @@ class DebugFetcher:
                 {
                     "time":   datetime.fromtimestamp(
                         e["timestamp"] / 1000, tz=timezone.utc
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    ).strftime(_TS_FMT),
                     "source": f"CloudWatch/Logs/{log_group}",
                     "event":  e.get("message", "").strip()[:200],
                 }
@@ -144,7 +147,7 @@ class DebugFetcher:
             events = []
             for e in resp.get("Events", []):
                 events.append({
-                    "time":       e["EventTime"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "time":       e["EventTime"].strftime(_TS_FMT),
                     "source":     "CloudTrail",
                     "event":      e.get("EventName", ""),
                     "principal":  e.get("Username", ""),
@@ -190,7 +193,7 @@ class DebugFetcher:
                     val = dp.get("Sum", dp.get("Average", 0))
                     if val and val > 0:
                         results.append({
-                            "time":   dp["Timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "time":   dp["Timestamp"].strftime(_TS_FMT),
                             "source": f"ALB/{metric}",
                             "event":  f"{metric}={val:.1f}",
                             "metric": metric,
@@ -220,7 +223,7 @@ class DebugFetcher:
             svc  = resp.get("services", [{}])[0]
             events = [
                 {
-                    "time":   e["createdAt"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "time":   e["createdAt"].strftime(_TS_FMT),
                     "source": f"ECS/{cluster}/{service}",
                     "event":  e.get("message", ""),
                 }
@@ -258,7 +261,7 @@ class DebugFetcher:
             resp = rds.describe_events(**kwargs)
             events = [
                 {
-                    "time":   e["Date"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "time":   e["Date"].strftime(_TS_FMT),
                     "source": f"RDS/{e.get('SourceIdentifier', '')}",
                     "event":  e.get("Message", ""),
                 }
@@ -298,7 +301,7 @@ class DebugFetcher:
                     )
                     for ex in execs.get("pipelineExecutionSummaries", []):
                         events.append({
-                            "time":   ex["startTime"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "time":   ex["startTime"].strftime(_TS_FMT),
                             "source": f"CodePipeline/{name}",
                             "event":  (
                                 f"status={ex.get('status', '?')} "
