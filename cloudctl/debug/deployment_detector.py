@@ -8,9 +8,9 @@ Detection order (same logic for every cloud):
        Azure: ARM Deployment history (ResourceManagementClient.deployments)
        GCP:   Deployment Manager API (deploymentmanager.deployments.list)
   3. Audit trail          — who last modified this resource
-       AWS:   CloudTrail  lookup_events → caller username
-       Azure: Activity Log (MonitorManagementClient.activity_logs) → caller field
-       GCP:   Cloud Audit Logs (google.cloud.logging) → authenticationInfo.principalEmail
+       AWS:   CloudTrail  lookup_events → userAgent (definitive) + Username (secondary)
+       Azure: Activity Log (MonitorManagementClient.activity_logs) → HTTP userAgent + caller
+       GCP:   Cloud Audit Logs (google.cloud.logging) → callerSuppliedUserAgent + principalEmail
 """
 from __future__ import annotations
 
@@ -96,29 +96,63 @@ def _detect_aws(session, resource_arn: Optional[str], tags: dict) -> str:
 
 
 def _aws_cfn_registry(session, resource_arn: str) -> str:
-    """CloudFormation describe_stack_resources + check stack tags for CDK marker."""
+    """CloudFormation describe_stack_resources + inspect template body for CDK fingerprints."""
+    import json  # noqa: PLC0415
+    import re    # noqa: PLC0415
     try:
         cf     = session.client("cloudformation")
         resp   = cf.describe_stack_resources(PhysicalResourceId=resource_arn)
         stacks = resp.get("StackResources", [])
         if not stacks:
             return "unknown"
-        stack_name  = stacks[0]["StackName"]
-        stack_resp  = cf.describe_stacks(StackName=stack_name)
-        stack_tags  = {
-            t["Key"]: t["Value"]
-            for t in stack_resp.get("Stacks", [{}])[0].get("Tags", [])
-        }
-        # CDK stamps aws:cdk:path on every resource it creates
-        if "aws:cdk:path" in stack_tags or any(k.startswith("aws:cdk:") for k in stack_tags):
+        stack_name = stacks[0]["StackName"]
+
+        # Inspect template body — CDK leaves structural fingerprints inside the
+        # template regardless of whether the team added any explicit tags
+        try:
+            tpl_resp = cf.get_template(StackName=stack_name)
+            template = tpl_resp.get("TemplateBody", {})
+            if isinstance(template, str):
+                template = json.loads(template)
+            resources = template.get("Resources", {})
+
+            # CDKMetadata resource — CDK injects this into every stack it generates
+            if "CDKMetadata" in resources:
+                return "cdk"
+
+            # aws:cdk:path in any resource's Metadata block
+            for resource_def in resources.values():
+                if "aws:cdk:path" in resource_def.get("Metadata", {}):
+                    return "cdk"
+
+            # aws:cdk:path anywhere in the template (belt and suspenders)
+            if "aws:cdk:path" in json.dumps(template):
+                return "cdk"
+
+            # CDK logical ID pattern: ends with exactly 8 uppercase hex chars
+            # e.g. "PaymentsApiServiceD4F8B3A2" — raw CF uses human-chosen IDs
+            cdk_id_pattern = re.compile(r"^.+[A-F0-9]{8}$")
+            cdk_id_count = sum(1 for k in resources if cdk_id_pattern.match(k))
+            if resources and cdk_id_count > len(resources) * 0.5:
+                return "cdk"
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Also check CDKToolkit bootstrap stack — present in every CDK-bootstrapped account
+        try:
+            cf.describe_stacks(StackName="CDKToolkit")
             return "cdk"
+        except Exception:  # noqa: BLE001
+            pass
+
         return "cloudformation"
     except Exception:  # noqa: BLE001
         return "unknown"
 
 
 def _aws_cloudtrail(session, resource_arn: str) -> str:
-    """CloudTrail lookup_events — last principal that wrote to this resource."""
+    """CloudTrail lookup_events — check userAgent (definitive) then Username (secondary)."""
+    import json as _json  # noqa: PLC0415
     from datetime import datetime, timedelta, timezone  # noqa: PLC0415
     try:
         ct    = session.client("cloudtrail")
@@ -130,7 +164,20 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
             MaxResults=10,
         )
         for ev in resp.get("Events", []):
-            u = (ev.get("Username") or "").lower()
+            # Parse full CloudTrail JSON to get userAgent — IaC tools always set this
+            detail = _json.loads(ev.get("CloudTrailEvent", "{}"))
+            ua = detail.get("userAgent", "").lower()
+            u  = (ev.get("Username") or "").lower()
+
+            # userAgent is definitive — cannot be suppressed by the caller
+            if "hashicorp terraform" in ua:
+                return "terraform"
+            if "pulumi" in ua:
+                return "pulumi"
+            if "aws-cdk" in ua:
+                return "cdk"
+
+            # Username as secondary signal (catches named CI roles)
             if "codepipeline" in u:
                 return "codepipeline"
             if "github-actions" in u or "github.com" in u:
@@ -202,15 +249,18 @@ def _azure_arm_deployments(
                     name = gen.get("name", "").lower()
                     if "bicep" in name:
                         return "bicep"
-                    if "arm" in name or name == "":
-                        # Empty generator name = raw ARM template
+                    if "arm" in name:
                         return "arm"
-            # If we can't inspect the template, check the deployment mode/name for hints
+                    # Empty/unknown generator — can't conclude from template alone
+            # If we can't inspect the template, check the deployment name for hints.
+            # Do NOT return "arm" if Terraform created the deployment — Terraform
+            # azurerm creates ARM deployments internally; those are caught by
+            # _azure_activity_log() via userAgent instead.
             dep_name = (dep.name or "").lower()
             if "bicep" in dep_name:
                 return "bicep"
-            if dep_name:
-                return "arm"  # Any CF-style deployment = ARM
+            if dep_name and "terraform" not in dep_name:
+                return "arm"
     except Exception:  # noqa: BLE001
         pass
     return "unknown"
@@ -236,9 +286,19 @@ def _azure_activity_log(credential, subscription_id: str, resource_id: str) -> s
             f"eventTimestamp le '{end.isoformat()}' and "
             f"resourceId eq '{resource_id}'"
         )
-        for event in client.activity_logs.list(filter=f, select="caller,operationName"):
-            caller = (getattr(event, "caller", None) or "").lower()
-            # Azure DevOps service principals use vstoken scheme or contain "devops"
+        for event in client.activity_logs.list(filter=f, select="caller,operationName,httpRequest"):
+            caller       = (getattr(event, "caller", None) or "").lower()
+            http_request = getattr(event, "http_request", None)
+
+            # HTTP userAgent is definitive — Terraform azurerm always sets it
+            if http_request:
+                http_str = str(http_request).lower()
+                if "hashicorp terraform" in http_str:
+                    return "terraform"
+                if "pulumi" in http_str:
+                    return "pulumi"
+
+            # caller field as secondary signal
             if "vstoken" in caller or "vstfs" in caller or "azure devops" in caller or "azdo" in caller:
                 return "azure-devops"
             if "github" in caller or "github-actions" in caller:
@@ -373,7 +433,19 @@ def _gcp_audit_logs(project: str, resource_name: str) -> str:
         )
         for entry in client.list_entries(filter_=filter_str, max_results=10):
             payload = entry.payload if isinstance(entry.payload, dict) else {}
-            email   = (
+
+            # callerSuppliedUserAgent is definitive — always set by IaC tools
+            ua = (
+                payload.get("requestMetadata", {})
+                       .get("callerSuppliedUserAgent", "") or ""
+            ).lower()
+            if "hashicorp terraform" in ua:
+                return "terraform"
+            if "pulumi" in ua:
+                return "pulumi"
+
+            # principalEmail as secondary signal
+            email = (
                 payload.get("authenticationInfo", {}).get("principalEmail", "") or ""
             ).lower()
             if "cnrm-controller-manager" in email or "cnrm" in email:
@@ -424,17 +496,33 @@ def _labels_gcp(labels: dict) -> str:
 def _tags_crosscloud(tags: dict) -> str:
     """Detect cross-cloud IaC tools (Terraform, Pulumi) from tags/labels."""
     lk = {k.lower(): (v.lower() if isinstance(v, str) else "") for k, v in tags.items()}
-    lv = set(lk.values())
 
-    if "terraform" in lk or any("terraform" in v for v in lv):
+    # Terraform — all known tag/label patterns across providers
+    _tf_keys = {
+        "terraform",
+        "terraform-workspace",
+        "tf-workspace",
+        "goog-terraform-provisioned",  # GCP google provider default label
+    }
+    _tf_managed_values = {"terraform", "terraform-cloud", "terraform-enterprise"}
+
+    if any(k in lk for k in _tf_keys):
         return "terraform"
-    if "pulumi:project" in lk or any("pulumi" in v for v in lv):
+    if lk.get("managed-by", lk.get("managedby", "")) in _tf_managed_values:
+        return "terraform"
+    if lk.get("provisioner", "") == "terraform":
+        return "terraform"
+    if lk.get("iac-tool", "") == "terraform":
+        return "terraform"
+
+    # Pulumi — all known tag/label patterns
+    _pulumi_keys = {"pulumi:project", "pulumi:stack", "pulumi:organization"}
+
+    if any(k in lk for k in _pulumi_keys):
         return "pulumi"
-
-    mgd = lk.get("managed-by", lk.get("managedby", ""))
-    if "terraform" in mgd:
-        return "terraform"
-    if "pulumi" in mgd:
+    if lk.get("managed-by", lk.get("managedby", "")) == "pulumi":
+        return "pulumi"
+    if lk.get("iac-tool", "") == "pulumi":
         return "pulumi"
 
     return "unknown"

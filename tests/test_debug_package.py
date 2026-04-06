@@ -290,6 +290,224 @@ class TestDeploymentDetector:
                 continue
             assert method in _STEPS, f"Missing resolver steps for '{method}'"
 
+    # ── PATCH 1: CDK detected via template body (CDKMetadata) ─────────────
+    def test_aws_cfn_cdk_via_cdkmetadata(self):
+        """CDK stack identified from CDKMetadata resource in template, not stack tags."""
+        from unittest.mock import MagicMock
+        from cloudctl.debug.deployment_detector import _aws_cfn_registry
+        import json
+
+        cf = MagicMock()
+        cf.describe_stack_resources.return_value = {
+            "StackResources": [{"StackName": "MyStack"}]
+        }
+        cf.describe_stacks.return_value = {"Stacks": [{"Tags": []}]}
+        cf.get_template.return_value = {
+            "TemplateBody": json.dumps({
+                "Resources": {
+                    "CDKMetadata": {"Type": "AWS::CDK::Metadata"},
+                    "MyBucketABCD1234": {"Type": "AWS::S3::Bucket"},
+                }
+            })
+        }
+        session = MagicMock()
+        session.client.return_value = cf
+        assert _aws_cfn_registry(session, "arn:aws:s3:::my-bucket") == "cdk"
+
+    def test_aws_cfn_cdk_via_logical_id_pattern(self):
+        """CDK detected from >50% of logical IDs matching the 8-hex-char suffix pattern."""
+        from unittest.mock import MagicMock
+        from cloudctl.debug.deployment_detector import _aws_cfn_registry
+        import json
+
+        cf = MagicMock()
+        cf.describe_stack_resources.return_value = {
+            "StackResources": [{"StackName": "MyStack"}]
+        }
+        cf.describe_stacks.return_value = {"Stacks": [{"Tags": []}]}
+        cf.get_template.return_value = {
+            "TemplateBody": json.dumps({
+                "Resources": {
+                    "ServiceRoleABCDEF12": {"Type": "AWS::IAM::Role"},
+                    "FunctionABCDEF34": {"Type": "AWS::Lambda::Function"},
+                    "BucketABCDEF56": {"Type": "AWS::S3::Bucket"},
+                }
+            })
+        }
+        session = MagicMock()
+        session.client.return_value = cf
+        assert _aws_cfn_registry(session, "arn:aws:lambda:::function:test") == "cdk"
+
+    def test_aws_cfn_raw_cloudformation(self):
+        """Plain CF stack with human-chosen IDs returns cloudformation (CDKToolkit absent)."""
+        from unittest.mock import MagicMock
+        from cloudctl.debug.deployment_detector import _aws_cfn_registry
+        import json
+
+        cf = MagicMock()
+        cf.describe_stack_resources.return_value = {
+            "StackResources": [{"StackName": "MyStack"}]
+        }
+        cf.get_template.return_value = {
+            "TemplateBody": json.dumps({
+                "Resources": {
+                    "MyBucket": {"Type": "AWS::S3::Bucket"},
+                    "MyRole": {"Type": "AWS::IAM::Role"},
+                }
+            })
+        }
+        # CDKToolkit not present — makes the bootstrap check fail
+        cf.describe_stacks.side_effect = Exception("Stack not found")
+        session = MagicMock()
+        session.client.return_value = cf
+        assert _aws_cfn_registry(session, "arn:aws:s3:::my-bucket") == "cloudformation"
+
+    # ── PATCH 2: CloudTrail userAgent ─────────────────────────────────────
+    def test_aws_cloudtrail_useragent_terraform(self):
+        """Terraform detected from HashiCorp userAgent in CloudTrail event detail."""
+        import json
+        from unittest.mock import MagicMock
+        from cloudctl.debug.deployment_detector import _aws_cloudtrail
+
+        ct = MagicMock()
+        ct.lookup_events.return_value = {
+            "Events": [{
+                "Username": "ci-deploy-role",
+                "CloudTrailEvent": json.dumps({
+                    "userAgent": "HashiCorp Terraform/1.7.0 (+https://www.terraform.io)"
+                }),
+            }]
+        }
+        session = MagicMock()
+        session.client.return_value = ct
+        assert _aws_cloudtrail(session, "arn:aws:s3:::my-bucket") == "terraform"
+
+    def test_aws_cloudtrail_useragent_pulumi(self):
+        """Pulumi detected from userAgent even when Username gives no hint."""
+        import json
+        from unittest.mock import MagicMock
+        from cloudctl.debug.deployment_detector import _aws_cloudtrail
+
+        ct = MagicMock()
+        ct.lookup_events.return_value = {
+            "Events": [{
+                "Username": "deploy-sa",
+                "CloudTrailEvent": json.dumps({
+                    "userAgent": "pulumi/3.0 go1.21 linux/amd64"
+                }),
+            }]
+        }
+        session = MagicMock()
+        session.client.return_value = ct
+        assert _aws_cloudtrail(session, "arn:aws:s3:::my-bucket") == "pulumi"
+
+    # ── PATCH 3: Azure Activity Log HTTP userAgent ────────────────────────
+    def test_azure_activity_log_http_useragent_terraform(self):
+        """Terraform detected from HTTP userAgent in Activity Log even with generic caller."""
+        from unittest.mock import MagicMock, patch
+        from cloudctl.debug.deployment_detector import _azure_activity_log
+
+        event = MagicMock()
+        event.caller = "ci-runner@tenant.com"
+        event.http_request = MagicMock()
+        event.http_request.__str__ = lambda self: "HashiCorp Terraform/1.7.0 azurerm/3.0"
+
+        mock_client = MagicMock()
+        mock_client.activity_logs.list.return_value = [event]
+
+        with patch("azure.mgmt.monitor.MonitorManagementClient", return_value=mock_client):
+            result = _azure_activity_log(MagicMock(), "sub-123", "/subscriptions/sub-123/res")
+        assert result == "terraform"
+
+    # ── PATCH 4: GCP callerSuppliedUserAgent ──────────────────────────────
+    def test_gcp_audit_logs_caller_useragent_terraform(self):
+        """Terraform detected from callerSuppliedUserAgent even with opaque principalEmail."""
+        import sys
+        from unittest.mock import MagicMock
+        from cloudctl.debug.deployment_detector import _gcp_audit_logs
+
+        entry = MagicMock()
+        entry.payload = {
+            "requestMetadata": {
+                "callerSuppliedUserAgent": "HashiCorp Terraform/1.7.0"
+            },
+            "authenticationInfo": {
+                "principalEmail": "deploy@project.iam.gserviceaccount.com"
+            },
+        }
+
+        mock_logging_client = MagicMock()
+        mock_logging_client.list_entries.return_value = [entry]
+        mock_logging_module = MagicMock()
+        mock_logging_module.Client.return_value = mock_logging_client
+
+        # Inject mock modules so the optional import inside _gcp_audit_logs succeeds.
+        # The function does: from google.cloud import logging as gcp_logging
+        # so we must set it as an attribute on the google.cloud mock AND in sys.modules.
+        mock_google_cloud = MagicMock()
+        mock_google_cloud.logging = mock_logging_module
+        sys.modules["google"] = MagicMock()
+        sys.modules["google.cloud"] = mock_google_cloud
+        sys.modules["google.cloud.logging"] = mock_logging_module
+
+        try:
+            result = _gcp_audit_logs("my-project", "my-resource")
+        finally:
+            for mod in ("google", "google.cloud", "google.cloud.logging"):
+                sys.modules.pop(mod, None)
+
+        assert result == "terraform"
+
+    # ── PATCH 5: Expanded tag patterns ────────────────────────────────────
+    def test_goog_terraform_provisioned_label(self):
+        """GCP goog-terraform-provisioned label is recognised."""
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("gcp", gcp_labels={"goog-terraform-provisioned": "true"}) == "terraform"
+
+    def test_terraform_workspace_tag(self):
+        """terraform-workspace tag is recognised on AWS."""
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("aws", resource_tags={"terraform-workspace": "prod"}) == "terraform"
+
+    def test_iac_tool_tag_terraform(self):
+        """iac-tool=terraform tag is recognised."""
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("aws", resource_tags={"iac-tool": "terraform"}) == "terraform"
+
+    def test_iac_tool_tag_pulumi(self):
+        """iac-tool=pulumi tag is recognised."""
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("aws", resource_tags={"iac-tool": "pulumi"}) == "pulumi"
+
+    def test_pulumi_stack_tag(self):
+        """pulumi:stack tag is recognised."""
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("aws", resource_tags={"pulumi:stack": "prod"}) == "pulumi"
+
+    def test_managed_by_terraform_cloud(self):
+        """managed-by=terraform-cloud is recognised."""
+        from cloudctl.debug.deployment_detector import detect
+        assert detect("aws", resource_tags={"managed-by": "terraform-cloud"}) == "terraform"
+
+    # ── PATCH 6: ARM false-positive prevention ────────────────────────────
+    def test_azure_arm_deployments_skips_terraform_named_deployment(self):
+        """Deployment with 'terraform' in the name is not misidentified as arm."""
+        from unittest.mock import MagicMock, patch
+        from cloudctl.debug.deployment_detector import _azure_arm_deployments
+
+        dep = MagicMock()
+        dep.name = "terraform-20240101"
+        dep.properties = MagicMock()
+        dep.properties.template = None
+
+        mock_client = MagicMock()
+        mock_client.deployments.list_by_resource_group.return_value = [dep]
+        mock_client.deployments.get.return_value = dep
+
+        with patch("azure.mgmt.resource.ResourceManagementClient", return_value=mock_client):
+            result = _azure_arm_deployments(MagicMock(), "sub-123", "my-rg", None)
+        assert result == "unknown"
+
 
 # ─── renderer (smoke — no assertions on output content) ──────────────────────
 
