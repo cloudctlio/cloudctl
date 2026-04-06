@@ -134,9 +134,6 @@ def detect(
     return _tags_crosscloud(resource_tags or gcp_labels or {})
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# AWS
-# ════════════════════════════════════════════════════════════════════════════
 
 def _detect_aws(session, resource_arn: Optional[str], tags: dict) -> str:
     # 1. Tags (Terraform/Pulumi stamp tags on AWS resources)
@@ -245,9 +242,6 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
     return "unknown"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Azure
-# ════════════════════════════════════════════════════════════════════════════
 
 def _detect_azure(
     tags: dict,
@@ -279,6 +273,21 @@ def _detect_azure(
     return "unknown"
 
 
+def _arm_generator_tool(template) -> str:
+    """Return tool from ARM template _generator metadata, or empty string."""
+    if not isinstance(template, dict):
+        return ""
+    gen = template.get("metadata", {}).get("_generator", {})
+    if not isinstance(gen, dict):
+        return ""
+    name = gen.get("name", "").lower()
+    if "bicep" in name:
+        return "bicep"
+    if "arm" in name:
+        return "arm"
+    return ""
+
+
 def _azure_arm_deployments(
     credential, subscription_id: str,
     resource_group: str,
@@ -291,24 +300,11 @@ def _azure_arm_deployments(
         from azure.mgmt.resource import ResourceManagementClient  # noqa: PLC0415
         client = ResourceManagementClient(credential, subscription_id)
         for dep in client.deployments.list_by_resource_group(resource_group):
-            # Get full deployment detail to read template metadata
-            detail = client.deployments.get(resource_group, dep.name)
-            props  = detail.properties or {}
-            # template_hash is present on completed deployments; check _generator in template
-            template = getattr(props, "template", None) or {}
-            if isinstance(template, dict):
-                gen = template.get("metadata", {}).get("_generator", {})
-                if isinstance(gen, dict):
-                    name = gen.get("name", "").lower()
-                    if "bicep" in name:
-                        return "bicep"
-                    if "arm" in name:
-                        return "arm"
-                    # Empty/unknown generator — can't conclude from template alone
-            # If we can't inspect the template, check the deployment name for hints.
-            # Do NOT return "arm" if Terraform created the deployment — Terraform
-            # azurerm creates ARM deployments internally; those are caught by
-            # _azure_activity_log() via userAgent instead.
+            detail   = client.deployments.get(resource_group, dep.name)
+            template = getattr(detail.properties or {}, "template", None) or {}
+            tool = _arm_generator_tool(template)
+            if tool:
+                return tool
             dep_name = (dep.name or "").lower()
             if "bicep" in dep_name:
                 return "bicep"
@@ -392,9 +388,6 @@ def _tags_azure(tags: dict) -> str:
     return _tags_crosscloud(tags)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# GCP
-# ════════════════════════════════════════════════════════════════════════════
 
 def _detect_gcp(
     labels: dict,
@@ -522,9 +515,6 @@ def _labels_gcp(labels: dict) -> str:
     return _tags_crosscloud(labels)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Cross-cloud
-# ════════════════════════════════════════════════════════════════════════════
 
 def _tags_crosscloud(tags: dict) -> str:
     """Detect cross-cloud IaC tools (Terraform, Pulumi) from tags/labels."""
@@ -561,9 +551,6 @@ def _tags_crosscloud(tags: dict) -> str:
     return "unknown"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# IaC drift warnings
-# ════════════════════════════════════════════════════════════════════════════
 
 _DRIFT_WARNINGS: dict[str, str] = {
     # AWS

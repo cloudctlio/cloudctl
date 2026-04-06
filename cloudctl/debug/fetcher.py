@@ -33,9 +33,6 @@ class DebugFetcher:
     def _mark(self, source: str, ok: bool) -> None:
         self._availability[source] = ok
 
-    # ─────────────────────────────────────────
-    # CloudWatch Metrics
-    # ─────────────────────────────────────────
     def cloudwatch_metrics(
         self,
         namespace: str = "AWS/EC2",
@@ -74,9 +71,6 @@ class DebugFetcher:
             self._mark("cloudwatch_metrics", False)
             return []
 
-    # ─────────────────────────────────────────
-    # CloudWatch Logs
-    # ─────────────────────────────────────────
     def cloudwatch_logs(
         self,
         log_group: str,
@@ -113,9 +107,6 @@ class DebugFetcher:
             self._mark("cloudwatch_logs", False)
             return []
 
-    # ─────────────────────────────────────────
-    # CloudTrail
-    # ─────────────────────────────────────────
     def cloudtrail(
         self,
         minutes: int = 120,
@@ -162,9 +153,6 @@ class DebugFetcher:
             self._mark("cloudtrail", False)
             return []
 
-    # ─────────────────────────────────────────
-    # ALB Access Logs (via CloudWatch Metrics)
-    # ─────────────────────────────────────────
     def alb_metrics(
         self,
         load_balancer_name: str,
@@ -205,9 +193,6 @@ class DebugFetcher:
             self._mark("alb_logs", False)
             return []
 
-    # ─────────────────────────────────────────
-    # ECS Service Events
-    # ─────────────────────────────────────────
     def ecs_events(
         self,
         cluster: str,
@@ -235,9 +220,6 @@ class DebugFetcher:
             self._mark("ecs_events", False)
             return []
 
-    # ─────────────────────────────────────────
-    # RDS Events
-    # ─────────────────────────────────────────
     def rds_events(
         self,
         db_identifier: Optional[str] = None,
@@ -273,9 +255,6 @@ class DebugFetcher:
             self._mark("rds_events", False)
             return []
 
-    # ─────────────────────────────────────────
-    # CodePipeline
-    # ─────────────────────────────────────────
     def codepipeline(
         self,
         pipeline_name: Optional[str] = None,
@@ -317,9 +296,6 @@ class DebugFetcher:
             self._mark("codepipeline", False)
             return []
 
-    # ─────────────────────────────────────────
-    # Lambda Logs
-    # ─────────────────────────────────────────
     def lambda_logs(
         self,
         function_name: str,
@@ -332,9 +308,6 @@ class DebugFetcher:
             minutes=minutes,
         )
 
-    # ─────────────────────────────────────────
-    # Network Context
-    # ─────────────────────────────────────────
     def network_context(
         self,
         vpc_id: Optional[str] = None,
