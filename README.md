@@ -147,7 +147,9 @@ Incident report saved: ~/.cloudctl/incidents/2026-04-06T15-47-payments-502.md
 
 ---
 
-## MCP Server (Claude Desktop / Cursor)
+## MCP Server
+
+Works with Claude Desktop, Cursor, and any MCP-compatible client (including Bedrock-hosted Claude).
 
 ```bash
 pip install cctl[mcp]
@@ -155,7 +157,7 @@ cloudctl mcp config    # prints the config block to paste into claude_desktop_co
 cloudctl-mcp           # start the MCP server
 ```
 
-Once connected, Claude Desktop and Cursor can query your cloud infrastructure directly:
+Once connected, the AI client can query your cloud infrastructure directly:
 
 > "What's the cost breakdown for prod this month?"
 > "List all ECS services with high CPU"
@@ -210,8 +212,6 @@ gcloud auth application-default login
 | AWS Bedrock (Claude) | `ai.provider: bedrock` |
 | Azure AI Foundry (Claude) | `ai.provider: azure_foundry` |
 | Google Vertex AI (Claude) | `ai.provider: vertex` |
-| OpenAI | `ai.provider: openai` |
-| Ollama (local) | `ai.provider: ollama` |
 
 ```bash
 cloudctl config set ai.provider bedrock
