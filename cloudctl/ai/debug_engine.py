@@ -66,11 +66,10 @@ class DebugEngine:
             required_keys=include,
         )
 
-        from cloudctl.ai.prompts.debug import debug_prompt, DEBUG_SYSTEM  # noqa: PLC0415
+        from cloudctl.ai.prompts.debug import DEBUG_SYSTEM  # noqa: PLC0415
         from cloudctl.ai.factory import _parse_json_response  # noqa: PLC0415
 
         ai = get_ai(self._cfg, purpose="analysis")
-        prompt = debug_prompt(symptom, context)
 
         # Override system prompt with debug-specific one
         raw_response = ai.ask(symptom, context=context)

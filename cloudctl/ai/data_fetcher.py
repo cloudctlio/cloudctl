@@ -15,6 +15,11 @@ def _safe_fetch(fn):
         return None
 
 
+def _set_if_fetched(data: dict, key: str, val) -> None:
+    if val is not None:
+        data[key] = val
+
+
 class DataFetcher:
     """Fetches real cloud data for AI context. Never calls AI without fetching first."""
 
@@ -63,38 +68,30 @@ class DataFetcher:
             return data
 
         if "compute" in include:
-            val = _safe_fetch(lambda: [
+            _set_if_fetched(data, "compute", _safe_fetch(lambda: [
                 {"id": i.id, "name": i.name, "type": i.type, "state": i.state, "region": i.region}
                 for i in prov.list_compute(account=profile, region=region)
-            ])
-            if val is not None:
-                data["compute"] = val
+            ]))
 
         if "storage" in include:
-            val = _safe_fetch(lambda: [
+            _set_if_fetched(data, "storage", _safe_fetch(lambda: [
                 {"name": b.name, "region": b.region or "global", "public": b.public}
                 for b in prov.list_storage(account=profile, region=region)
-            ])
-            if val is not None:
-                data["storage"] = val
+            ]))
 
         if "database" in include:
-            val = _safe_fetch(lambda: [
+            _set_if_fetched(data, "database", _safe_fetch(lambda: [
                 {"id": db.id, "engine": db.engine, "state": db.state, "region": db.region}
                 for db in prov.list_databases(account=profile, region=region)
-            ])
-            if val is not None:
-                data["database"] = val
+            ]))
 
         if "cost" in include:
-            val = _safe_fetch(lambda: prov.get_cost_summary(account=profile))
-            if val is not None:
-                data["cost"] = val
+            _set_if_fetched(data, "cost", _safe_fetch(lambda: prov.get_cost_summary(account=profile)))
 
         if "security" in include:
-            val = _safe_fetch(lambda: prov.get_security_findings(account=profile))
-            if val is not None:
-                data["security_findings"] = val
+            _set_if_fetched(data, "security_findings", _safe_fetch(
+                lambda: prov.get_security_findings(account=profile)
+            ))
 
         return data
 

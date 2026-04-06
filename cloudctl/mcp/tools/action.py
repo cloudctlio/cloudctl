@@ -27,11 +27,7 @@ def stop_compute(
             "description": f"Would stop {cloud} instance {instance_id}. Pass dry_run=false to execute.",
         })
 
-    from cloudctl.mcp.context import get_cfg  # noqa: PLC0415
-    cfg = get_cfg()
     if cloud == "aws":
-        from cloudctl.commands._helpers import get_aws_provider  # noqa: PLC0415
-        prov = get_aws_provider(account or "default", region or None)
         try:
             import boto3  # noqa: PLC0415
             sess = boto3.Session(profile_name=account or "default", region_name=region or None)

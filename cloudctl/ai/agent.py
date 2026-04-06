@@ -28,6 +28,15 @@ class AgentResult:
     confidence_level: str = "LOW"
 
 
+def _merge_context(base: dict, update: dict) -> None:
+    """Merge update dict into base, merging nested dicts in place."""
+    for k, v in update.items():
+        if k not in base:
+            base[k] = v
+        elif isinstance(v, dict) and isinstance(base[k], dict):
+            base[k].update(v)
+
+
 def _extract_data_needs(answer: str, already_fetched: set[str]) -> list[str]:
     """
     Detect if the AI answer hints it needs more data.
@@ -109,11 +118,7 @@ class CloudAgent:
                 fetched_categories.add(cat)
 
             # Merge new context
-            for k, v in new_ctx.items():
-                if k not in context:
-                    context[k] = v
-                elif isinstance(v, dict) and isinstance(context[k], dict):
-                    context[k].update(v)
+            _merge_context(context, new_ctx)
 
             response = ai.ask(question, context=context)
 
