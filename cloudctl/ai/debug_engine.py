@@ -119,8 +119,14 @@ class DebugEngine:
         region: Optional[str],
         context: dict,
     ) -> str:
-        """Detect IaC deployment method and enrich context with redacted CF resource config."""
-        from cloudctl.debug.deployment_detector import detect  # noqa: PLC0415
+        """Detect IaC deployment method using resource ARNs already in context.
+
+        Generic approach — works for any AWS service, not just Lambda:
+        1. Collect resource ARNs from CloudTrail events already fetched.
+        2. Use the Resource Groups Tagging API to get tags for those ARNs.
+        3. Pass to _detect_aws (tags → CF registry → CloudTrail userAgent).
+        4. For CDK/CF stacks, enrich context with template slice.
+        """
         from cloudctl.commands._helpers import get_aws_provider  # noqa: PLC0415
 
         if cloud not in ("aws", "all"):
@@ -135,35 +141,64 @@ class DebugEngine:
             prov    = get_aws_provider(targets[0], region)
             session = prov._session  # noqa: SLF001
 
-            # Collect tags + ARNs from Lambda functions mentioned in service_logs
+            # Collect resource names/ARNs from whatever is already in context.
+            # CloudTrail resource fields may be plain names OR full ARNs — accept both.
+            # Log group sources encode the service path (e.g. /aws/lambda/fn, /aws/rds/...).
+            resource_names: list[str] = []
+            seen: set = set()
+
+            for ev in context.get("cloudtrail_events", [])[:20]:
+                for part in ev.get("resource", "").split(", "):
+                    part = part.strip()
+                    if part and part not in seen:
+                        seen.add(part)
+                        resource_names.append(part)
+                        if len(resource_names) >= 5:
+                            break
+                if len(resource_names) >= 5:
+                    break
+
+            # Fall back to log sources if CloudTrail had nothing useful
+            if not resource_names:
+                for ev in context.get("service_logs", [])[:10]:
+                    src = ev.get("source", "")
+                    # "CloudWatch/Logs//aws/lambda/fn" → "fn"
+                    # "CloudWatch/Logs//aws/rds/cluster" → "cluster"
+                    if "/aws/" in src:
+                        name = src.split("/aws/")[-1].split("/")[-1]
+                        if name and name not in seen:
+                            seen.add(name)
+                            resource_names.append(name)
+                            if len(resource_names) >= 5:
+                                break
+
+            # Tags: only query tagging API when we have full ARNs.
             resource_tags: dict = {}
-            fn_arns: dict[str, str] = {}  # fn_name -> ARN
-            log_groups = [e.get("source", "") for e in context.get("service_logs", [])]
-            fn_names = {
-                lg.replace("CloudWatch/Logs//aws/lambda/", "")
-                for lg in log_groups
-                if "/aws/lambda/" in lg
-            }
-            if fn_names:
-                lm = session.client("lambda")
-                for fn in list(fn_names)[:3]:
-                    try:
-                        fn_data = lm.get_function(FunctionName=fn)
-                        tags = fn_data.get("Tags", {})
-                        resource_tags.update(tags)
-                        fn_arns[fn] = fn_data["Configuration"]["FunctionArn"]
-                    except Exception:  # noqa: BLE001
-                        pass
+            arns = [n for n in resource_names if n.startswith("arn:aws:")]
+            if arns:
+                try:
+                    tagger = session.client("resourcegroupstaggingapi")
+                    resp   = tagger.get_resources(ResourceARNList=arns[:5])
+                    for item in resp.get("ResourceTagMappingList", []):
+                        for tag in item.get("Tags", []):
+                            resource_tags[tag["Key"]] = tag["Value"]
+                except Exception:  # noqa: BLE001
+                    pass
 
-            # Use _detect_aws directly so CloudFormation template inspection runs
-            # (detect() public API with tags-only never reaches _aws_cfn_registry)
             from cloudctl.debug.deployment_detector import _detect_aws  # noqa: PLC0415
-            first_arn = next(iter(fn_arns.values()), None)
-            method = _detect_aws(session, first_arn, resource_tags) if first_arn else detect("aws", resource_tags=resource_tags)
+            # _detect_aws's CloudTrail lookup handles both full ARNs and plain names.
+            first_resource = resource_names[0] if resource_names else None
+            method = _detect_aws(session, first_resource, resource_tags)
 
-            # Fetch CF resource config for affected Lambdas — redact sensitive env vars
-            if fn_arns:
-                self._fetch_cf_resource_context(session, fn_arns, resource_tags, context)
+            # For CDK/CF: enrich context with template slice for Lambda resources.
+            if method in ("cdk", "cloudformation"):
+                fn_arns = {
+                    n.split(":")[-1]: n
+                    for n in resource_names
+                    if n.startswith("arn:aws:") and ":lambda:" in n and ":function:" in n
+                }
+                if fn_arns:
+                    self._fetch_cf_resource_context(session, fn_arns, resource_tags, context)
 
             return method
         except Exception:  # noqa: BLE001

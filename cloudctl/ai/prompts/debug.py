@@ -33,12 +33,12 @@ def debug_prompt(symptom: str, context: dict, deploy_method: str = "unknown") ->
         deploy_note = (
             f"\nDEPLOYMENT METHOD: {deploy_method}\n"
             f"All remediation_steps MUST use {deploy_method} tooling — not raw cloud CLI. "
-            f"IMPORTANT: Do NOT end every step with '{_apply_cmd}'. "
+            f"IMPORTANT: Do NOT reference any specific filename (e.g. main.tf, __main__.py) — "
+            f"you do not know where the user keeps their {deploy_method} configuration. "
+            f"Say 'In your {deploy_method} configuration' instead. "
+            f"Do NOT end every step with '{_apply_cmd}'. "
             f"List all configuration changes first as separate steps, then add ONE final step: "
-            f"'Apply all changes: {_apply_cmd}'. "
-            f"For example: Step 1: 'In main.tf, set DB_POOL_SIZE = 10 in the error-5xx Lambda environment block.' "
-            f"Step 2: 'In main.tf, set timeout = 5 in the intermittent Lambda.' "
-            f"Final step: 'Apply all changes: {_apply_cmd}'\n"
+            f"'Apply all changes: {_apply_cmd}'.\n"
         )
     return (
         f"REAL CLOUD DATA:\n{json.dumps(context, indent=2, default=str)}\n\n"
