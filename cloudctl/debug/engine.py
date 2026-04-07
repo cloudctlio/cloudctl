@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from cloudctl.debug.planner import plan_sources, extract_service_hints
-from cloudctl.debug.correlator import build_timeline, find_inflection_point, summarise
+from cloudctl.debug.correlator import build_timeline, summarise
 from cloudctl.debug.resolver import build_steps
 from cloudctl.debug.renderer import (
     diagnosing_banner,
@@ -81,8 +81,7 @@ def run(
         fetch_skipped(cloud, "deep debug only supports AWS in this version")
 
     # ── 3. Correlate ──────────────────────────────────────────────
-    timeline     = build_timeline(all_evidence)
-    inflection   = find_inflection_point(timeline)
+    timeline       = build_timeline(all_evidence)
     timeline_dicts = summarise(timeline)
 
     # ── 4. Analyze ────────────────────────────────────────────────
@@ -225,6 +224,32 @@ def _collect(evidence: list, context: dict, key: str, evts: list, extend: bool =
             context[key] = evts
 
 
+def _fetch_cloudwatch(fetcher, evidence: list, context: dict) -> None:
+    fetch_start("CloudWatch Metrics")
+    for ns, metric in [
+        ("AWS/EC2",            "CPUUtilization"),
+        ("AWS/ECS",            "CPUUtilization"),
+        ("AWS/RDS",            "DatabaseConnections"),
+        ("AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count"),
+    ]:
+        _collect(evidence, context, "metrics", fetcher.cloudwatch_metrics(namespace=ns, metric_name=metric), extend=True)
+    fetch_item("CloudWatch Metrics", len([e for e in evidence if "CloudWatch" in e.get("source", "")]))
+
+
+def _fetch_cloudtrail(fetcher, evidence: list, context: dict) -> None:
+    fetch_start("CloudTrail")
+    evts = fetcher.cloudtrail(minutes=120)
+    _collect(evidence, context, "cloudtrail_events", evts)
+    if evts:
+        fetch_item("CloudTrail", len(evts))
+    elif fetcher.availability.get("cloudtrail") is False:
+        fetch_skipped("CloudTrail", "not enabled in this region or no permissions")
+        missing_source_warning(
+            "CloudTrail",
+            "Enable CloudTrail: `aws cloudtrail create-trail --name cloudctl-trail --s3-bucket-name <bucket>`",
+        )
+
+
 def _fetch_aws(session, sources: list[str], hints: list[str]) -> tuple[list[dict], dict]:
     """Fetch all planned AWS data sources, return (evidence_list, context_dict)."""
     from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
@@ -233,40 +258,18 @@ def _fetch_aws(session, sources: list[str], hints: list[str]) -> tuple[list[dict
     evidence: list[dict] = []
     context:  dict       = {}
 
-    # CloudWatch Metrics
     if "cloudwatch_metrics" in sources:
-        fetch_start("CloudWatch Metrics")
-        for ns, metric in [
-            ("AWS/EC2",            "CPUUtilization"),
-            ("AWS/ECS",            "CPUUtilization"),
-            ("AWS/RDS",            "DatabaseConnections"),
-            ("AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count"),
-        ]:
-            _collect(evidence, context, "metrics", fetcher.cloudwatch_metrics(namespace=ns, metric_name=metric), extend=True)
-        fetch_item("CloudWatch Metrics", len([e for e in evidence if "CloudWatch" in e.get("source", "")]))
+        _fetch_cloudwatch(fetcher, evidence, context)
 
-    # CloudTrail
     if "cloudtrail" in sources:
-        fetch_start("CloudTrail")
-        evts = fetcher.cloudtrail(minutes=120)
-        _collect(evidence, context, "cloudtrail_events", evts)
-        if evts:
-            fetch_item("CloudTrail", len(evts))
-        elif fetcher.availability.get("cloudtrail") is False:
-            fetch_skipped("CloudTrail", "not enabled in this region or no permissions")
-            missing_source_warning(
-                "CloudTrail",
-                "Enable CloudTrail: `aws cloudtrail create-trail --name cloudctl-trail --s3-bucket-name <bucket>`",
-            )
+        _fetch_cloudtrail(fetcher, evidence, context)
 
-    # ECS Events (use service hints)
     if "ecs_events" in sources and hints:
         fetch_start("ECS Events")
         for cluster_hint in hints[:2]:
             _collect(evidence, context, "ecs_events", fetcher.ecs_events(cluster=cluster_hint, service=cluster_hint), extend=True)
         fetch_item("ECS Events", len(context.get("ecs_events", [])))
 
-    # RDS Events
     if "rds_events" in sources:
         fetch_start("RDS Events")
         evts = fetcher.rds_events()
@@ -274,7 +277,6 @@ def _fetch_aws(session, sources: list[str], hints: list[str]) -> tuple[list[dict
         if evts:
             fetch_item("RDS Events", len(evts))
 
-    # CodePipeline
     if "codepipeline" in sources:
         fetch_start("CodePipeline")
         evts = fetcher.codepipeline()
@@ -282,7 +284,6 @@ def _fetch_aws(session, sources: list[str], hints: list[str]) -> tuple[list[dict
         if evts:
             fetch_item("CodePipeline", len(evts))
 
-    # Network Context
     if "network_context" in sources:
         fetch_start("Network Context")
         evts = fetcher.network_context()
