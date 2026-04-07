@@ -91,12 +91,12 @@ class BedrockAI(BaseAI):
         session = boto3.Session(profile_name=profile) if profile else boto3.Session()
         self._client = session.client("bedrock-runtime", region_name=region)
 
-    def _invoke(self, prompt: str) -> str:
+    def _invoke(self, prompt: str, system: str | None = None) -> str:
         import json  # noqa: PLC0415
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 4096,
-            "system": _SYSTEM_PROMPT,
+            "system": system or _SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}],
         })
         resp = self._client.invoke_model(modelId=self._model, body=body)

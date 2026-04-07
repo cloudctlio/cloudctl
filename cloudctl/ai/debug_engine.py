@@ -71,11 +71,11 @@ class DebugEngine:
         )
 
         from cloudctl.ai.factory import _parse_json_response  # noqa: PLC0415
+        from cloudctl.ai.prompts.debug import debug_prompt, DEBUG_SYSTEM  # noqa: PLC0415
 
         ai = get_ai(self._cfg, purpose="analysis")
-        raw_response = ai.ask(symptom, context=context)
-
-        answer_text = raw_response.get("answer", "")
+        prompt = debug_prompt(symptom, context)
+        answer_text = ai._invoke(prompt, system=DEBUG_SYSTEM)  # noqa: SLF001
         parsed = _parse_json_response(answer_text)
 
         return DebugFinding(
