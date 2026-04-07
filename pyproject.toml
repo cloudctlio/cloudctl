@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [
-    { name = "Harish Guttikonda", email = "cloudctlhq@gmail.com" }
+    { name = "hgutti", email = "cloudctlhq@gmail.com" }
 ]
 keywords = [
     "cloud", "cli", "aws", "azure", "gcp",
