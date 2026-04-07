@@ -25,11 +25,20 @@ def debug_prompt(symptom: str, context: dict, deploy_method: str = "unknown") ->
     """Build a debug prompt with real cloud context."""
     deploy_note = ""
     if deploy_method and deploy_method != "unknown":
+        _apply_cmd = {
+            "terraform": "terraform plan && terraform apply",
+            "cdk":       "cdk deploy",
+            "pulumi":    "pulumi up",
+        }.get(deploy_method, f"{deploy_method} deploy")
         deploy_note = (
             f"\nDEPLOYMENT METHOD: {deploy_method}\n"
             f"All remediation_steps MUST use {deploy_method} tooling — not raw cloud CLI. "
-            f"For example, if deploy_method is 'cdk', steps should say "
-            f"'Update the CDK stack environment variable and run: cdk deploy' — not aws lambda update-function-configuration.\n"
+            f"IMPORTANT: Do NOT end every step with '{_apply_cmd}'. "
+            f"List all configuration changes first as separate steps, then add ONE final step: "
+            f"'Apply all changes: {_apply_cmd}'. "
+            f"For example: Step 1: 'In main.tf, set DB_POOL_SIZE = 10 in the error-5xx Lambda environment block.' "
+            f"Step 2: 'In main.tf, set timeout = 5 in the intermittent Lambda.' "
+            f"Final step: 'Apply all changes: {_apply_cmd}'\n"
         )
     return (
         f"REAL CLOUD DATA:\n{json.dumps(context, indent=2, default=str)}\n\n"

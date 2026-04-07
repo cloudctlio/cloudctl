@@ -16,12 +16,22 @@ from __future__ import annotations
 
 from typing import Optional
 
-_TF_UA = "hashicorp terraform"
+def _is_terraform_ua(ua: str) -> bool:
+    """
+    Detect Terraform in a userAgent string.
+
+    Terraform's AWS provider sets:
+      "APN/1.0 HashiCorp/1.0 Terraform/X.Y.Z (+https://www.terraform.io) ..."
+    which lowercased contains "hashicorp" and "terraform" but NOT the literal
+    string "hashicorp terraform" (they are separated by "/1.0 ").
+    We therefore check for both tokens independently.
+    """
+    return "hashicorp" in ua and "terraform" in ua
 
 
 def _tool_from_useragent(ua: str) -> str:
     """Return IaC tool name detected in an AWS CloudTrail userAgent, or empty string."""
-    if _TF_UA in ua:
+    if _is_terraform_ua(ua):
         return "terraform"
     if "pulumi" in ua:
         return "pulumi"
@@ -32,7 +42,7 @@ def _tool_from_useragent(ua: str) -> str:
 
 def _tool_from_http_useragent(ua: str) -> str:
     """Return IaC tool name from an Azure/GCP HTTP userAgent (no CDK — CDK is AWS-only)."""
-    if _TF_UA in ua:
+    if _is_terraform_ua(ua):
         return "terraform"
     if "pulumi" in ua:
         return "pulumi"
@@ -215,26 +225,51 @@ def _aws_cfn_registry(session, resource_arn: str) -> str:
 
 
 def _aws_cloudtrail(session, resource_arn: str) -> str:
-    """CloudTrail lookup_events — check userAgent (definitive) then Username (secondary)."""
+    """CloudTrail lookup_events — check userAgent (definitive) then Username (secondary).
+
+    CloudTrail indexes Lambda (and most services) by resource *name*, not ARN.
+    We try both: ARN first, then the short name extracted from the ARN.
+    """
     import json as _json  # noqa: PLC0415
     from datetime import datetime, timedelta, timezone  # noqa: PLC0415
-    try:
-        ct    = session.client("cloudtrail")
-        end   = datetime.now(timezone.utc)
-        resp  = ct.lookup_events(
-            LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_arn}],
-            StartTime=end - timedelta(hours=24),
-            EndTime=end,
-            MaxResults=10,
-        )
-        for ev in resp.get("Events", []):
-            # Parse full CloudTrail JSON to get userAgent — IaC tools always set this
+
+    def _scan_events(events) -> str:
+        for ev in events:
             detail = _json.loads(ev.get("CloudTrailEvent", "{}"))
             ua = detail.get("userAgent", "").lower()
             u  = (ev.get("Username") or "").lower()
-
-            # userAgent is definitive — cannot be suppressed by the caller
             tool = _tool_from_useragent(ua) or _tool_from_cloudtrail_username(u)
+            if tool:
+                return tool
+        return ""
+
+    try:
+        ct  = session.client("cloudtrail")
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=24)
+
+        # First pass: lookup by ARN
+        resp = ct.lookup_events(
+            LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_arn}],
+            StartTime=start,
+            EndTime=end,
+            MaxResults=10,
+        )
+        tool = _scan_events(resp.get("Events", []))
+        if tool:
+            return tool
+
+        # Second pass: lookup by short name (last segment of the ARN)
+        # e.g. arn:aws:lambda:...:function:my-fn  →  "my-fn"
+        short_name = resource_arn.split(":")[-1]
+        if short_name and short_name != resource_arn:
+            resp2 = ct.lookup_events(
+                LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": short_name}],
+                StartTime=start,
+                EndTime=end,
+                MaxResults=10,
+            )
+            tool = _scan_events(resp2.get("Events", []))
             if tool:
                 return tool
     except Exception:  # noqa: BLE001
