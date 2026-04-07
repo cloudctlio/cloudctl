@@ -296,6 +296,17 @@ class DebugFetcher:
             self._mark("codepipeline", False)
             return []
 
+    def discover_log_groups(self, prefix: str, limit: int = 10) -> list[str]:
+        """Return log group names that contain *prefix* (case-insensitive search)."""
+        if not self._session:
+            return []
+        try:
+            logs = self._session.client("logs")
+            resp = logs.describe_log_groups(logGroupNamePattern=prefix, limit=limit)
+            return [lg["logGroupName"] for lg in resp.get("logGroups", [])]
+        except Exception:  # noqa: BLE001
+            return []
+
     def lambda_logs(
         self,
         function_name: str,
