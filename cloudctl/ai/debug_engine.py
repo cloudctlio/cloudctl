@@ -95,6 +95,23 @@ class DebugEngine:
             context_summary={k: len(v) if isinstance(v, (list, dict)) else v for k, v in context.items()},
         )
 
+    # Env var key patterns whose values must be redacted before leaving this process
+    _SENSITIVE_PATTERNS = (
+        "secret", "password", "passwd", "token", "api_key", "apikey",
+        "auth", "credential", "private_key", "access_key", "signing_key",
+        "encryption_key", "client_secret", "db_pass", "database_pass",
+    )
+
+    @classmethod
+    def _is_sensitive_key(cls, key: str) -> bool:
+        k = key.lower()
+        return any(pat in k for pat in cls._SENSITIVE_PATTERNS)
+
+    @classmethod
+    def _redact_env_vars(cls, env_vars: dict) -> dict:
+        return {k: ("***REDACTED***" if cls._is_sensitive_key(k) else v)
+                for k, v in env_vars.items()}
+
     def _detect_deployment_method(
         self,
         cloud: str,
@@ -102,7 +119,7 @@ class DebugEngine:
         region: Optional[str],
         context: dict,
     ) -> str:
-        """Detect IaC deployment method from resource tags/labels in context."""
+        """Detect IaC deployment method and enrich context with redacted CF resource config."""
         from cloudctl.debug.deployment_detector import detect  # noqa: PLC0415
         from cloudctl.commands._helpers import get_aws_provider  # noqa: PLC0415
 
@@ -115,11 +132,12 @@ class DebugEngine:
             return "unknown"
 
         try:
-            prov = get_aws_provider(targets[0], region)
+            prov    = get_aws_provider(targets[0], region)
             session = prov._session  # noqa: SLF001
 
-            # Collect tags from Lambda functions mentioned in service_logs
+            # Collect tags + ARNs from Lambda functions mentioned in service_logs
             resource_tags: dict = {}
+            fn_arns: dict[str, str] = {}  # fn_name -> ARN
             log_groups = [e.get("source", "") for e in context.get("service_logs", [])]
             fn_names = {
                 lg.replace("CloudWatch/Logs//aws/lambda/", "")
@@ -130,14 +148,94 @@ class DebugEngine:
                 lm = session.client("lambda")
                 for fn in list(fn_names)[:3]:
                     try:
-                        tags = lm.get_function(FunctionName=fn).get("Tags", {})
+                        fn_data = lm.get_function(FunctionName=fn)
+                        tags = fn_data.get("Tags", {})
                         resource_tags.update(tags)
+                        fn_arns[fn] = fn_data["Configuration"]["FunctionArn"]
                     except Exception:  # noqa: BLE001
                         pass
 
-            return detect("aws", resource_tags=resource_tags)
+            # Use _detect_aws directly so CloudFormation template inspection runs
+            # (detect() public API with tags-only never reaches _aws_cfn_registry)
+            from cloudctl.debug.deployment_detector import _detect_aws  # noqa: PLC0415
+            first_arn = next(iter(fn_arns.values()), None)
+            method = _detect_aws(session, first_arn, resource_tags) if first_arn else detect("aws", resource_tags=resource_tags)
+
+            # Fetch CF resource config for affected Lambdas — redact sensitive env vars
+            if fn_arns:
+                self._fetch_cf_resource_context(session, fn_arns, resource_tags, context)
+
+            return method
         except Exception:  # noqa: BLE001
             return "unknown"
+
+    def _fetch_cf_resource_context(
+        self,
+        session,
+        fn_arns: dict,
+        resource_tags: dict,
+        context: dict,
+    ) -> None:
+        """Fetch CF template slice for affected resources; redact sensitive values."""
+        import json  # noqa: PLC0415
+        try:
+            cf         = session.client("cloudformation")
+            stack_name = resource_tags.get("aws:cloudformation:stack-name", "")
+            if not stack_name:
+                # Fall back: look up by first function ARN
+                arn = next(iter(fn_arns.values()), "")
+                if not arn:
+                    return
+                resp = cf.describe_stack_resources(PhysicalResourceId=arn)
+                stacks = resp.get("StackResources", [])
+                if not stacks:
+                    return
+                stack_name = stacks[0]["StackName"]
+
+            tpl_body = cf.get_template(StackName=stack_name).get("TemplateBody", "")
+            tpl      = json.loads(tpl_body) if isinstance(tpl_body, str) else tpl_body
+
+            # Resolve logical IDs: from tag first, then describe_stack_resources per ARN
+            cf_resources = tpl.get("Resources", {})
+            logical_ids: set[str] = set()
+            tag_lid = resource_tags.get("aws:cloudformation:logical-id", "")
+            if tag_lid:
+                logical_ids.add(tag_lid)
+            for arn in fn_arns.values():
+                try:
+                    stk = cf.describe_stack_resources(PhysicalResourceId=arn)
+                    for r in stk.get("StackResources", []):
+                        logical_ids.add(r["LogicalResourceId"])
+                except Exception:  # noqa: BLE001
+                    pass
+            logical_ids.discard("")
+
+            slices: dict = {}
+            for lid in logical_ids:
+                if lid not in cf_resources:
+                    continue
+                res   = cf_resources[lid]
+                props = dict(res.get("Properties", {}))
+                env   = props.get("Environment", {}).get("Variables", {})
+                if env:
+                    props["Environment"] = {"Variables": self._redact_env_vars(env)}
+                slices[lid] = {
+                    "Type":       res.get("Type", ""),
+                    "Properties": {
+                        k: props[k] for k in
+                        ("FunctionName", "Handler", "Runtime", "MemorySize",
+                         "Timeout", "Environment", "ReservedConcurrentExecutions")
+                        if k in props
+                    },
+                }
+
+            if slices:
+                context["iac_resource_config"] = {
+                    "stack":     stack_name,
+                    "resources": slices,
+                }
+        except Exception:  # noqa: BLE001
+            pass
 
     def _fetch_symptom_context_aws(
         self,
