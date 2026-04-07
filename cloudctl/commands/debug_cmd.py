@@ -49,6 +49,8 @@ def _render_incident(finding, account: Optional[str]) -> None:
     t.add_column(style="bold cyan", no_wrap=True, min_width=14, max_width=14)
     t.add_column()
 
+    deploy = getattr(finding, "deployment_method", "unknown")
+
     t.add_row(
         Text(""),
         Text(f"INCIDENT ANALYSIS  ·  {ts}  ·  account: {acct}", style="bold"),
@@ -60,6 +62,9 @@ def _render_incident(finding, account: Optional[str]) -> None:
         Text(f"DEGRADED  —  {affected_name}", style=status_color),
         end_section=True,
     )
+
+    if deploy and deploy != "unknown":
+        t.add_row(Text("DEPLOYED VIA"), Text(deploy.upper()), end_section=True)
 
     confidence_val = cs_level
     if cs_reason:

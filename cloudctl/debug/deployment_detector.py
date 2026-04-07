@@ -548,6 +548,15 @@ def _tags_crosscloud(tags: dict) -> str:
     if lk.get("iac-tool", "") == "pulumi":
         return "pulumi"
 
+    # CDK / CloudFormation via managed-by tag
+    _cdk_managed_values = {"cdk", "aws-cdk"}
+    if lk.get("managed-by", lk.get("managedby", "")) in _cdk_managed_values:
+        return "cdk"
+    if lk.get("iac-tool", "") in _cdk_managed_values:
+        return "cdk"
+    if lk.get("managed-by", lk.get("managedby", "")) == "cloudformation":
+        return "cloudformation"
+
     return "unknown"
 
 

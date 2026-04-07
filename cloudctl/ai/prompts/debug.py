@@ -21,11 +21,20 @@ DEBUG_SYSTEM = (
 )
 
 
-def debug_prompt(symptom: str, context: dict) -> str:
+def debug_prompt(symptom: str, context: dict, deploy_method: str = "unknown") -> str:
     """Build a debug prompt with real cloud context."""
+    deploy_note = ""
+    if deploy_method and deploy_method != "unknown":
+        deploy_note = (
+            f"\nDEPLOYMENT METHOD: {deploy_method}\n"
+            f"All remediation_steps MUST use {deploy_method} tooling — not raw cloud CLI. "
+            f"For example, if deploy_method is 'cdk', steps should say "
+            f"'Update the CDK stack environment variable and run: cdk deploy' — not aws lambda update-function-configuration.\n"
+        )
     return (
         f"REAL CLOUD DATA:\n{json.dumps(context, indent=2, default=str)}\n\n"
-        f"SYMPTOM: {symptom}\n\n"
+        f"SYMPTOM: {symptom}\n"
+        f"{deploy_note}\n"
         "Diagnose the root cause. Return JSON only — no text outside the JSON object. "
         "The root_cause value may contain markdown. All other values must be plain strings or string lists."
     )
