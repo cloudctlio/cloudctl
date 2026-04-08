@@ -253,7 +253,7 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
             LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_arn}],
             StartTime=start,
             EndTime=end,
-            MaxResults=10,
+            MaxResults=50,
         )
         tool = _scan_events(resp.get("Events", []))
         if tool:
@@ -267,7 +267,7 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
                 LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": short_name}],
                 StartTime=start,
                 EndTime=end,
-                MaxResults=10,
+                MaxResults=50,
             )
             tool = _scan_events(resp2.get("Events", []))
             if tool:

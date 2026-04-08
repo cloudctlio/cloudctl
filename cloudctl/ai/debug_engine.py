@@ -186,9 +186,12 @@ class DebugEngine:
                     pass
 
             from cloudctl.debug.deployment_detector import _detect_aws  # noqa: PLC0415
-            # _detect_aws's CloudTrail lookup handles both full ARNs and plain names.
-            first_resource = resource_names[0] if resource_names else None
-            method = _detect_aws(session, first_resource, resource_tags)
+            # Try each collected resource name until detection succeeds.
+            method = "unknown"
+            for candidate in resource_names:
+                method = _detect_aws(session, candidate, resource_tags)
+                if method != "unknown":
+                    break
 
             # For CDK/CF: enrich context with template slice for affected resources.
             if method in ("cdk", "cloudformation"):
@@ -296,7 +299,7 @@ class DebugEngine:
             return
 
         # Service logs — discover any CloudWatch log group matching the hints
-        if "lambda_logs" in sources or "alb_logs" in sources:
+        if "service_logs" in sources:
             service_logs: list[dict] = []
             for hint in hints[:5]:
                 for lg in fetcher.discover_log_groups(hint):
@@ -309,19 +312,6 @@ class DebugEngine:
             if service_logs:
                 context["service_logs"] = service_logs
 
-        # Lambda metrics
-        if "lambda_logs" in sources:
-            for metric in ("Errors", "Duration", "Throttles"):
-                evts = fetcher.cloudwatch_metrics(namespace="AWS/Lambda", metric_name=metric)
-                if evts:
-                    context.setdefault("metrics", []).extend(evts)
-
-        # ALB metrics
-        if "alb_logs" in sources:
-            for metric in ("HTTPCode_Target_5XX_Count", "HTTPCode_Target_4XX_Count", "TargetResponseTime"):
-                evts = fetcher.cloudwatch_metrics(namespace="AWS/ApplicationELB", metric_name=metric)
-                if evts:
-                    context.setdefault("metrics", []).extend(evts)
 
         # CloudTrail
         if "cloudtrail" in sources:
@@ -340,3 +330,9 @@ class DebugEngine:
             evts = fetcher.codepipeline()
             if evts:
                 context["pipeline_executions"] = evts
+
+        # Network context
+        if "network_context" in sources:
+            evts = fetcher.network_context()
+            if evts:
+                context["network_context"] = evts

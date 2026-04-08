@@ -5,31 +5,31 @@ from typing import Optional
 
 # Maps symptom keywords to the data sources (fetcher methods) to call
 SYMPTOM_SOURCES: dict[str, list[str]] = {
-    # HTTP / API errors
-    "502":             ["alb_logs", "ecs_events", "cloudwatch_metrics", "cloudtrail"],
-    "503":             ["alb_logs", "ecs_events", "cloudwatch_metrics"],
-    "504":             ["alb_logs", "ecs_events", "cloudwatch_metrics", "rds_events"],
-    "timeout":         ["cloudwatch_metrics", "ecs_events", "rds_events", "lambda_logs"],
-    "latency":         ["cloudwatch_metrics", "rds_events", "alb_logs"],
-    "slow":            ["cloudwatch_metrics", "rds_events", "cloudwatch_logs"],
-    "error rate":      ["alb_logs", "cloudwatch_metrics", "cloudwatch_logs"],
-    "5xx":             ["alb_logs", "ecs_events", "cloudwatch_metrics"],
-    "4xx":             ["alb_logs", "cloudwatch_logs"],
+    # HTTP / API errors — include network context since LB/target health is often root cause
+    "502":             ["service_logs", "ecs_events", "cloudwatch_metrics", "cloudtrail", "network_context"],
+    "503":             ["service_logs", "ecs_events", "cloudwatch_metrics", "network_context"],
+    "504":             ["service_logs", "ecs_events", "cloudwatch_metrics", "rds_events", "network_context"],
+    "timeout":         ["cloudwatch_metrics", "ecs_events", "rds_events", "service_logs", "network_context"],
+    "latency":         ["cloudwatch_metrics", "rds_events", "service_logs", "network_context"],
+    "slow":            ["cloudwatch_metrics", "rds_events", "cloudwatch_logs", "network_context"],
+    "error rate":      ["service_logs", "cloudwatch_metrics", "cloudwatch_logs"],
+    "5xx":             ["service_logs", "ecs_events", "cloudwatch_metrics", "network_context"],
+    "4xx":             ["service_logs", "cloudwatch_logs"],
 
     # Compute
     "crash":           ["ecs_events", "cloudwatch_logs", "cloudtrail"],
-    "unhealthy":       ["ecs_events", "alb_logs", "cloudwatch_metrics"],
+    "unhealthy":       ["ecs_events", "service_logs", "cloudwatch_metrics", "network_context"],
     "oom":             ["cloudwatch_logs", "ecs_events", "cloudwatch_metrics"],
     "out of memory":   ["cloudwatch_logs", "ecs_events", "cloudwatch_metrics"],
     "cpu":             ["cloudwatch_metrics", "ecs_events"],
     "memory":          ["cloudwatch_metrics", "ecs_events", "cloudwatch_logs"],
     "container":       ["ecs_events", "cloudwatch_logs"],
     "task":            ["ecs_events", "cloudwatch_logs"],
-    "lambda":          ["lambda_logs", "cloudwatch_metrics"],
-    "function":        ["lambda_logs", "cloudwatch_metrics"],
+    "lambda":          ["service_logs", "cloudwatch_metrics"],
+    "function":        ["service_logs", "cloudwatch_metrics"],
 
     # Database
-    "connection":      ["rds_events", "cloudwatch_metrics", "cloudwatch_logs"],
+    "connection":      ["rds_events", "cloudwatch_metrics", "cloudwatch_logs", "network_context"],
     "database":        ["rds_events", "cloudwatch_metrics"],
     "rds":             ["rds_events", "cloudwatch_metrics"],
     "pool":            ["rds_events", "cloudwatch_metrics", "cloudwatch_logs"],
@@ -51,12 +51,33 @@ SYMPTOM_SOURCES: dict[str, list[str]] = {
     "iam":             ["cloudtrail", "iam_simulation"],
     "role":            ["cloudtrail", "iam_simulation"],
 
-    # Network
-    "network":         ["network_context", "vpc_flow_logs", "cloudwatch_metrics"],
-    "connectivity":    ["network_context", "vpc_flow_logs"],
+    # Network — dedicated symptoms
+    "network":         ["network_context", "cloudwatch_metrics", "cloudtrail"],
+    "connectivity":    ["network_context", "cloudtrail"],
     "unreachable":     ["network_context", "cloudtrail"],
     "dns":             ["cloudwatch_logs", "network_context"],
-    "nat":             ["network_context", "vpc_flow_logs"],
+    "nat":             ["network_context"],
+    "vpc":             ["network_context"],
+    "subnet":          ["network_context"],
+    "security group":  ["network_context", "cloudtrail"],
+    "firewall":        ["network_context", "cloudtrail"],
+    "routing":         ["network_context"],
+    "load balancer":   ["network_context", "service_logs", "cloudwatch_metrics"],
+    "target group":    ["network_context", "service_logs"],
+    "vpn":             ["network_context", "cloudtrail"],
+    "direct connect":  ["network_context"],
+    "peering":         ["network_context"],
+    "endpoint":        ["network_context", "cloudtrail"],
+
+    # Processing / application failures
+    "failing":         ["service_logs", "cloudwatch_metrics", "cloudtrail"],
+    "failed":          ["service_logs", "cloudwatch_metrics", "cloudtrail"],
+    "exception":       ["service_logs", "cloudwatch_logs"],
+    "processing":      ["service_logs", "cloudwatch_metrics", "cloudwatch_logs"],
+    "retry":           ["service_logs", "cloudwatch_metrics"],
+    "dead":            ["service_logs", "cloudwatch_metrics"],
+    "throttl":         ["service_logs", "cloudwatch_metrics", "cloudtrail"],
+    "concurren":       ["service_logs", "cloudwatch_metrics"],
 
     # Cost
     "cost":            ["cloudwatch_metrics"],
