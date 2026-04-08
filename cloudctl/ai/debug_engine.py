@@ -190,15 +190,16 @@ class DebugEngine:
             first_resource = resource_names[0] if resource_names else None
             method = _detect_aws(session, first_resource, resource_tags)
 
-            # For CDK/CF: enrich context with template slice for Lambda resources.
+            # For CDK/CF: enrich context with template slice for affected resources.
             if method in ("cdk", "cloudformation"):
-                fn_arns = {
+                # Use any ARN we have — CF lookup works for Lambda, ECS, RDS, etc.
+                resource_arns = {
                     n.split(":")[-1]: n
                     for n in resource_names
-                    if n.startswith("arn:aws:") and ":lambda:" in n and ":function:" in n
+                    if n.startswith("arn:aws:")
                 }
-                if fn_arns:
-                    self._fetch_cf_resource_context(session, fn_arns, resource_tags, context)
+                if resource_arns:
+                    self._fetch_cf_resource_context(session, resource_arns, resource_tags, context)
 
             return method
         except Exception:  # noqa: BLE001
@@ -251,17 +252,13 @@ class DebugEngine:
                     continue
                 res   = cf_resources[lid]
                 props = dict(res.get("Properties", {}))
-                env   = props.get("Environment", {}).get("Variables", {})
+                # Redact sensitive env vars regardless of resource type
+                env = props.get("Environment", {}).get("Variables", {})
                 if env:
                     props["Environment"] = {"Variables": self._redact_env_vars(env)}
                 slices[lid] = {
                     "Type":       res.get("Type", ""),
-                    "Properties": {
-                        k: props[k] for k in
-                        ("FunctionName", "Handler", "Runtime", "MemorySize",
-                         "Timeout", "Environment", "ReservedConcurrentExecutions")
-                        if k in props
-                    },
+                    "Properties": props,
                 }
 
             if slices:
