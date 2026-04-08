@@ -30,8 +30,8 @@ _CFG_PROVIDER = "ai.provider"
 # ── Model ID tables ────────────────────────────────────────────────────────────
 
 _BEDROCK_MODELS = {
-    "opus":   "us.anthropic.claude-opus-4-6-v1:0",
-    "sonnet": "us.anthropic.claude-sonnet-4-6-v1:0",
+    "opus":   "us.anthropic.claude-opus-4-20250514-v1:0",
+    "sonnet": "us.anthropic.claude-sonnet-4-20250514-v1:0",
     "haiku":  "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 }
 _AZURE_MODELS = {
@@ -84,17 +84,19 @@ def _parse_json_response(text: str) -> dict:
 class BedrockAI(BaseAI):
     def __init__(self, cfg: ConfigManager):
         import boto3  # noqa: PLC0415
-        region = cfg.get("ai.bedrock_region") or "us-east-1"
-        tier   = cfg.get(_CFG_TIER) or "sonnet"
+        region  = cfg.get("ai.bedrock_region") or "us-east-1"
+        profile = cfg.get("ai.bedrock_profile") or None
+        tier    = cfg.get(_CFG_TIER) or "sonnet"
         self._model = cfg.get("ai.bedrock_model") or _BEDROCK_MODELS.get(tier, _BEDROCK_MODELS["sonnet"])
-        self._client = boto3.client("bedrock-runtime", region_name=region)
+        session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+        self._client = session.client("bedrock-runtime", region_name=region)
 
-    def _invoke(self, prompt: str) -> str:
+    def _invoke(self, prompt: str, system: str | None = None) -> str:
         import json  # noqa: PLC0415
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 4096,
-            "system": _SYSTEM_PROMPT,
+            "system": system or _SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}],
         })
         resp = self._client.invoke_model(modelId=self._model, body=body)
