@@ -101,6 +101,34 @@ def _render_incident(finding, account: Optional[str]) -> None:
     console.print()
 
 
+def _render_explain(finding) -> None:
+    """Show how cloudctl fetched and analyzed the incident (--explain output)."""
+    console.print("\n[bold]HOW THIS ANALYSIS WORKS:[/bold]\n")
+
+    console.print("  [bold]Step 1 — Data fetched (deterministic, read-only):[/bold]")
+    for source, count in finding.context_summary.items():
+        if source == "deployment_method":
+            continue
+        console.print(f"    - {source}: {count} items")
+
+    console.print()
+    console.print("  [bold]Step 2 — AI reasoning:[/bold]")
+    deploy = getattr(finding, "deployment_method", "unknown")
+    if deploy and deploy != "unknown":
+        console.print(f"    - Deployment method detected: {deploy.upper()}")
+        console.print(f"    - Remediation steps tailored to {deploy} tooling")
+    else:
+        console.print("    - Deployment method: not detected (remediation uses CLI commands)")
+
+    console.print()
+    cs = finding.confidence
+    level = cs.level if cs else "UNKNOWN"
+    console.print(f"  [bold]Confidence: {level}[/bold]")
+    if finding.confidence_notes:
+        console.print(f"    {finding.confidence_notes}")
+    console.print()
+
+
 @app.command("symptom")
 def debug_symptom(
     symptom:  str           = typer.Argument(..., help="Describe the symptom, e.g. 'payments returning 502s'"),
@@ -111,6 +139,14 @@ def debug_symptom(
         None, "--include", "-i",
         help="Comma-separated data categories: compute,cost,security,database,storage",
     ),
+    dry_run:  bool          = typer.Option(
+        False, "--dry-run",
+        help="Show what cloudctl will fetch without running the analysis (all operations are read-only)",
+    ),
+    explain:  bool          = typer.Option(
+        False, "--explain",
+        help="Show how cloudctl fetched and analyzed this incident after the result",
+    ),
 ) -> None:
     """
     Debug a cloud infrastructure symptom using AI analysis of real data.
@@ -119,8 +155,34 @@ def debug_symptom(
       cloudctl debug symptom "payments returning 502s"
       cloudctl debug symptom "Lambda timing out" --cloud aws
       cloudctl debug symptom "high costs this month" --include cost
+      cloudctl debug symptom "payments 502s" --dry-run
     """
     cfg = require_init()
+
+    if dry_run:
+        from cloudctl.debug.planner import plan_sources, extract_service_hints  # noqa: PLC0415
+        sources = plan_sources(symptom)
+        hints   = extract_service_hints(symptom)
+        console.print("\n[bold]DRY RUN — no data will be fetched, no changes made[/bold]\n")
+        console.print("This session would fetch (all operations are read-only):\n")
+        source_descriptions = {
+            "service_logs":       "application log groups matching symptom hints",
+            "cloudwatch_metrics": "CloudWatch metrics (CPU, errors, latency)",
+            "cloudtrail":         "CloudTrail audit events (last 2h)",
+            "network_context":    "full network topology (VPCs, SGs, route tables, ALB, NLB, ...)",
+            "ecs_events":         "ECS service events",
+            "rds_events":         "RDS instance events",
+            "codepipeline":       "CodePipeline execution history",
+            "cloudwatch_logs":    "CloudWatch log groups",
+            "iam_simulation":     "IAM policy simulation",
+        }
+        for src in sources:
+            desc = source_descriptions.get(src, src)
+            console.print(f"   - {src}: {desc}")
+        if hints:
+            console.print(f"\nResource hints extracted from symptom: {', '.join(hints)}")
+        console.print("\nRun without --dry-run to execute the analysis.")
+        return
 
     try:
         from cloudctl.ai.factory import is_ai_configured  # noqa: PLC0415
@@ -148,3 +210,6 @@ def debug_symptom(
     )
 
     _render_incident(finding, account)
+
+    if explain:
+        _render_explain(finding)

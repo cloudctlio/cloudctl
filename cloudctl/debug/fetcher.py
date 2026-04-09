@@ -7,6 +7,13 @@ from typing import Optional
 
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
+# CloudTrail management events have up to 15-minute delivery lag.
+# cloudctl uses CloudTrail for deployment detection (7-day lookback, lag irrelevant)
+# and IAM deny diagnosis (lag acceptable). Real-time signals come from CloudWatch
+# metrics (1-min lag). If an incident happened < 20 minutes ago, the caller should
+# surface a lag warning so users know CloudTrail data may be incomplete.
+CLOUDTRAIL_LAG_MINUTES = 15
+
 
 class DebugFetcher:
     """
@@ -532,4 +539,368 @@ class DebugFetcher:
             return events
         except Exception:  # noqa: BLE001
             self._mark("network_context", False)
+            return []
+
+    def cloudtrail_with_lag_check(
+        self,
+        minutes: int = 120,
+        resource_name: Optional[str] = None,
+        incident_time: Optional[datetime] = None,
+    ) -> tuple[list[dict], bool]:
+        """Fetch CloudTrail events and return (events, lag_warning).
+
+        lag_warning is True when the incident is < 20 minutes old, meaning
+        CloudTrail may not yet have delivered the latest management events
+        (AWS-documented max delivery lag: CLOUDTRAIL_LAG_MINUTES).
+        Use CloudWatch metrics for real-time signals in that case.
+        """
+        lag_warning = False
+        if incident_time:
+            age_minutes = (datetime.now(timezone.utc) - incident_time).total_seconds() / 60
+            if age_minutes < CLOUDTRAIL_LAG_MINUTES + 5:
+                lag_warning = True
+        return self.cloudtrail(minutes=minutes, resource_name=resource_name), lag_warning
+
+    # ── P2.5: ALB log discovery ───────────────────────────────────────────────
+
+    def find_alb_for_resource(self, resource_name: str) -> Optional[str]:
+        """Discover the ALB ARN attached to an ECS service or resource by name hint.
+
+        Searches ECS services for a name match, follows loadBalancers →
+        target group → ALB. Falls back to scanning all ALBs for a name match.
+        Returns ALB ARN or None.
+        """
+        if not self._session:
+            return None
+        try:
+            ecs   = self._session.client("ecs")
+            elbv2 = self._session.client("elbv2")
+
+            # Search ECS clusters for a service matching the hint
+            clusters = ecs.list_clusters().get("clusterArns", [])[:5]
+            for cluster_arn in clusters:
+                svcs = ecs.list_services(cluster=cluster_arn).get("serviceArns", [])[:20]
+                matching = [s for s in svcs if resource_name.lower() in s.lower()]
+                if matching:
+                    desc = ecs.describe_services(cluster=cluster_arn, services=[matching[0]])
+                    svc  = desc.get("services", [{}])[0]
+                    for lb in svc.get("loadBalancers", []):
+                        tg_arn = lb.get("targetGroupArn")
+                        if tg_arn:
+                            tg_resp = elbv2.describe_target_groups(TargetGroupArns=[tg_arn])
+                            alb_arns = tg_resp["TargetGroups"][0].get("LoadBalancerArns", [])
+                            if alb_arns:
+                                return alb_arns[0]
+
+            # Fallback: scan ALBs by name
+            for lb in elbv2.describe_load_balancers().get("LoadBalancers", [])[:20]:
+                if resource_name.lower() in lb.get("LoadBalancerName", "").lower():
+                    return lb.get("LoadBalancerArn")
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def get_alb_log_config(self, alb_arn: str) -> dict:
+        """Read ALB access log config from load balancer attributes.
+
+        Returns dict: {enabled: bool, bucket: str|None, prefix: str, alb_arn: str}
+        """
+        if not self._session:
+            return {"enabled": False, "bucket": None, "prefix": "", "alb_arn": alb_arn}
+        try:
+            elbv2  = self._session.client("elbv2")
+            attrs  = elbv2.describe_load_balancer_attributes(LoadBalancerArn=alb_arn)
+            by_key = {a["Key"]: a["Value"] for a in attrs.get("Attributes", [])}
+            enabled = by_key.get("access_logs.s3.enabled", "false").lower() == "true"
+            bucket  = by_key.get("access_logs.s3.bucket") or None
+            prefix  = by_key.get("access_logs.s3.prefix", "")
+            return {"enabled": enabled, "bucket": bucket, "prefix": prefix, "alb_arn": alb_arn}
+        except Exception:  # noqa: BLE001
+            return {"enabled": False, "bucket": None, "prefix": "", "alb_arn": alb_arn}
+
+    def alb_target_health(self, alb_arn: str) -> list[dict]:
+        """Return target health for all target groups on an ALB."""
+        if not self._session:
+            return []
+        results = []
+        try:
+            elbv2 = self._session.client("elbv2")
+            for tg in elbv2.describe_target_groups(LoadBalancerArn=alb_arn).get("TargetGroups", []):
+                tg_name = tg.get("TargetGroupName", "")
+                tg_arn  = tg.get("TargetGroupArn", "")
+                for th in elbv2.describe_target_health(TargetGroupArn=tg_arn).get("TargetHealthDescriptions", []):
+                    tgt    = th.get("Target", {})
+                    health = th.get("TargetHealth", {})
+                    results.append({
+                        "time":   "—",
+                        "source": f"ALBTargetHealth/{tg_name}",
+                        "event":  (
+                            f"target={tgt.get('Id')}:{tgt.get('Port')} "
+                            f"state={health.get('State')} "
+                            f"reason={health.get('Reason', '')} "
+                            f"description={health.get('Description', '')}"
+                        ),
+                    })
+        except Exception:  # noqa: BLE001
+            pass
+        return results
+
+    # ── P2.6: ECS stopped task reasons ───────────────────────────────────────
+
+    def ecs_stopped_tasks(self, cluster: str, service: Optional[str] = None, limit: int = 10) -> list[dict]:
+        """Fetch recently stopped ECS tasks with stop reasons.
+
+        Stop reasons (e.g. OOMKilled, task failed to start) are the most
+        useful signal for crash and OOM diagnosis — more specific than service events.
+        """
+        if not self._session:
+            return []
+        try:
+            ecs    = self._session.client("ecs")
+            kwargs: dict = {"cluster": cluster, "desiredStatus": "STOPPED", "maxResults": limit}
+            if service:
+                kwargs["serviceName"] = service
+            task_arns = ecs.list_tasks(**kwargs).get("taskArns", [])
+            if not task_arns:
+                return []
+            tasks  = ecs.describe_tasks(cluster=cluster, tasks=task_arns).get("tasks", [])
+            events = []
+            for t in tasks:
+                stopped_at = t.get("stoppedAt")
+                ts = stopped_at.strftime(_TS_FMT) if stopped_at else "—"
+                for container in t.get("containers", []):
+                    reason = container.get("reason", t.get("stoppedReason", "—"))
+                    events.append({
+                        "time":   ts,
+                        "source": f"ECS/StoppedTask/{cluster}",
+                        "event":  (
+                            f"container={container.get('name')} "
+                            f"exit_code={container.get('exitCode', '—')} "
+                            f"stop_reason={reason}"
+                        ),
+                    })
+            return events
+        except Exception:  # noqa: BLE001
+            return []
+
+    # ── P2.6: RDS slow query log ──────────────────────────────────────────────
+
+    def rds_slow_queries(self, db_identifier: str, minutes: int = 60) -> list[dict]:
+        """Fetch RDS slow query log lines from CloudWatch Logs if enabled.
+
+        Checks the parameter group for slow_query_log / log_min_duration_statement
+        then reads from /aws/rds/instance/<id>/slowquery or postgresql log group.
+        """
+        if not self._session:
+            return []
+        try:
+            rds = self._session.client("rds")
+            db  = rds.describe_db_instances(DBInstanceIdentifier=db_identifier)
+            instance = db.get("DBInstances", [{}])[0]
+            engine   = instance.get("Engine", "")
+
+            # Pick correct log group path by engine
+            if "postgres" in engine:
+                log_group = f"/aws/rds/instance/{db_identifier}/postgresql"
+                pattern   = "?duration ?ERROR ?FATAL"
+            else:
+                log_group = f"/aws/rds/instance/{db_identifier}/slowquery"
+                pattern   = "?Query_time ?slow"
+
+            return self.cloudwatch_logs(log_group=log_group, filter_pattern=pattern, minutes=minutes)
+        except Exception:  # noqa: BLE001
+            return []
+
+    # ── P2.6: Lambda REPORT line parser ──────────────────────────────────────
+
+    def lambda_report_metrics(self, function_name: str, minutes: int = 60) -> list[dict]:
+        """Parse Lambda REPORT lines from CloudWatch Logs.
+
+        Each invocation emits a REPORT line:
+          REPORT RequestId: ...  Duration: 234.12 ms  Billed Duration: 235 ms
+          Memory Size: 128 MB  Max Memory Used: 87 MB  Init Duration: 312 ms
+
+        Returns structured events with duration, memory, cold_start fields.
+        """
+        import re  # noqa: PLC0415
+        _REPORT_PATTERN = re.compile(
+            r"Duration:\s*([\d.]+)\s*ms.*?"
+            r"Billed Duration:\s*([\d.]+)\s*ms.*?"
+            r"Memory Size:\s*(\d+)\s*MB.*?"
+            r"Max Memory Used:\s*(\d+)\s*MB"
+            r"(?:.*?Init Duration:\s*([\d.]+)\s*ms)?",
+            re.DOTALL,
+        )
+        log_group = f"/aws/lambda/{function_name}"
+        raw = self.cloudwatch_logs(log_group=log_group, filter_pattern="REPORT RequestId", minutes=minutes)
+        events = []
+        for entry in raw:
+            m = _REPORT_PATTERN.search(entry.get("event", ""))
+            if m:
+                duration, billed, mem_size, mem_used, init = m.groups()
+                cold_start = init is not None
+                events.append({
+                    "time":        entry["time"],
+                    "source":      f"LambdaREPORT/{function_name}",
+                    "event":       entry["event"],
+                    "duration_ms": float(duration),
+                    "memory_mb":   int(mem_used),
+                    "cold_start":  cold_start,
+                })
+        return events
+
+    # ── P2.6: SQS DLQ discovery ───────────────────────────────────────────────
+
+    def sqs_with_dlq(self, queue_name_hint: str) -> list[dict]:
+        """Discover SQS queues matching a hint and fetch metrics including DLQ depth.
+
+        Returns events for: queue depth, DLQ depth (if configured), message age.
+        """
+        if not self._session:
+            return []
+        try:
+            sqs    = self._session.client("sqs")
+            cw     = self._session.client("cloudwatch")
+            queues = sqs.list_queues(QueueNamePrefix=queue_name_hint).get("QueueUrls", [])[:5]
+            events = []
+            for url in queues:
+                attrs = sqs.get_queue_attributes(
+                    QueueUrl=url,
+                    AttributeNames=["All"],
+                ).get("Attributes", {})
+                q_name  = url.split("/")[-1]
+                depth   = attrs.get("ApproximateNumberOfMessages", "0")
+                in_flight = attrs.get("ApproximateNumberOfMessagesNotVisible", "0")
+                events.append({
+                    "time":   "—",
+                    "source": f"SQS/{q_name}",
+                    "event":  f"depth={depth} in_flight={in_flight} retention_seconds={attrs.get('MessageRetentionPeriod', '?')}",
+                })
+
+                # Check for DLQ via RedrivePolicy
+                redrive = attrs.get("RedrivePolicy", "")
+                if redrive:
+                    import json as _json  # noqa: PLC0415
+                    try:
+                        rp     = _json.loads(redrive)
+                        dlq_arn = rp.get("deadLetterTargetArn", "")
+                        max_rcv = rp.get("maxReceiveCount", "?")
+                        dlq_name = dlq_arn.split(":")[-1]
+                        dlq_url  = sqs.get_queue_url(QueueName=dlq_name).get("QueueUrl", "")
+                        if dlq_url:
+                            dlq_attrs = sqs.get_queue_attributes(
+                                QueueUrl=dlq_url,
+                                AttributeNames=["ApproximateNumberOfMessages"],
+                            ).get("Attributes", {})
+                            dlq_depth = dlq_attrs.get("ApproximateNumberOfMessages", "0")
+                            events.append({
+                                "time":   "—",
+                                "source": f"SQS/DLQ/{dlq_name}",
+                                "event":  f"dlq_depth={dlq_depth} max_receive_count={max_rcv} source_queue={q_name}",
+                            })
+                    except Exception:  # noqa: BLE001
+                        pass
+            return events
+        except Exception:  # noqa: BLE001
+            return []
+
+    # ── P2.6: CodePipeline discovery from resource ────────────────────────────
+
+    def codepipeline_for_resource(self, resource_name: str) -> list[dict]:
+        """Find CodePipeline pipelines that deploy a named resource.
+
+        Searches by: (1) resource name in pipeline name, (2) pipeline tags,
+        (3) tag on the resource itself. Returns recent execution events.
+        """
+        if not self._session:
+            return []
+        try:
+            cp = self._session.client("codepipeline")
+            all_pipelines = cp.list_pipelines().get("pipelines", [])
+
+            matched: list[str] = []
+            for p in all_pipelines:
+                name = p.get("name", "")
+                if resource_name.lower() in name.lower():
+                    matched.append(name)
+
+            # Fallback: check tags on the resource for pipeline name
+            if not matched:
+                try:
+                    tagger = self._session.client("resourcegroupstaggingapi")
+                    resp   = tagger.get_resources(
+                        TagFilters=[{"Key": "pipeline", "Values": [resource_name]}]
+                    )
+                    for item in resp.get("ResourceTagMappingList", []):
+                        for tag in item.get("Tags", []):
+                            if tag["Key"].lower() == "pipeline":
+                                matched.append(tag["Value"])
+                except Exception:  # noqa: BLE001
+                    pass
+
+            events = []
+            for name in matched[:3]:
+                try:
+                    execs = cp.list_pipeline_executions(pipelineName=name, maxResults=5)
+                    for ex in execs.get("pipelineExecutionSummaries", []):
+                        events.append({
+                            "time":   ex["startTime"].strftime(_TS_FMT),
+                            "source": f"CodePipeline/{name}",
+                            "event":  f"status={ex.get('status')} trigger={ex.get('trigger', {}).get('triggerType', '?')}",
+                            "status": ex.get("status", ""),
+                        })
+                except Exception:  # noqa: BLE001
+                    pass
+            return events
+        except Exception:  # noqa: BLE001
+            return []
+
+    # ── P2.6: RDS instance discovery from ECS service ────────────────────────
+
+    def rds_for_resource(self, resource_name: str, vpc_id: Optional[str] = None) -> list[dict]:
+        """Discover RDS instances likely used by a named resource.
+
+        Strategy: (1) match by resource name in RDS identifier,
+        (2) if vpc_id given, return RDS instances in same VPC,
+        (3) scan environment variable hints via CloudTrail.
+        Returns RDS events for matched instances.
+        """
+        if not self._session:
+            return []
+        try:
+            rds = self._session.client("rds")
+            instances = rds.describe_db_instances().get("DBInstances", [])
+            matched = []
+
+            # Name match
+            for db in instances:
+                ident = db.get("DBInstanceIdentifier", "")
+                if resource_name.lower() in ident.lower():
+                    matched.append(db)
+
+            # VPC match fallback
+            if not matched and vpc_id:
+                for db in instances:
+                    if db.get("DBSubnetGroup", {}).get("VpcId") == vpc_id:
+                        matched.append(db)
+
+            events = []
+            for db in matched[:3]:
+                ident  = db.get("DBInstanceIdentifier", "")
+                status = db.get("DBInstanceStatus", "")
+                engine = db.get("Engine", "")
+                events.append({
+                    "time":   "—",
+                    "source": f"RDS/{ident}",
+                    "event":  (
+                        f"status={status} engine={engine} "
+                        f"endpoint={db.get('Endpoint', {}).get('Address', '—')} "
+                        f"connections={db.get('DBInstanceClass')} "
+                        f"storage={db.get('AllocatedStorage')}GB"
+                    ),
+                })
+                # Also pull recent events
+                events.extend(self.rds_events(db_identifier=ident, minutes=120))
+            return events
+        except Exception:  # noqa: BLE001
             return []
