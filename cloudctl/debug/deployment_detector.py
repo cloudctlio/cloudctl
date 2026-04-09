@@ -259,7 +259,7 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
         if tool:
             return tool
 
-        # Second pass: lookup by short name (last segment of the ARN)
+        # Second pass: lookup by short name (last colon-segment of the ARN)
         # e.g. arn:aws:lambda:...:function:my-fn  →  "my-fn"
         short_name = resource_arn.split(":")[-1]
         if short_name and short_name != resource_arn:
@@ -272,6 +272,24 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
             tool = _scan_events(resp2.get("Events", []))
             if tool:
                 return tool
+
+        # Third pass: ELB-style ARN suffixes use slashes — "targetgroup/name/hex-id"
+        # or "loadbalancer/app/name/hex-id". Extract the human-readable name segment.
+        if "/" in short_name:
+            import re as _re  # noqa: PLC0415
+            _SKIP = {"app", "net", "gateway", "targetgroup", "loadbalancer", "listener"}
+            _HEX  = _re.compile(r"^[0-9a-f]{16,}$")
+            for seg in short_name.split("/"):
+                if seg and seg not in _SKIP and not _HEX.match(seg) and seg != short_name:
+                    resp3 = ct.lookup_events(
+                        LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": seg}],
+                        StartTime=start,
+                        EndTime=end,
+                        MaxResults=50,
+                    )
+                    tool = _scan_events(resp3.get("Events", []))
+                    if tool:
+                        return tool
     except Exception:  # noqa: BLE001
         pass
     return "unknown"

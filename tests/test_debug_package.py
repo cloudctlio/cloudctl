@@ -402,6 +402,58 @@ class TestDeploymentDetector:
         session.client.return_value = ct
         assert _aws_cloudtrail(session, "arn:aws:s3:::my-bucket") == "pulumi"
 
+    def test_aws_cloudtrail_elb_arn_extracts_name_segment(self):
+        """ELB target group ARN: name segment extracted from 'targetgroup/name/hex-id'."""
+        import json
+        from unittest.mock import MagicMock, call
+        from cloudctl.debug.deployment_detector import _aws_cloudtrail
+
+        tg_arn = "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/my-service-tg/abcdef1234567890"
+
+        ct = MagicMock()
+        # First two lookups (full ARN + "targetgroup/name/hex-id") return nothing.
+        # Third lookup (name segment "my-service-tg") returns a Terraform event.
+        empty = {"Events": []}
+        terraform_event = {"Events": [{
+            "Username": "ci",
+            "CloudTrailEvent": json.dumps({"userAgent": "HashiCorp Terraform/1.9.0"}),
+        }]}
+        ct.lookup_events.side_effect = [empty, empty, terraform_event]
+
+        session = MagicMock()
+        session.client.return_value = ct
+        assert _aws_cloudtrail(session, tg_arn) == "terraform"
+
+        # Confirm the third call used the clean name segment
+        calls = ct.lookup_events.call_args_list
+        looked_up_names = [c.kwargs["LookupAttributes"][0]["AttributeValue"] for c in calls]
+        assert "my-service-tg" in looked_up_names
+
+    def test_aws_cloudtrail_alb_arn_extracts_name_segment(self):
+        """ALB ARN: name segment extracted from 'loadbalancer/app/name/hex-id'."""
+        import json
+        from unittest.mock import MagicMock
+        from cloudctl.debug.deployment_detector import _aws_cloudtrail
+
+        alb_arn = "arn:aws:elasticloadbalancing:us-east-1:123:loadbalancer/app/my-alb/abcdef1234567890"
+
+        ct = MagicMock()
+        empty = {"Events": []}
+        terraform_event = {"Events": [{
+            "Username": "ci",
+            "CloudTrailEvent": json.dumps({"userAgent": "HashiCorp Terraform/1.9.0"}),
+        }]}
+        # First two lookups return nothing, "my-alb" lookup succeeds
+        ct.lookup_events.side_effect = [empty, empty, terraform_event]
+
+        session = MagicMock()
+        session.client.return_value = ct
+        assert _aws_cloudtrail(session, alb_arn) == "terraform"
+
+        calls = ct.lookup_events.call_args_list
+        looked_up_names = [c.kwargs["LookupAttributes"][0]["AttributeValue"] for c in calls]
+        assert "my-alb" in looked_up_names
+
     # ── PATCH 3: Azure Activity Log HTTP userAgent ────────────────────────
     def test_azure_activity_log_http_useragent_terraform(self):
         """Terraform detected from HTTP userAgent in Activity Log even with generic caller."""
@@ -907,3 +959,96 @@ class TestRdsForResource:
         results = f.rds_for_resource("payments-db")
         assert len(results) == 1
         assert "payments-db" in results[0]["event"]
+
+
+# ─── deployment_detector: generic resource harvest from context ───────────────
+
+class TestGenericResourceHarvest:
+    """Verify _detect_deployment_method harvests identifiers from all context sources."""
+
+    def _make_engine(self):
+        from unittest.mock import MagicMock
+        from cloudctl.ai.debug_engine import DebugEngine
+        cfg = MagicMock()
+        cfg.accounts = {"aws": [{"name": "test-profile"}]}
+        return DebugEngine(cfg)
+
+    def _make_session(self, terraform_resource: str):
+        """Return a mock session where CloudTrail finds Terraform for terraform_resource,
+        and CloudFormation always raises (resource not in any CF stack)."""
+        import json
+        from unittest.mock import MagicMock
+
+        empty = {"Events": []}
+        terraform_event = {"Events": [{
+            "Username": "ci",
+            "CloudTrailEvent": json.dumps({"userAgent": "HashiCorp Terraform/1.9.0"}),
+        }]}
+
+        mock_ct = MagicMock()
+        mock_ct.lookup_events.side_effect = lambda **kw: (
+            terraform_event
+            if terraform_resource in str(kw.get("LookupAttributes", ""))
+            else empty
+        )
+
+        mock_cf = MagicMock()
+        mock_cf.describe_stack_resources.side_effect = Exception("Stack not found")
+
+        mock_tagger = MagicMock()
+        mock_tagger.get_resources.return_value = {"ResourceTagMappingList": []}
+
+        session = MagicMock()
+        session.client.side_effect = lambda svc, **kw: {
+            "cloudtrail":               mock_ct,
+            "cloudformation":           mock_cf,
+            "resourcegroupstaggingapi": mock_tagger,
+        }.get(svc, MagicMock())
+        return session
+
+    def test_network_context_vpc_id_used_for_detection(self):
+        """VPC IDs from network_context reach the IaC detector (no /aws/ path needed)."""
+        from unittest.mock import patch
+
+        engine = self._make_engine()
+        context = {
+            "cloudtrail_events": [],
+            "network_context": [
+                {"time": "—", "source": "VPC/vpc-0abc1234def56789a", "event": "state=available"},
+                {"time": "—", "source": "SecurityGroup/sg-0f70105360f3d1326", "event": "ingress port=8080"},
+            ],
+        }
+        session = self._make_session("vpc-0abc1234def56789a")
+
+        with patch("cloudctl.commands._helpers.get_aws_provider") as mock_provider:
+            from unittest.mock import MagicMock
+            mock_prov = MagicMock()
+            mock_prov._session = session
+            mock_provider.return_value = mock_prov
+            result = engine._detect_deployment_method("aws", "test-profile", None, context)
+
+        assert result == "terraform"
+
+    def test_service_logs_harvested_even_when_cloudtrail_events_present(self):
+        """Service log names are harvested even when cloudtrail_events is non-empty."""
+        from unittest.mock import MagicMock, patch
+
+        engine = self._make_engine()
+        context = {
+            "cloudtrail_events": [
+                {"resource": "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/my-tg/abc",
+                 "source": "CT", "event": "DescribeTargetHealth"},
+            ],
+            "service_logs": [
+                {"time": "t", "source": "CloudWatch/Logs//aws/lambda/my-fn", "event": "[ERROR] fail"},
+            ],
+        }
+        session = self._make_session("my-fn")
+
+        with patch("cloudctl.commands._helpers.get_aws_provider") as mock_provider:
+            mock_prov = MagicMock()
+            mock_prov._session = session
+            mock_provider.return_value = mock_prov
+            result = engine._detect_deployment_method("aws", "test-profile", None, context)
+
+        assert result == "terraform"

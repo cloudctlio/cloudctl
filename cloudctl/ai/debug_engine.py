@@ -158,19 +158,35 @@ class DebugEngine:
                 if len(resource_names) >= 5:
                     break
 
-            # Fall back to log sources if CloudTrail had nothing useful
-            if not resource_names:
-                for ev in context.get("service_logs", [])[:10]:
+            # Harvest resource identifiers from all event lists in context.
+            # Two source formats exist:
+            #   "/aws/service/name"    (Lambda, RDS, ECS log groups)  → extract "name"
+            #   "ResourceType/id"      (network_context: VPC, SG, …)  → extract "id"
+            # Both yield stable, infrequently-queried identifiers whose CloudTrail
+            # create event is more likely to appear within MaxResults than high-volume
+            # scheduler events (e.g. ECS DescribeTargetHealth).
+            import re as _re  # noqa: PLC0415
+            _AWS_ID = _re.compile(r"^(vpc|subnet|sg|rtb|igw|nat|eni|eip|acl)-[0-9a-f]+$")
+            for ctx_key, events in context.items():
+                if not isinstance(events, list):
+                    continue
+                for ev in events[:10]:
+                    if not isinstance(ev, dict):
+                        continue
                     src = ev.get("source", "")
-                    # "CloudWatch/Logs//aws/lambda/fn" → "fn"
-                    # "CloudWatch/Logs//aws/rds/cluster" → "cluster"
                     if "/aws/" in src:
+                        # e.g. "CloudWatch/Logs//aws/lambda/my-fn" → "my-fn"
                         name = src.split("/aws/")[-1].split("/")[-1]
-                        if name and name not in seen:
-                            seen.add(name)
-                            resource_names.append(name)
-                            if len(resource_names) >= 5:
-                                break
+                    elif "/" in src:
+                        # e.g. "VPC/vpc-0abc123" or "SecurityGroup/sg-0abc123" → "vpc-0abc123"
+                        name = src.split("/")[-1]
+                    else:
+                        continue
+                    if name and name not in seen and (_AWS_ID.match(name) or not name.startswith(("arn:", "http"))):
+                        seen.add(name)
+                        resource_names.append(name)
+                if len(resource_names) >= 10:
+                    break
 
             # Tags: only query tagging API when we have full ARNs.
             resource_tags: dict = {}

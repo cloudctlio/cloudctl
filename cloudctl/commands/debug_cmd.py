@@ -47,7 +47,7 @@ def _render_incident(finding, account: Optional[str]) -> None:
         show_edge=True,
     )
     t.add_column(style="bold cyan", no_wrap=True, min_width=14, max_width=14)
-    t.add_column()
+    t.add_column(overflow="fold")
 
     deploy = getattr(finding, "deployment_method", "unknown")
 
