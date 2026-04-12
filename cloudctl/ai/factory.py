@@ -2,9 +2,55 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, List, Optional
 
+from pydantic import BaseModel, Field
 from cloudctl.config.manager import ConfigManager
+
+
+# ── Pydantic response models ───────────────────────────────────────────────────
+
+class RemediationStep(BaseModel):
+    command: str = Field(
+        description=(
+            "The exact CLI command or IaC step to execute. "
+            "MUST use real resource IDs/ARNs from the cloud data. "
+            "NEVER use placeholders like <resource-id>, <param-group>, or <bucket-name>. "
+            "If the required identifier is not in the data, omit this field and set "
+            "explanation to the discovery command instead."
+        )
+    )
+    explanation: str = Field(
+        description=(
+            "Why this step is prioritized at this position. "
+            "Cite the specific metric value, error code, or log entry that justifies it. "
+            "NEVER use vague words like 'likely', 'possibly', 'consider', or 'investigate'."
+        )
+    )
+
+
+class DebugResponse(BaseModel):
+    root_cause: str = Field(
+        description=(
+            "Detailed markdown explanation of the root cause. "
+            "Use ## headers and bullet lists (each bullet on its own line starting with '- '). "
+            "Every claim MUST cite direct evidence from the cloud data: "
+            "metric values, error codes, log entries, or timestamps. "
+            "NEVER fabricate log entries or metric values not present in the data."
+        )
+    )
+    affected_resources: List[str] = Field(
+        description="List of specific resource names or ARNs that appear in the cloud data."
+    )
+    remediation_steps: List[RemediationStep] = Field(
+        description="Ordered list of concrete fix steps, most impactful first."
+    )
+    confidence_notes: str = Field(
+        description=(
+            "One sentence: what data was available and what was missing. "
+            "If diagnosis relies on metrics rather than logs, state that explicitly."
+        )
+    )
 
 
 # ── Base class ─────────────────────────────────────────────────────────────────
@@ -77,6 +123,42 @@ def _parse_json_response(text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         return {"raw": text}
+
+
+def parse_debug_response(text: str) -> DebugResponse:
+    """
+    Parse raw AI text into a validated DebugResponse.
+
+    Fast path: plain JSON → Pydantic validation.
+    Fallback: log the raw output for schema-drift diagnosis, then surface the
+    raw AI text as root_cause so the user still gets signal.
+    """
+    import json    # noqa: PLC0415
+    import logging # noqa: PLC0415
+
+    # Fast path: try plain JSON parse + Pydantic validation
+    clean = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`")
+    try:
+        data = json.loads(clean)
+        # Normalise remediation_steps: accept list[str] or list[dict]
+        steps = data.get("remediation_steps", [])
+        if steps and isinstance(steps[0], str):
+            data["remediation_steps"] = [
+                {"command": s, "explanation": ""} for s in steps
+            ]
+        return DebugResponse(**data)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "AI response failed schema validation (%s). Raw output: %.500s", exc, text,
+        )
+
+    # Partial diagnosis: surface raw text rather than hiding the failure
+    return DebugResponse(
+        root_cause=text,
+        affected_resources=[],
+        remediation_steps=[],
+        confidence_notes="AI response was unstructured — showing raw analysis. Re-run for a clean result.",
+    )
 
 
 # ── AWS Bedrock ────────────────────────────────────────────────────────────────

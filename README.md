@@ -44,7 +44,7 @@ pip install cctl[all]
 ## Quick Start
 
 ```bash
-# First-run: auto-detects your existing AWS/Azure/GCP credentials
+# First-run: auto-detects your existing AWS/Azure/GCP credentials — no prompts
 cloudctl init
 
 # See all configured cloud accounts
@@ -96,7 +96,7 @@ cloudctl database list --cloud aws --env staging
 
 | Command | Description |
 |---|---|
-| `cloudctl init` | First-run setup — detects existing credentials |
+| `cloudctl init` | First-run setup — detects existing credentials and auto-enables all found clouds (no prompts) |
 | `cloudctl accounts list/verify/use` | Manage cloud accounts and profiles |
 | `cloudctl config get/set/list` | Manage cloudctl config |
 
@@ -217,6 +217,22 @@ gcloud auth application-default login
 cloudctl config set ai.provider bedrock
 cloudctl config set ai.model anthropic.claude-sonnet-4-6-v1
 ```
+
+---
+
+## Known Limitations
+
+- **CloudTrail lag** — AWS management events take up to 15 minutes to appear in CloudTrail. If you run `cloudctl debug` immediately after a deployment or config change, the triggering event may not be visible yet. Wait 15 minutes and re-run for the most complete analysis.
+
+- **S3 ALB access logs** — ALB access log analysis requires S3 access log delivery to be enabled on the load balancer (`access_logs.s3.enabled = true`). If not enabled, cloudctl falls back to CloudWatch metrics only.
+
+- **CloudWatch Logs retention** — `cloudctl debug` searches the last 3 hours of logs by default. Log groups with short retention periods (< 3 hours) or no log delivery configured will return no results.
+
+- **Cross-account resources** — Deployment detection and log discovery operate within a single AWS account per run. Resources that span multiple accounts (e.g., shared VPCs, cross-account RDS) require running with `--account` targeting each account separately.
+
+- **GCP / Azure debug depth** — `cloudctl debug` has the deepest data coverage on AWS. GCP and Azure analysis uses available metrics and audit logs but does not yet include the same level of service-specific event correlation.
+
+- **IaC detection requires audit trail** — Terraform/CDK/CloudFormation detection relies on CloudTrail events for the resource. If CloudTrail is not enabled or events have aged out, deployment method will show as `unknown`.
 
 ---
 

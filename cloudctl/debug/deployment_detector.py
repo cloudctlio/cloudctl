@@ -174,9 +174,24 @@ def _aws_cfn_registry(session, resource_arn: str) -> str:
     import json  # noqa: PLC0415
     import re    # noqa: PLC0415
     try:
-        cf     = session.client("cloudformation")
-        resp   = cf.describe_stack_resources(PhysicalResourceId=resource_arn)
-        stacks = resp.get("StackResources", [])
+        cf = session.client("cloudformation")
+        # CloudFormation physical resource IDs are short names, not ARNs.
+        # e.g. for Lambda: "MyStack-FunctionABC12345-AbCdEfGh" (not arn:aws:lambda:...)
+        # Try the full value first; if it returns nothing, retry with the short name
+        # extracted from the last colon-segment (works for Lambda, RDS, ECS tasks, etc.)
+        def _lookup(physical_id: str):
+            try:
+                resp = cf.describe_stack_resources(PhysicalResourceId=physical_id)
+                return resp.get("StackResources", [])
+            except Exception:  # noqa: BLE001
+                return []
+
+        stacks = _lookup(resource_arn)
+        if not stacks and ":" in resource_arn:
+            short = resource_arn.split(":")[-1]
+            if short and short != resource_arn:
+                stacks = _lookup(short)
+
         if not stacks:
             return "unknown"
         stack_name = stacks[0]["StackName"]
@@ -253,13 +268,13 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
             LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_arn}],
             StartTime=start,
             EndTime=end,
-            MaxResults=10,
+            MaxResults=50,
         )
         tool = _scan_events(resp.get("Events", []))
         if tool:
             return tool
 
-        # Second pass: lookup by short name (last segment of the ARN)
+        # Second pass: lookup by short name (last colon-segment of the ARN)
         # e.g. arn:aws:lambda:...:function:my-fn  →  "my-fn"
         short_name = resource_arn.split(":")[-1]
         if short_name and short_name != resource_arn:
@@ -267,11 +282,29 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
                 LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": short_name}],
                 StartTime=start,
                 EndTime=end,
-                MaxResults=10,
+                MaxResults=50,
             )
             tool = _scan_events(resp2.get("Events", []))
             if tool:
                 return tool
+
+        # Third pass: ELB-style ARN suffixes use slashes — "targetgroup/name/hex-id"
+        # or "loadbalancer/app/name/hex-id". Extract the human-readable name segment.
+        if "/" in short_name:
+            import re as _re  # noqa: PLC0415
+            _SKIP = {"app", "net", "gateway", "targetgroup", "loadbalancer", "listener"}
+            _HEX  = _re.compile(r"^[0-9a-f]{16,}$")
+            for seg in short_name.split("/"):
+                if seg and seg not in _SKIP and not _HEX.match(seg) and seg != short_name:
+                    resp3 = ct.lookup_events(
+                        LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": seg}],
+                        StartTime=start,
+                        EndTime=end,
+                        MaxResults=50,
+                    )
+                    tool = _scan_events(resp3.get("Events", []))
+                    if tool:
+                        return tool
     except Exception:  # noqa: BLE001
         pass
     return "unknown"

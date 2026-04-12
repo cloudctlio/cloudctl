@@ -12,7 +12,7 @@ console = Console()
 
 
 def run_init_wizard() -> None:
-    """Interactive first-run wizard. Detects existing credentials and writes config."""
+    """Detect existing cloud credentials and write config. No prompts."""
     console.print(Panel.fit(
         "[bold cyan]⚡ cloudctl init[/bold cyan]\n"
         "Universal Cloud CLI — first-time setup",
@@ -23,55 +23,50 @@ def run_init_wizard() -> None:
     cfg = ConfigManager()
     token_mgr = TokenManager()
 
-    # Detect available clouds
+    # Detect available clouds — file checks only, no network calls
     detected: dict[str, bool] = {
         "aws": token_mgr.has_aws_credentials(),
         "azure": token_mgr.has_azure_credentials(),
         "gcp": token_mgr.has_gcp_credentials(),
     }
 
-    console.print("[bold]Detected credentials:[/bold]")
-    for cloud, found in detected.items():
-        icon = "[green]✓[/green]" if found else "[dim]✗[/dim]"
-        console.print(f"  {icon}  {cloud.upper()}")
+    enabled = [c for c, ok in detected.items() if ok]
+
+    for cloud in ("aws", "azure", "gcp"):
+        if detected[cloud]:
+            console.print(f"  [green]✓[/green]  {cloud.upper()} credentials found")
+        else:
+            console.print(f"  [dim]✗  {cloud.upper()} — not configured[/dim]")
     console.print()
 
-    clouds_found = [c for c, ok in detected.items() if ok]
-
-    if not clouds_found:
+    if not enabled:
         console.print(
             "[yellow]No cloud credentials found.[/yellow]\n"
-            "Configure at least one:\n"
-            "  AWS   → aws configure\n"
+            "Configure at least one and re-run cloudctl init:\n"
+            "  AWS   → aws configure  (or aws sso login)\n"
             "  Azure → az login\n"
             "  GCP   → gcloud auth application-default login"
         )
         raise typer.Exit(1)
 
-    # Ask which clouds to enable
-    console.print("[bold]Which clouds do you want to use?[/bold]")
-    enabled: list[str] = []
-    for cloud in clouds_found:
-        use = typer.confirm(f"  Enable {cloud.upper()}?", default=True)
-        if use:
-            enabled.append(cloud)
-
-    if not enabled:
-        console.print("[red]No clouds enabled. Exiting.[/red]")
-        raise typer.Exit(1)
-
     cfg.set("clouds", enabled)
     cfg.save()
 
-    # Discover accounts for each enabled cloud
-    console.print()
-    console.print("[bold]Discovering accounts…[/bold]")
+    # Discover accounts for each enabled cloud (all file-based, no network)
     all_accounts: dict = {}
 
     if "aws" in enabled:
         aws_accounts = token_mgr.list_aws_profiles()
         all_accounts["aws"] = aws_accounts
-        console.print(f"  [green]AWS:[/green] {len(aws_accounts)} profile(s) found")
+        console.print(f"  [green]AWS:[/green] {len(aws_accounts)} profile(s) loaded")
+
+    if "azure" in enabled:
+        all_accounts["azure"] = []
+        console.print("  [green]Azure:[/green] credentials detected (run [cyan]cloudctl accounts list[/cyan] to verify)")
+
+    if "gcp" in enabled:
+        all_accounts["gcp"] = []
+        console.print("  [green]GCP:[/green] credentials detected (run [cyan]cloudctl accounts list[/cyan] to verify)")
 
     cfg.set_accounts(all_accounts)
 
