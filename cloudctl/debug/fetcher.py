@@ -314,6 +314,73 @@ class DebugFetcher:
         except Exception:  # noqa: BLE001
             return []
 
+    def recently_active_log_groups(self, minutes: int = 180, limit: int = 30) -> list[str]:
+        """Return log groups that had activity in the last *minutes*, sorted by recency.
+
+        This catches custom log groups (/app/payments, /prod/checkout, etc.) that
+        would never be found by hint-based prefix matching against AWS resource names.
+        """
+        if not self._session:
+            return []
+        try:
+            from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+            logs      = self._session.client("logs")
+            cutoff_ms = int(
+                (datetime.now(timezone.utc) - timedelta(minutes=minutes)).timestamp() * 1000
+            )
+            paginator = logs.get_paginator("describe_log_groups")
+            active: list[tuple[int, str]] = []
+            # Scan up to 5 pages (= 250 log groups) — enough to find recent ones
+            for page in paginator.paginate(PaginationConfig={"MaxItems": 250, "PageSize": 50}):
+                for lg in page.get("logGroups", []):
+                    last_event = lg.get("lastEventTimestamp") or lg.get("creationTime", 0)
+                    if last_event >= cutoff_ms:
+                        active.append((last_event, lg["logGroupName"]))
+            # Sort most-recent first, return names only
+            active.sort(reverse=True)
+            return [name for _, name in active[:limit]]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def tail_log_group(self, log_group: str, lines: int = 50) -> list[dict]:
+        """Fetch the last *lines* events from the most recent log stream.
+
+        Used as a fallback when ERROR/WARN filter returns empty — catches
+        stack traces and structured JSON logs that don't contain those words.
+        """
+        if not self._session:
+            return []
+        try:
+            logs = self._session.client("logs")
+            # Get the most recently active stream
+            streams = logs.describe_log_streams(
+                logGroupName=log_group,
+                orderBy="LastEventTime",
+                descending=True,
+                limit=1,
+            ).get("logStreams", [])
+            if not streams:
+                return []
+            stream_name = streams[0]["logStreamName"]
+            resp = logs.get_log_events(
+                logGroupName=log_group,
+                logStreamName=stream_name,
+                limit=lines,
+                startFromHead=False,
+            )
+            return [
+                {
+                    "time":   datetime.fromtimestamp(
+                        e["timestamp"] / 1000, tz=timezone.utc
+                    ).strftime(_TS_FMT),
+                    "source": f"CloudWatch/Logs/{log_group}",
+                    "event":  e.get("message", "").strip()[:200],
+                }
+                for e in resp.get("events", [])
+            ]
+        except Exception:  # noqa: BLE001
+            return []
+
     def lambda_logs(
         self,
         function_name: str,
@@ -322,7 +389,7 @@ class DebugFetcher:
         log_group = f"/aws/lambda/{function_name}"
         return self.cloudwatch_logs(
             log_group=log_group,
-            filter_pattern="?ERROR ?WARN ?Task timed out",
+            filter_pattern="?ERROR ?WARN ?error ?warn",
             minutes=minutes,
         )
 

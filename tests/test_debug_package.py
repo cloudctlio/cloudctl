@@ -7,33 +7,26 @@ import pytest
 # ─── planner ────────────────────────────────────────────────────────────────
 
 class TestPlanner:
-    def test_502_includes_service_logs_and_network(self):
-        from cloudctl.debug.planner import plan_sources
+    def test_always_returns_all_sources(self):
+        from cloudctl.debug.planner import plan_sources, ALL_SOURCES
         sources = plan_sources("payments returning 502s")
-        assert "service_logs" in sources
-        assert "network_context" in sources
-        assert "cloudwatch_metrics" in sources
+        assert sources == ALL_SOURCES
 
     def test_default_sources_always_present(self):
         from cloudctl.debug.planner import plan_sources
         sources = plan_sources("something completely unrelated xyz")
-        assert "cloudwatch_metrics" in sources
-        assert "cloudtrail" in sources
+        assert "service_logs" in sources
+        assert "audit_logs" in sources
+        assert "network_context" in sources
 
-    def test_database_symptom(self):
-        from cloudctl.debug.planner import plan_sources
-        sources = plan_sources("database connection pool exhausted")
-        assert "rds_events" in sources
-
-    def test_deploy_symptom(self):
-        from cloudctl.debug.planner import plan_sources
-        sources = plan_sources("after the deploy things broke")
-        assert "codepipeline" in sources
-
-    def test_permission_symptom(self):
-        from cloudctl.debug.planner import plan_sources
-        sources = plan_sources("access denied when calling S3")
-        assert "iam_simulation" in sources
+    def test_any_symptom_returns_all_sources(self):
+        from cloudctl.debug.planner import plan_sources, ALL_SOURCES
+        for symptom in [
+            "database connection pool exhausted",
+            "after the deploy things broke",
+            "access denied when calling S3",
+        ]:
+            assert plan_sources(symptom) == ALL_SOURCES
 
     def test_extract_service_hints_hyphenated(self):
         from cloudctl.debug.planner import extract_service_hints
@@ -363,6 +356,38 @@ class TestDeploymentDetector:
         session.client.return_value = cf
         assert _aws_cfn_registry(session, "arn:aws:s3:::my-bucket") == "cloudformation"
 
+    def test_aws_cfn_cdk_short_name_fallback(self):
+        """When full ARN returns no stacks, retry with short function name (last colon segment)."""
+        from unittest.mock import MagicMock, call
+        from cloudctl.debug.deployment_detector import _aws_cfn_registry
+        import json
+
+        cf = MagicMock()
+        # First call (full ARN) returns empty — CloudFormation physical IDs are names not ARNs
+        # Second call (short name) returns the stack
+        cf.describe_stack_resources.side_effect = [
+            {"StackResources": []},
+            {"StackResources": [{"StackName": "LambdaCrashStack"}]},
+        ]
+        cf.describe_stacks.return_value = {"Stacks": [{"Tags": []}]}
+        cf.get_template.return_value = {
+            "TemplateBody": json.dumps({
+                "Resources": {
+                    "CDKMetadata": {"Type": "AWS::CDK::Metadata"},
+                    "PaymentsFn08FA78A0": {"Type": "AWS::Lambda::Function"},
+                }
+            })
+        }
+        session = MagicMock()
+        session.client.return_value = cf
+
+        fn_arn = "arn:aws:lambda:us-east-1:123456789012:function:LambdaCrashStack-PaymentsFn08FA78A0-Y60RENQ9YHrY"
+        assert _aws_cfn_registry(session, fn_arn) == "cdk"
+        # First lookup used full ARN, second used short function name
+        calls = cf.describe_stack_resources.call_args_list
+        assert calls[0] == call(PhysicalResourceId=fn_arn)
+        assert calls[1] == call(PhysicalResourceId="LambdaCrashStack-PaymentsFn08FA78A0-Y60RENQ9YHrY")
+
     # ── PATCH 2: CloudTrail userAgent ─────────────────────────────────────
     def test_aws_cloudtrail_useragent_terraform(self):
         """Terraform detected from HashiCorp userAgent in CloudTrail event detail."""
@@ -623,7 +648,7 @@ class TestDebugCmdFlags:
 
         runner = CliRunner()
         with patch("cloudctl.commands.debug_cmd.require_init", return_value=MagicMock()):
-            return runner.invoke(app, ["debug", "symptom", symptom, "--dry-run"])
+            return runner.invoke(app, ["debug", symptom, "--dry-run"])
 
     def test_dry_run_no_aws_calls(self):
         """--dry-run exits before touching AWS and prints the planned sources."""
@@ -631,7 +656,7 @@ class TestDebugCmdFlags:
         assert result.exit_code == 0
         assert "DRY RUN" in result.output
         assert "service_logs" in result.output
-        assert "cloudwatch_metrics" in result.output
+        assert "audit_logs" in result.output
         # must NOT make any real AWS / AI calls — if it did, it would raise without mocks
 
     def test_dry_run_shows_hints(self):
@@ -1012,7 +1037,7 @@ class TestGenericResourceHarvest:
 
         engine = self._make_engine()
         context = {
-            "cloudtrail_events": [],
+            "audit_logs": [],
             "network_context": [
                 {"time": "—", "source": "VPC/vpc-0abc1234def56789a", "event": "state=available"},
                 {"time": "—", "source": "SecurityGroup/sg-0f70105360f3d1326", "event": "ingress port=8080"},
@@ -1029,13 +1054,13 @@ class TestGenericResourceHarvest:
 
         assert result == "terraform"
 
-    def test_service_logs_harvested_even_when_cloudtrail_events_present(self):
-        """Service log names are harvested even when cloudtrail_events is non-empty."""
+    def test_service_logs_harvested_even_when_audit_logs_present(self):
+        """Service log names are harvested even when audit_logs is non-empty."""
         from unittest.mock import MagicMock, patch
 
         engine = self._make_engine()
         context = {
-            "cloudtrail_events": [
+            "audit_logs": [
                 {"resource": "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/my-tg/abc",
                  "source": "CT", "event": "DescribeTargetHealth"},
             ],

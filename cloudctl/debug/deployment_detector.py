@@ -174,9 +174,24 @@ def _aws_cfn_registry(session, resource_arn: str) -> str:
     import json  # noqa: PLC0415
     import re    # noqa: PLC0415
     try:
-        cf     = session.client("cloudformation")
-        resp   = cf.describe_stack_resources(PhysicalResourceId=resource_arn)
-        stacks = resp.get("StackResources", [])
+        cf = session.client("cloudformation")
+        # CloudFormation physical resource IDs are short names, not ARNs.
+        # e.g. for Lambda: "MyStack-FunctionABC12345-AbCdEfGh" (not arn:aws:lambda:...)
+        # Try the full value first; if it returns nothing, retry with the short name
+        # extracted from the last colon-segment (works for Lambda, RDS, ECS tasks, etc.)
+        def _lookup(physical_id: str):
+            try:
+                resp = cf.describe_stack_resources(PhysicalResourceId=physical_id)
+                return resp.get("StackResources", [])
+            except Exception:  # noqa: BLE001
+                return []
+
+        stacks = _lookup(resource_arn)
+        if not stacks and ":" in resource_arn:
+            short = resource_arn.split(":")[-1]
+            if short and short != resource_arn:
+                stacks = _lookup(short)
+
         if not stacks:
             return "unknown"
         stack_name = stacks[0]["StackName"]
