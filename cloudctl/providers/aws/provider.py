@@ -31,10 +31,12 @@ class AWSProvider(CloudProvider):
         return self._client("ec2", region)
 
     def _account_id(self) -> str:
-        try:
-            return self._client("sts").get_caller_identity()["Account"]
-        except Exception:
-            return self._profile
+        if not hasattr(self, "_cached_account_id"):
+            try:
+                self._cached_account_id = self._client("sts").get_caller_identity()["Account"]
+            except Exception:
+                self._cached_account_id = self._profile
+        return self._cached_account_id
 
     # ── EC2 ──────────────────────────────────────────────────────────────────
 
@@ -53,11 +55,12 @@ class AWSProvider(CloudProvider):
             for k, v in tags.items():
                 filters.append({"Name": f"tag:{k}", "Values": [v]})
         paginator = ec2.get_paginator("describe_instances")
+        account_id = self._account_id()
         results: list[ComputeResource] = []
         for page in paginator.paginate(Filters=filters):
             for reservation in page["Reservations"]:
                 for inst in reservation["Instances"]:
-                    results.append(self._to_compute(inst, account, region or self._region or ""))
+                    results.append(self._to_compute(inst, account_id, region or self._region or ""))
         return results
 
     def describe_compute(self, account: str, instance_id: str) -> ComputeResource:
@@ -65,7 +68,7 @@ class AWSProvider(CloudProvider):
         reservations = resp.get("Reservations", [])
         if not reservations or not reservations[0].get("Instances"):
             raise ValueError(f"Instance {instance_id} not found")
-        return self._to_compute(reservations[0]["Instances"][0], account, self._region or "")
+        return self._to_compute(reservations[0]["Instances"][0], self._account_id(), self._region or "")
 
     def stop_compute(self, account: str, instance_id: str) -> None:
         try:
@@ -292,6 +295,7 @@ class AWSProvider(CloudProvider):
     ) -> list[StorageResource]:
         s3 = self._client("s3")
         buckets = s3.list_buckets().get("Buckets", [])
+        account_id = self._account_id()
         results: list[StorageResource] = []
         for bucket in buckets:
             name = bucket["Name"]
@@ -305,7 +309,7 @@ class AWSProvider(CloudProvider):
                 name=name,
                 region=region,
                 cloud="aws",
-                account=account,
+                account=account_id,
                 public=is_public,
                 created_at=created.isoformat() if created else None,
             ))
@@ -321,7 +325,7 @@ class AWSProvider(CloudProvider):
         is_public = self._s3_bucket_is_public(s3, bucket_name)
         return StorageResource(
             id=bucket_name, name=bucket_name, region=region,
-            cloud="aws", account=account, public=is_public,
+            cloud="aws", account=self._account_id(), public=is_public,
         )
 
     # ── RDS ──────────────────────────────────────────────────────────────────
@@ -333,10 +337,11 @@ class AWSProvider(CloudProvider):
     ) -> list[DatabaseResource]:
         rds = self._client("rds", region)
         paginator = rds.get_paginator("describe_db_instances")
+        account_id = self._account_id()
         results: list[DatabaseResource] = []
         for page in paginator.paginate():
             for db in page["DBInstances"]:
-                results.append(self._to_database(db, account, region or self._region or ""))
+                results.append(self._to_database(db, account_id, region or self._region or ""))
         return results
 
     def describe_database(self, account: str, db_id: str, region: Optional[str] = None) -> DatabaseResource:
@@ -345,7 +350,7 @@ class AWSProvider(CloudProvider):
         instances = resp.get("DBInstances", [])
         if not instances:
             raise ValueError(f"Database '{db_id}' not found")
-        return self._to_database(instances[0], account, region or self._region or "")
+        return self._to_database(instances[0], self._account_id(), region or self._region or "")
 
     def list_snapshots(self, _account: str, db_id: Optional[str] = None, region: Optional[str] = None) -> list[dict]:
         rds = self._client("rds", region)
