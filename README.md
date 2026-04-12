@@ -44,7 +44,7 @@ pip install cctl[all]
 ## Quick Start
 
 ```bash
-# First-run: auto-detects your existing AWS/Azure/GCP credentials
+# First-run: auto-detects your existing AWS/Azure/GCP credentials — no prompts
 cloudctl init
 
 # See all configured cloud accounts
@@ -96,7 +96,7 @@ cloudctl database list --cloud aws --env staging
 
 | Command | Description |
 |---|---|
-| `cloudctl init` | First-run setup — detects existing credentials |
+| `cloudctl init` | First-run setup — detects existing credentials and auto-enables all found clouds (no prompts) |
 | `cloudctl accounts list/verify/use` | Manage cloud accounts and profiles |
 | `cloudctl config get/set/list` | Manage cloudctl config |
 
