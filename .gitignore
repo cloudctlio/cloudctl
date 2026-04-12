@@ -18,3 +18,11 @@ venv/
 
 # OS
 .DS_Store
+
+# E2E tests — internal live-AWS scenarios, never commit
+tests/e2e/
+
+# Local session files
+CLAUDE.md
+.coverage
+coverage.xml
