@@ -1436,3 +1436,66 @@ class GCPProvider(CloudProvider):
         except Exception:
             pass
         return results
+
+    # ── SSL / TLS Certificates ────────────────────────────────────────────────
+
+    def list_ssl_certificates(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List Google-managed and self-managed SSL certificates via Compute API.
+
+        Sources:
+          - Global SSL certificates (used by HTTPS load balancers)
+
+        Returns normalised list (shared schema with AWS/Azure):
+          domain, status, days_to_expiry, expiry, type, auto_renew,
+          in_use_by, id, region, account, cloud, source
+        """
+        if not _GAPI_AVAILABLE:
+            return []
+        from datetime import datetime, timezone as _tz  # noqa: PLC0415
+        now     = datetime.now(_tz.utc)
+        results: list[dict] = []
+        try:
+            svc   = self._svc("compute", "v1")
+            certs = svc.sslCertificates().list(project=self._project).execute()
+            for cert in certs.get("items", []):
+                managed    = cert.get("managed", {})
+                cert_type  = cert.get("type", "SELF_MANAGED")
+                expire_str = cert.get("expireTime", "")
+                expiry     = None
+                days: int | None = None
+                if expire_str:
+                    try:
+                        expiry = datetime.fromisoformat(expire_str.rstrip("Z")).replace(tzinfo=_tz.utc)
+                        days   = (expiry - now).days
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                managed_status = managed.get("status", "")
+                if managed_status == "FAILED_NOT_VISIBLE" or (days is not None and days < 0):
+                    status = "EXPIRED"
+                elif days is not None and days < 30:
+                    status = "EXPIRING_SOON"
+                elif cert_type == "SELF_MANAGED":
+                    status = "IMPORTED_NO_AUTO_RENEW"
+                else:
+                    status = "OK"
+
+                domains = managed.get("domains", []) or [cert.get("name", "—")]
+                results.append({
+                    "domain":         domains[0] if domains else cert.get("name", "—"),
+                    "sans":           domains[1:],
+                    "status":         status,
+                    "days_to_expiry": days,
+                    "expiry":         expiry.isoformat() if expiry else None,
+                    "type":           "MANAGED" if cert_type == "MANAGED" else "IMPORTED",
+                    "auto_renew":     cert_type == "MANAGED",
+                    "in_use_by":      [],
+                    "id":             cert.get("selfLink", cert.get("name", "—")),
+                    "region":         "global",
+                    "account":        account,
+                    "cloud":          "gcp",
+                    "source":         "ComputeSSL",
+                })
+        except Exception:  # noqa: BLE001
+            pass
+        return results

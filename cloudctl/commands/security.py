@@ -159,6 +159,91 @@ def _apply_fixes(cfg, raw_findings: list[dict]) -> None:
     fixer.apply(proposals)
 
 
+@app.command("certs")
+def security_certs(
+    cloud:    str           = _CLOUD,
+    account:  Optional[str] = _ACCOUNT,
+    expiring: int           = typer.Option(
+        60, "--expiring", help="Warn on certs expiring within N days (default 60)"
+    ),
+) -> None:
+    """List SSL/TLS certificates and flag expiry risks across cloud accounts.
+
+    Highlights:
+      - EXPIRED certs — active outage cause
+      - Certs expiring within --expiring days
+      - Imported/self-managed certs that will NOT auto-renew
+
+    Examples:
+      cloudctl security certs --cloud aws
+      cloudctl security certs --cloud all --expiring 90
+    """
+    cfg  = require_init()
+    rows: list[dict] = []
+
+    _STATUS_ICON = {
+        "EXPIRED":               "[bold red]EXPIRED[/bold red]",
+        "EXPIRING_SOON":         "[yellow]EXPIRING SOON[/yellow]",
+        "IMPORTED_NO_AUTO_RENEW": "[dim]IMPORTED[/dim]",
+        "OK":                    "[green]OK[/green]",
+    }
+
+    def _cert_rows(certs: list[dict]) -> list[dict]:
+        result = []
+        for c in certs:
+            days = c.get("days_to_expiry")
+            # Apply user-supplied --expiring threshold
+            if c["status"] == "OK" and days is not None and days < expiring:
+                display_status = "[yellow]EXPIRING SOON[/yellow]"
+            else:
+                display_status = _STATUS_ICON.get(c["status"], c["status"])
+            result.append({
+                "Cloud":          cloud_label(c.get("cloud", "aws")),
+                "Account":        c.get("account", "—"),
+                "Domain":         c.get("domain", "—"),
+                "Status":         display_status,
+                "Expires in":     f"{days}d" if days is not None else "—",
+                "Auto-Renew":     "YES" if c.get("auto_renew") else "[yellow]NO[/yellow]",
+                "Source":         c.get("source", "—"),
+                "In Use By":      str(len(c.get("in_use_by", []))),
+            })
+        return result
+
+    if cloud in ("aws", "all") and "aws" in cfg.clouds:
+        profiles = cfg.accounts.get("aws", [])
+        targets  = [p["name"] for p in profiles if not account or p["name"] == account]
+        for profile_name in targets:
+            try:
+                certs = get_aws_provider(profile_name).list_ssl_certificates(account=profile_name)
+                rows += _cert_rows(certs)
+            except Exception as e:
+                warn(f"[AWS/{profile_name}] {e}")
+
+    if cloud in ("azure", "all") and (cloud == "azure" or "azure" in cfg.clouds):
+        try:
+            certs = get_azure_provider(subscription_id=account).list_ssl_certificates(
+                account=account or "azure"
+            )
+            rows += _cert_rows(certs)
+        except Exception as e:
+            warn(f"[Azure] {e}")
+
+    if cloud in ("gcp", "all") and (cloud == "gcp" or "gcp" in cfg.clouds):
+        try:
+            certs = get_gcp_provider(project_id=account).list_ssl_certificates(
+                account=account or "gcp"
+            )
+            rows += _cert_rows(certs)
+        except Exception as e:
+            warn(f"[GCP] {e}")
+
+    if not rows:
+        console.print("[bold green]No SSL/TLS certificates found.[/bold green]")
+        return
+
+    print_table(rows, title=f"SSL/TLS Certificates ({len(rows)})")
+
+
 @app.command("public-resources")
 def security_public_resources(
     cloud:   str           = _CLOUD,

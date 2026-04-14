@@ -537,3 +537,11 @@ class DebugEngine:
 
             if service_logs:
                 context["service_logs"] = service_logs
+
+        # ACM certificate expiry — always fetch, regardless of symptom keywords.
+        # Expired certs cause silent outages with no CPU spike or deployment signal.
+        acm_result = fetcher.acm_certificates()
+        context["acm_expiry_check"] = acm_result
+        # Surface expired certs prominently so the AI treats them as first-class evidence
+        if acm_result.get("has_issues"):
+            context["acm_issues"] = acm_result["issues"]
