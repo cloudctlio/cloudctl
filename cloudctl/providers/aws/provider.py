@@ -1575,6 +1575,170 @@ class AWSProvider(CloudProvider):
             tags=tags,
         )
 
+    # ── Debug context fetch ───────────────────────────────────────────────────
+
+    def fetch_debug_context(
+        self,
+        symptom: str,
+        hints: list[str],
+        context: dict,
+        minutes: int = 120,
+    ) -> None:
+        """Fetch AWS-specific debug evidence and merge into context.
+
+        Delegates to DebugFetcher (boto3) for all data collection.
+        The orchestration logic that was in debug_engine._fetch_symptom_context_aws
+        now lives here so the engine can call one method per provider.
+        """
+        from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+        from cloudctl.debug.planner import plan_sources, extract_service_hints  # noqa: PLC0415
+
+        fetcher = DebugFetcher(self._session)
+        sources = plan_sources(symptom)
+        # Merge caller hints with any additional ones extracted here
+        all_hints = list(hints)
+        extra_hints = [h for h in extract_service_hints(symptom) if h not in all_hints]
+        all_hints.extend(extra_hints)
+
+        # ── Audit logs first — resource names seed log discovery ──────────────
+        if "audit_logs" in sources:
+            evts = fetcher.cloudtrail(minutes=minutes)
+            if evts:
+                context["audit_logs"] = evts
+                # Extract function/DB names from CloudTrail resources
+                _hint_set = set(all_hints)
+                for ev in evts:
+                    for part in ev.get("resource", "").split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if ":function:" in part:
+                            name = part.split(":function:")[-1].split(":")[0]
+                        elif ":db:" in part:
+                            name = part.split(":db:")[-1]
+                        else:
+                            name = part
+                        if name and len(name) > 4 and name not in _hint_set:
+                            _hint_set.add(name)
+                            all_hints.append(name)
+
+        # ── Network context ───────────────────────────────────────────────────
+        if "network_context" in sources:
+            evts = fetcher.network_context()
+            if evts:
+                context["network_context"] = evts
+                # Harvest resource names from network events for log discovery
+                _seen = set(all_hints)
+                _SKIP = {"aws", "ecs", "rds", "lambda", "CloudWatch", "Logs",
+                         "VPC", "Subnet", "RouteTable", "SecurityGroup",
+                         "NatGateway", "IGW", "NetworkACL", "ElasticIP",
+                         "InternetGateway", "VPCFlowLogs"}
+                for ev in evts[:100]:
+                    src = ev.get("source", "")
+                    if "/" in src:
+                        name = src.split("/")[-1]
+                        if (name and name not in _seen and len(name) > 4
+                                and not name.startswith((
+                                    "arn:", "i-", "sg-", "vpc-", "subnet-",
+                                    "rtb-", "igw-", "nat-", "eni-", "acl-",
+                                    "eipalloc-", "tgw-", "pcx-", "pl-", "vpce-",
+                                ))):
+                            _seen.add(name)
+                            all_hints.append(name)
+
+        # ── Service logs ──────────────────────────────────────────────────────
+        if "service_logs" in sources:
+            service_logs: list[dict] = []
+            seen_lgs: set[str] = set()
+            for hint in all_hints[:20]:
+                for lg in fetcher.discover_log_groups(hint, limit=50):
+                    if lg in seen_lgs:
+                        continue
+                    seen_lgs.add(lg)
+                    evts = fetcher.cloudwatch_logs(
+                        log_group=lg, filter_pattern="?ERROR ?WARN ?error ?warn",
+                        minutes=minutes,
+                    )
+                    if not evts:
+                        evts = fetcher.tail_log_group(lg, lines=50)
+                    service_logs.extend(evts)
+            # Fallback sweep if hint-based discovery found < 2 groups
+            if len(seen_lgs) < 2:
+                for lg in fetcher.recently_active_log_groups(minutes=minutes, limit=30):
+                    if lg in seen_lgs:
+                        continue
+                    seen_lgs.add(lg)
+                    evts = fetcher.cloudwatch_logs(
+                        log_group=lg, filter_pattern="?ERROR ?WARN ?error ?warn",
+                        minutes=minutes,
+                    )
+                    service_logs.extend(evts)
+            if service_logs:
+                context["service_logs"] = service_logs
+
+        # ── ACM — always fetch ────────────────────────────────────────────────
+        acm = fetcher.acm_certificates()
+        context["acm_expiry_check"] = acm
+        if acm.get("has_issues"):
+            context["acm_issues"] = acm["issues"]
+
+        # ── ALB resource map ──────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            alb_map = fetcher.build_alb_resource_map(hint)
+            if alb_map:
+                context["alb_resource_map"] = alb_map
+                break
+
+        # ── ECS stopped tasks ─────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            evts = fetcher.ecs_stopped_tasks(cluster=hint, service=hint)
+            if evts:
+                context.setdefault("ecs_stopped", []).extend(evts)
+                break
+
+        # ── Lambda REPORT metrics ─────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            evts = fetcher.lambda_report_metrics(function_name=hint, minutes=minutes)
+            if evts:
+                context.setdefault("lambda_report", []).extend(evts)
+                break
+
+        # ── RDS slow queries ──────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            evts = fetcher.rds_slow_queries(db_identifier=hint, minutes=minutes)
+            if evts:
+                context.setdefault("rds_slow", []).extend(evts)
+                break
+
+        # ── SQS DLQ ───────────────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            evts = fetcher.sqs_with_dlq(queue_name_hint=hint)
+            if evts:
+                context.setdefault("sqs_dlq", []).extend(evts)
+                break
+
+        # ── CodePipeline for resource ─────────────────────────────────────────
+        for hint in all_hints[:3]:
+            evts = fetcher.codepipeline_for_resource(resource_name=hint)
+            if evts:
+                context.setdefault("codepipeline_resource", []).extend(evts)
+                break
+
+        # ── VPC flow log REJECT records ───────────────────────────────────────
+        flow_evts = fetcher.vpc_flow_logs(minutes=minutes)
+        if flow_evts:
+            context["vpc_flow_logs"] = flow_evts
+
+        # ── Rich timeline + correlation ────────────────────────────────────────
+        from cloudctl.debug.correlator import build_rich_timeline  # noqa: PLC0415
+        rich = build_rich_timeline(context)
+        context["_rich_timeline"] = {
+            "pattern":         rich.pattern,
+            "correlation_pct": rich.correlation_pct,
+            "inflection":      rich.inflection_point.event if rich.inflection_point else None,
+            "event_count":     len(rich.events),
+        }
+
     def _to_compute(self, inst: dict, account: str, region: str) -> ComputeResource:
         tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
         name = tags.get("Name", inst["InstanceId"])

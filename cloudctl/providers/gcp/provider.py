@@ -1499,3 +1499,99 @@ class GCPProvider(CloudProvider):
         except Exception:  # noqa: BLE001
             pass
         return results
+
+    # ── Debug context fetch ───────────────────────────────────────────────────
+
+    def fetch_debug_context(
+        self,
+        symptom: str,
+        hints: list[str],
+        context: dict,
+        minutes: int = 120,
+    ) -> None:
+        """Fetch GCP debug evidence and merge into context.
+
+        Collects: Cloud Logging (errors), Cloud Run service status.
+        Uses self._project for all API calls.
+        """
+        # ── Cloud Logging (= CloudWatch Logs) ─────────────────────────────────
+        for hint in hints[:3]:
+            result = self._debug_cloud_logging(hint, minutes)
+            if result.get("available") and result.get("rows"):
+                context["gcp_cloud_logging"] = result
+                break
+
+        # ── Cloud Run service status ───────────────────────────────────────────
+        for hint in hints[:3]:
+            result = self._debug_cloud_run(hint)
+            if result.get("available"):
+                context["gcp_cloud_run"] = result
+                break
+
+    def _debug_cloud_logging(self, resource_hint: str, minutes: int) -> dict:
+        """Query GCP Cloud Logging for errors related to a resource hint."""
+        try:
+            from google.cloud import logging as gcp_logging  # noqa: PLC0415
+        except ImportError:
+            return {"available": False, "reason": "google-cloud-logging not installed"}
+        try:
+            from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+            client = gcp_logging.Client(project=self._project)
+            end    = datetime.now(timezone.utc)
+            start  = end - timedelta(minutes=minutes)
+            ts_fmt = "%Y-%m-%dT%H:%M:%SZ"
+            filt   = "\n".join([
+                f'timestamp>="{start.strftime(ts_fmt)}"',
+                f'timestamp<="{end.strftime(ts_fmt)}"',
+                "severity>=ERROR",
+            ])
+            entries = list(client.list_entries(
+                filter_=filt, page_size=100, order_by=gcp_logging.DESCENDING,
+            ))
+            rows = []
+            for entry in entries:
+                msg = str(entry.payload)[:500]
+                # Filter to entries mentioning the hint
+                if resource_hint.lower() not in msg.lower() and resource_hint.lower() not in str(
+                    dict(entry.resource.labels) if entry.resource else {}
+                ).lower():
+                    continue
+                rows.append({
+                    "timestamp": entry.timestamp.isoformat() if entry.timestamp else "",
+                    "severity":  str(entry.severity),
+                    "message":   msg,
+                    "resource":  dict(entry.resource.labels) if entry.resource else {},
+                })
+            return {"available": True, "rows": rows}
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "reason": str(exc)}
+
+    def _debug_cloud_run(self, hint: str) -> dict:
+        """Fetch GCP Cloud Run service status for a service matching hint."""
+        if not _GAPI_AVAILABLE or not _GCP_AUTH_AVAILABLE:
+            return {"available": False, "reason": "google-api-python-client not installed"}
+        try:
+            svc = self._svc("run", "v1")
+            # List services in all regions; match by name hint
+            parent = f"projects/{self._project}/locations/-"
+            resp   = svc.projects().locations().services().list(parent=parent).execute()
+            for item in resp.get("items", []):
+                name = item.get("metadata", {}).get("name", "")
+                if hint.lower() not in name.lower():
+                    continue
+                conditions = item.get("status", {}).get("conditions", [])
+                return {
+                    "available":       True,
+                    "service":         name,
+                    "url":             item.get("status", {}).get("url", ""),
+                    "latest_revision": item.get("status", {}).get("latestReadyRevisionName", ""),
+                    "conditions":      conditions,
+                    "traffic":         item.get("spec", {}).get("traffic", []),
+                    "ready":           any(
+                        c.get("type") == "Ready" and c.get("status") == "True"
+                        for c in conditions
+                    ),
+                }
+            return {"available": False, "reason": f"No Cloud Run service matching '{hint}'"}
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "reason": str(exc)}

@@ -972,6 +972,213 @@ class DebugFetcher:
         except Exception:  # noqa: BLE001
             return []
 
+    # ── GAP 1: Full ALB topology map ─────────────────────────────────────────
+
+    def build_alb_resource_map(self, resource_name: str) -> Optional[dict]:
+        """Build complete ALB topology for a resource (ECS service / resource name hint).
+
+        Returns a dict with:
+          alb_arn, alb_name, log_config,
+          primary_tg  — TargetGroupHealth for the matched resource,
+          all_tgs     — list of TargetGroupHealth for every TG on this ALB,
+          listeners   — raw listener configs,
+          has_unhealthy — True if any TG has unhealthy targets.
+        """
+        if not self._session:
+            return None
+        try:
+            ecs   = self._session.client("ecs")
+            elbv2 = self._session.client("elbv2")
+
+            # Step 1: Find primary TG from ECS service matching the hint
+            primary_tg_arn: Optional[str] = None
+            clusters = ecs.list_clusters().get("clusterArns", [])[:5]
+            for cluster_arn in clusters:
+                svcs = ecs.list_services(cluster=cluster_arn).get("serviceArns", [])[:30]
+                for svc_arn in svcs:
+                    if resource_name.lower() not in svc_arn.lower():
+                        continue
+                    desc = ecs.describe_services(cluster=cluster_arn, services=[svc_arn])
+                    svc  = desc.get("services", [{}])[0]
+                    for lb in svc.get("loadBalancers", []):
+                        tg_arn = lb.get("targetGroupArn")
+                        if tg_arn:
+                            primary_tg_arn = tg_arn
+                            break
+                if primary_tg_arn:
+                    break
+
+            # Step 2: Resolve ALB ARN from TG, or fall back to name scan
+            alb_arn: Optional[str] = None
+            if primary_tg_arn:
+                tg_resp  = elbv2.describe_target_groups(TargetGroupArns=[primary_tg_arn])
+                alb_arns = tg_resp["TargetGroups"][0].get("LoadBalancerArns", []) if tg_resp["TargetGroups"] else []
+                alb_arn  = alb_arns[0] if alb_arns else None
+            if not alb_arn:
+                for lb in elbv2.describe_load_balancers().get("LoadBalancers", [])[:20]:
+                    if resource_name.lower() in lb.get("LoadBalancerName", "").lower():
+                        alb_arn = lb.get("LoadBalancerArn")
+                        break
+            if not alb_arn:
+                return None
+
+            alb_name = alb_arn.split("/")[-2] if "/" in alb_arn else alb_arn
+
+            # Step 3: Listeners
+            listeners = elbv2.describe_listeners(LoadBalancerArn=alb_arn).get("Listeners", [])
+
+            # Step 4: Build path map {tg_arn: [paths]} from listener rules
+            tg_paths: dict = {}
+            for lst in listeners:
+                try:
+                    rules = elbv2.describe_rules(ListenerArn=lst["ListenerArn"]).get("Rules", [])
+                    for rule in rules:
+                        paths = []
+                        for cond in rule.get("Conditions", []):
+                            if cond.get("Field") == "path-pattern":
+                                paths.extend(cond.get("PathPatternConfig", {}).get("Values", []))
+                        for action in rule.get("Actions", []):
+                            if action.get("Type") == "forward":
+                                for tg_ref in [action.get("TargetGroupArn", "")] + [
+                                    w.get("TargetGroupArn", "")
+                                    for w in action.get("ForwardConfig", {}).get("TargetGroups", [])
+                                ]:
+                                    if tg_ref:
+                                        tg_paths.setdefault(tg_ref, []).extend(paths)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Step 5+6: All TGs + per-TG target health
+            all_tgs_resp = elbv2.describe_target_groups(LoadBalancerArn=alb_arn).get("TargetGroups", [])
+            all_tgs = []
+            for tg in all_tgs_resp:
+                tg_arn   = tg["TargetGroupArn"]
+                tg_name  = tg.get("TargetGroupName", "")
+                health   = elbv2.describe_target_health(TargetGroupArn=tg_arn).get("TargetHealthDescriptions", [])
+                healthy_c   = sum(1 for t in health if t.get("TargetHealth", {}).get("State") == "healthy")
+                unhealthy_c = sum(1 for t in health if t.get("TargetHealth", {}).get("State") != "healthy")
+                targets_summary = [
+                    {
+                        "id":     t.get("Target", {}).get("Id"),
+                        "port":   t.get("Target", {}).get("Port"),
+                        "state":  t.get("TargetHealth", {}).get("State"),
+                        "reason": t.get("TargetHealth", {}).get("Reason", ""),
+                    }
+                    for t in health
+                ]
+                all_tgs.append({
+                    "arn":            tg_arn,
+                    "name":           tg_name,
+                    "port":           tg.get("Port", 0),
+                    "protocol":       tg.get("Protocol", ""),
+                    "target_type":    tg.get("TargetType", ""),
+                    "healthy_count":  healthy_c,
+                    "unhealthy_count": unhealthy_c,
+                    "targets":        targets_summary,
+                    "routing_paths":  tg_paths.get(tg_arn, []),
+                    "is_primary":     tg_arn == primary_tg_arn,
+                })
+
+            # Step 7: Log config
+            log_config = self.get_alb_log_config(alb_arn)
+
+            primary_tg = next((t for t in all_tgs if t["is_primary"]), None) or (all_tgs[0] if all_tgs else None)
+            has_unhealthy = any(t["unhealthy_count"] > 0 for t in all_tgs)
+
+            self._mark("alb_resource_map", True)
+            return {
+                "alb_arn":       alb_arn,
+                "alb_name":      alb_name,
+                "primary_tg":    primary_tg,
+                "all_tgs":       all_tgs,
+                "log_config":    log_config,
+                "listeners":     listeners,
+                "has_unhealthy": has_unhealthy,
+            }
+        except Exception:  # noqa: BLE001
+            self._mark("alb_resource_map", False)
+            return None
+
+    # ── GAP 10: VPC Flow Log REJECT records ──────────────────────────────────
+
+    def vpc_flow_logs(self, vpc_id: Optional[str] = None, minutes: int = 120) -> list[dict]:
+        """Fetch VPC Flow Log REJECT records — network-layer packet drops.
+
+        REJECT records are invisible in application logs: the packet is dropped
+        before the app sees anything. Indicates NACL or security group blocking.
+        Only available if VPC flow logs are enabled and sent to CloudWatch Logs.
+        """
+        if not self._session:
+            self._mark("vpc_flow_logs", False)
+            return []
+        try:
+            ec2  = self._session.client("ec2")
+            logs = self._session.client("logs")
+            end   = datetime.now(timezone.utc)
+            start = end - timedelta(minutes=minutes)
+
+            # Find active flow logs → CloudWatch Logs destination
+            fl_filters = [{"Name": "resource-id", "Values": [vpc_id]}] if vpc_id else []
+            flow_logs = ec2.describe_flow_logs(
+                **({"Filters": fl_filters} if fl_filters else {})
+            ).get("FlowLogs", [])
+
+            active_cw = [
+                fl for fl in flow_logs
+                if fl.get("FlowLogStatus") == "ACTIVE"
+                and fl.get("LogDestinationType", "cloud-watch-logs") == "cloud-watch-logs"
+                and fl.get("LogGroupName")
+            ]
+            if not active_cw:
+                self._mark("vpc_flow_logs", False)
+                return [{
+                    "time":   "—",
+                    "source": "VPCFlowLogs",
+                    "event":  (
+                        "WARNING: No active VPC flow logs (CloudWatch destination) configured. "
+                        "Enable: CDK vpc.addFlowLog() | Terraform aws_flow_log | "
+                        "Console: VPC → Flow Logs → Create"
+                    ),
+                }]
+
+            events: list[dict] = []
+            for fl in active_cw[:2]:
+                log_group = fl.get("LogGroupName", "")
+                try:
+                    resp = logs.filter_log_events(
+                        logGroupName=log_group,
+                        filterPattern="REJECT",
+                        startTime=int(start.timestamp() * 1000),
+                        endTime=int(end.timestamp() * 1000),
+                        limit=50,
+                    )
+                    for ev in resp.get("events", []):
+                        fields = ev.get("message", "").split()
+                        # VPC Flow Log fields: version account-id interface-id
+                        # srcaddr dstaddr srcport dstport protocol packets bytes
+                        # start end action log-status
+                        if len(fields) >= 14 and fields[13] == "REJECT":
+                            events.append({
+                                "time":   datetime.fromtimestamp(
+                                    ev["timestamp"] / 1000, tz=timezone.utc
+                                ).strftime(_TS_FMT),
+                                "source": f"VPCFlowLog/{log_group}",
+                                "event":  (
+                                    f"REJECT src={fields[3]}:{fields[5]} "
+                                    f"dst={fields[4]}:{fields[6]} "
+                                    f"proto={fields[7]} "
+                                    f"interface={fields[2]}"
+                                ),
+                            })
+                except Exception:  # noqa: BLE001
+                    pass
+
+            self._mark("vpc_flow_logs", bool(events))
+            return events
+        except Exception:  # noqa: BLE001
+            self._mark("vpc_flow_logs", False)
+            return []
+
     # ── ACM certificate expiry ────────────────────────────────────────────────
 
     def acm_certificates(self) -> dict:

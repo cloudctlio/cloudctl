@@ -55,6 +55,26 @@ class DatabaseResource:
 class CloudProvider(ABC):
     """Abstract interface every cloud provider must implement."""
 
+    def fetch_debug_context(
+        self,
+        symptom: str,
+        hints: list[str],
+        context: dict,
+        minutes: int = 120,
+    ) -> None:
+        """Fetch symptom-specific debug evidence and merge into context (in place).
+
+        Default is a no-op. Each provider overrides this with cloud-specific
+        log/audit/metric fetching relevant for root-cause analysis.
+
+        Args:
+            symptom: Raw symptom string from the user.
+            hints:   Service/resource name hints extracted from the symptom.
+            context: Mutable dict — add keys directly (audit_logs, service_logs,
+                     network_context, alb_resource_map, etc.).
+            minutes: Lookback window in minutes.
+        """
+
     @abstractmethod
     def list_compute(
         self,

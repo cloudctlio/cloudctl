@@ -1533,3 +1533,211 @@ class AzureProvider(CloudProvider):
                     pass
 
         return results
+
+    # ── Debug context fetch ───────────────────────────────────────────────────
+
+    def fetch_debug_context(
+        self,
+        symptom: str,
+        hints: list[str],
+        context: dict,
+        minutes: int = 120,
+    ) -> None:
+        """Fetch Azure debug evidence and merge into context.
+
+        Collects: Activity Log (audit trail), Monitor Logs (Log Analytics),
+        Container Apps revision events. Uses first configured subscription.
+        """
+        sub_id = self._subscriptions[0] if self._subscriptions else None
+        if not sub_id:
+            return
+
+        # ── Activity Log (audit trail equivalent of CloudTrail) ───────────────
+        for hint in hints[:3]:
+            evts = self._debug_activity_log(sub_id, hint, minutes)
+            if evts:
+                context.setdefault("audit_logs", []).extend(evts)
+                break
+
+        # ── Monitor Logs (Log Analytics KQL) ─────────────────────────────────
+        for hint in hints[:3]:
+            result = self._debug_monitor_logs(sub_id, minutes)
+            if result.get("available") and result.get("rows"):
+                context["azure_monitor_logs"] = result
+                break
+
+        # ── Container Apps revision events ────────────────────────────────────
+        for hint in hints[:3]:
+            evts = self._debug_container_apps(sub_id, hint)
+            if evts:
+                context.setdefault("service_events", []).extend(evts)
+                break
+
+    def _debug_activity_log(self, sub_id: str, hint: str, minutes: int) -> list[dict]:
+        """Fetch Activity Log events filtered by hint keyword."""
+        if not _MONITOR_AVAILABLE:
+            return []
+        try:
+            from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+            client = MonitorManagementClient(self._cred, sub_id)
+            end    = datetime.now(timezone.utc)
+            start  = end - timedelta(minutes=minutes)
+            ts_fmt = "%Y-%m-%dT%H:%M:%SZ"
+            filt   = (
+                f"eventTimestamp ge '{start.strftime(ts_fmt)}' and "
+                f"eventTimestamp le '{end.strftime(ts_fmt)}'"
+            )
+            events = []
+            for ev in client.activity_logs.list(filter=filt):
+                op  = str(getattr(getattr(ev, "operation_name", None), "value", "") or "").lower()
+                rid = str(getattr(ev, "resource_id", "") or "").lower()
+                if hint.lower() not in op and hint.lower() not in rid:
+                    continue
+                if not any(x in op for x in ("write", "delete", "action")):
+                    continue
+                ts = getattr(ev, "event_timestamp", None)
+                events.append({
+                    "time":   ts.strftime(ts_fmt) if ts else "—",
+                    "source": "AzureActivityLog",
+                    "event":  op,
+                    "status": str(getattr(getattr(ev, "status", None), "value", "") or ""),
+                    "caller": str(getattr(ev, "caller", "") or ""),
+                })
+            return sorted(events, key=lambda e: e["time"], reverse=True)
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _debug_monitor_logs(self, sub_id: str, minutes: int) -> dict:
+        """Query Log Analytics workspace for Error/Critical logs."""
+        try:
+            from azure.monitor.query import LogsQueryClient, LogsQueryStatus  # noqa: PLC0415
+        except ImportError:
+            return {"available": False, "reason": "azure-monitor-query not installed"}
+        if not _MONITOR_AVAILABLE:
+            return {"available": False, "reason": "azure-mgmt-monitor not installed"}
+        try:
+            from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+            from azure.monitor.query import LogsQueryClient, LogsQueryStatus  # noqa: PLC0415
+            monitor = MonitorManagementClient(self._cred, sub_id)
+            ts_fmt  = "%Y-%m-%dT%H:%M:%SZ"
+            end     = datetime.now(timezone.utc)
+            start   = end - timedelta(minutes=minutes)
+            # Discover a workspace from subscription-level diagnostic settings
+            workspace_id = None
+            try:
+                for r in monitor.diagnostic_settings.list_at_subscription_level():
+                    ws = getattr(r, "workspace_id", None)
+                    if ws:
+                        workspace_id = ws
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            if not workspace_id:
+                return {"available": False, "reason": "No Log Analytics workspace found"}
+            client = LogsQueryClient(credential=self._cred)
+            kql    = (
+                "union isfuzzy=true ContainerLog, AppTraces, AzureDiagnostics\n"
+                f"| where TimeGenerated between (datetime('{start.strftime(ts_fmt)}') "
+                f".. datetime('{end.strftime(ts_fmt)}'))\n"
+                "| where Level == 'Error' or Level == 'Critical'\n"
+                "| project TimeGenerated, Level, Message\n"
+                "| order by TimeGenerated desc\n"
+                "| limit 50"
+            )
+            result = client.query_workspace(
+                workspace_id=workspace_id, query=kql, timespan=(start, end)
+            )
+            if result.status == LogsQueryStatus.SUCCESS:
+                rows = []
+                for table in result.tables:
+                    for row in table.rows:
+                        rows.append(dict(zip(table.columns, row)))
+                return {"available": True, "rows": rows[:50]}
+            return {"available": True, "error": str(result.partial_error)}
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "reason": str(exc)}
+
+    def _debug_container_apps(self, sub_id: str, hint: str) -> list[dict]:
+        """Fetch Container Apps revisions matching a hint."""
+        try:
+            from azure.mgmt.appcontainers import ContainerAppsAPIClient  # noqa: PLC0415
+            from datetime import datetime  # noqa: PLC0415
+        except ImportError:
+            return []
+        try:
+            client = ContainerAppsAPIClient(self._cred, sub_id)
+            ts_fmt = "%Y-%m-%dT%H:%M:%SZ"
+            events: list[dict] = []
+            for app in client.container_apps.list_by_subscription():
+                app_name = app.name or ""
+                if hint.lower() not in app_name.lower():
+                    continue
+                rg = (app.id or "").split("/")[4] if app.id else ""
+                for rev in client.container_apps_revisions.list_revisions(
+                    resource_group_name=rg, container_app_name=app_name
+                ):
+                    ts = getattr(rev, "created_time", None)
+                    events.append({
+                        "time":   ts.strftime(ts_fmt) if ts else "—",
+                        "source": f"AzureContainerApps/{app_name}",
+                        "event":  (
+                            f"revision={getattr(rev, 'name', '')} "
+                            f"active={getattr(rev, 'active', False)} "
+                            f"replicas={getattr(rev, 'replicas', 0)} "
+                            f"provisioning={getattr(rev, 'provisioning_state', '')}"
+                        ),
+                    })
+            return sorted(events, key=lambda e: e["time"], reverse=True)
+        except Exception:  # noqa: BLE001
+            return []
+
+    # ── Debug context fetch ───────────────────────────────────────────────────
+
+    def fetch_debug_context(
+        self,
+        symptom: str,
+        hints: list[str],
+        context: dict,
+        minutes: int = 120,
+    ) -> None:
+        """Fetch Azure debug evidence and merge into context.
+
+        Collects: Activity Log (= CloudTrail), Monitor Logs (= CloudWatch Logs),
+        Container Apps revision events.  Uses the first configured subscription.
+        """
+        sub_id = self._subscriptions[0] if self._subscriptions else None
+        if not sub_id:
+            return
+
+        # ── Activity Log (audit trail) ────────────────────────────────────────
+        for hint in hints[:3]:
+            evts = self._fetch_activity_log_for_hint(sub_id, hint, minutes)
+            if evts:
+                context.setdefault("audit_logs", []).extend(evts)
+                break
+
+        # ── Monitor Logs (Log Analytics) ─────────────────────────────────────
+        for hint in hints[:3]:
+            result = self._fetch_monitor_logs_for_hint(sub_id, hint, minutes)
+            if result.get("available") and result.get("rows"):
+                context["azure_monitor_logs"] = result
+                break
+
+        # ── Container Apps events ─────────────────────────────────────────────
+        for hint in hints[:3]:
+            evts = self._fetch_container_apps_for_hint(sub_id, hint)
+            if evts:
+                context.setdefault("service_events", []).extend(evts)
+                break
+
+    def _fetch_activity_log_for_hint(
+        self, sub_id: str, hint: str, minutes: int
+    ) -> list[dict]:
+        if not _MONITOR_AVAILABLE:
+            return []
+        try:
+            from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+            client = MonitorManagementClient(self._cred, sub_id)
+            end   = datetime.now(timezone.utc)
+            start = end - timedelta(minutes=minutes)
+            _TS   = "

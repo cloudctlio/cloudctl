@@ -1,4 +1,4 @@
-"""AI confidence scoring — rates AI results based on data completeness."""
+"""AI confidence scoring — rates AI results based on data completeness and timeline quality."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -9,6 +9,7 @@ from typing import Optional
 class ConfidenceScore:
     level: str          # HIGH | MEDIUM | LOW
     reason: str
+    reasons: list[str] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     data_points: int = 0
     accounts_covered: int = 0
@@ -19,7 +20,7 @@ class ConfidenceScore:
         color = {"HIGH": "green", "MEDIUM": "yellow", "LOW": "red"}.get(self.level, "dim")
         parts = [f"[{color}]{self.level} confidence[/{color}]"]
         if self.sources:
-            parts.append(f"sources: {', '.join(self.sources)}")
+            parts.append(f"sources: {', '.join(self.sources[:4])}")
         if self.data_points:
             parts.append(f"{self.data_points} data points")
         if self.accounts_total:
@@ -33,17 +34,23 @@ def score(
     required_keys: Optional[list[str]] = None,
     expected_accounts: int = 1,
     historical_accuracy: Optional[float] = None,
+    timeline_pattern: Optional[str] = None,
+    timeline_correlation: Optional[float] = None,
+    has_inflection: bool = False,
 ) -> ConfidenceScore:
     """
     Score a data payload for AI context quality.
 
-    HIGH   = real API data, full time range, all accounts covered, accuracy > 80%
-    MEDIUM = partial data OR accuracy 50-80%
-    LOW    = very little data OR accuracy < 50%
+    HIGH   = ≥3 sources with data, clear inflection, correlation ≥80%, single_event/cascading pattern
+    MEDIUM = partial data OR correlation < 80% OR intermittent/gradual pattern
+    LOW    = no data OR no signal OR pattern == no_signal OR AI failed
     """
+    reasons: list[str] = []
+
     if not data:
         return ConfidenceScore(
             level="LOW", reason="No cloud data was fetched.",
+            reasons=["No cloud data was fetched."],
             sources=[], data_points=0,
         )
 
@@ -52,50 +59,84 @@ def score(
     covered   = sum(1 for v in data.values() if _count_items(v) > 0)
     missing   = [k for k in (required_keys or []) if k not in data or not data[k]]
 
-    if historical_accuracy is not None:
-        if historical_accuracy < 0.5:
-            return ConfidenceScore(
-                level="LOW",
-                reason=f"Historical accuracy {historical_accuracy:.0%} for similar queries.",
-                sources=sources, data_points=total_pts,
-                accounts_covered=covered, accounts_total=expected_accounts,
-            )
-        if historical_accuracy < 0.8:
-            return ConfidenceScore(
-                level="MEDIUM",
-                reason=f"Historical accuracy {historical_accuracy:.0%} for similar queries.",
-                sources=sources, data_points=total_pts,
-                accounts_covered=covered, accounts_total=expected_accounts,
-            )
+    numeric_score = 0
+
+    # ── Data completeness ──────────────────────────────────────────────────────
+    if covered >= 4:
+        numeric_score += 3
+        reasons.append(f"All {covered} data sources available")
+    elif covered >= 2:
+        numeric_score += 1
+        reasons.append(f"{covered} of {len(sources)} data sources available")
+    else:
+        numeric_score -= 1
+        reasons.append(f"Limited data: only {covered} sources returned data")
 
     if missing:
-        return ConfidenceScore(
-            level="MEDIUM",
-            reason=f"Missing data for: {', '.join(missing)}",
-            sources=sources, data_points=total_pts,
-            accounts_covered=covered, accounts_total=expected_accounts,
-        )
+        reasons.append(f"Missing data for: {', '.join(missing)}")
 
-    if total_pts == 0:
-        return ConfidenceScore(
-            level="LOW", reason="Data was fetched but returned empty results.",
-            sources=sources, data_points=0,
-            accounts_covered=0, accounts_total=expected_accounts,
-        )
+    # ── Timeline quality ───────────────────────────────────────────────────────
+    if has_inflection:
+        numeric_score += 2
+        reasons.append("Clear inflection point identified")
+    else:
+        reasons.append("No clear inflection point found")
 
-    if covered < expected_accounts:
-        return ConfidenceScore(
-            level="MEDIUM",
-            reason=f"Only {covered}/{expected_accounts} accounts returned data.",
-            sources=sources, data_points=total_pts,
-            accounts_covered=covered, accounts_total=expected_accounts,
-        )
+    if timeline_correlation is not None:
+        if timeline_correlation >= 80:
+            numeric_score += 1
+            reasons.append(f"Strong correlation: {timeline_correlation:.0f}%")
+        elif timeline_correlation >= 50:
+            reasons.append(f"Moderate correlation: {timeline_correlation:.0f}%")
+        else:
+            numeric_score -= 1
+            reasons.append(f"Weak correlation: {timeline_correlation:.0f}%")
+
+    if timeline_pattern:
+        if timeline_pattern == "intermittent":
+            numeric_score -= 1
+            reasons.append(
+                "Intermittent pattern — errors not continuous, "
+                "may not be visible at query time"
+            )
+        elif timeline_pattern == "no_signal":
+            numeric_score -= 2
+            reasons.append("No clear signal found in time window")
+        elif timeline_pattern in ("single_event", "cascading"):
+            numeric_score += 1
+            reasons.append(f"Clear {timeline_pattern.replace('_', ' ')} pattern")
+        elif timeline_pattern == "gradual_degradation":
+            reasons.append("Gradual degradation pattern — root cause may be gradual resource exhaustion")
+
+    # ── Historical accuracy ────────────────────────────────────────────────────
+    if historical_accuracy is not None:
+        if historical_accuracy >= 0.8:
+            numeric_score += 1
+            reasons.append(f"Historical accuracy {historical_accuracy:.0%} for similar queries")
+        elif historical_accuracy < 0.5:
+            numeric_score -= 1
+            reasons.append(f"Historical accuracy {historical_accuracy:.0%} — low confidence from past experience")
+
+    # ── Map numeric score to level ─────────────────────────────────────────────
+    if numeric_score >= 5:
+        level = "HIGH"
+    elif numeric_score >= 2:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    # Override: force MEDIUM for intermittent regardless of score
+    if timeline_pattern == "intermittent" and level == "HIGH":
+        level = "MEDIUM"
 
     return ConfidenceScore(
-        level="HIGH",
-        reason=f"Full data from {covered} account(s), {total_pts} resources.",
-        sources=sources, data_points=total_pts,
-        accounts_covered=covered, accounts_total=expected_accounts,
+        level=level,
+        reason=reasons[0] if reasons else "insufficient data",
+        reasons=reasons,
+        sources=sources,
+        data_points=total_pts,
+        accounts_covered=covered,
+        accounts_total=expected_accounts,
     )
 
 

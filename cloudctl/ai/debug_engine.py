@@ -62,9 +62,8 @@ class DebugEngine:
             include=include,
         )
 
-        # Symptom-aware fetching — discover service logs and metrics using planner hints
-        if cloud in ("aws", "all"):
-            self._fetch_symptom_context_aws(symptom, account, region, context)
+        # Symptom-aware fetching — each configured provider fetches its own evidence
+        self._fetch_symptom_context(symptom, cloud, account, region, context)
 
         # Detect deployment method from resource tags
         deploy_method = self._detect_deployment_method(cloud, account, region, context)
@@ -72,9 +71,13 @@ class DebugEngine:
             context["deployment_method"] = deploy_method
 
         from cloudctl.debug.planner import ALL_SOURCES  # noqa: PLC0415
+        rich = context.get("_rich_timeline", {})
         cs = confidence_mod.score(
             context,
             required_keys=ALL_SOURCES,
+            timeline_pattern=rich.get("pattern"),
+            timeline_correlation=rich.get("correlation_pct"),
+            has_inflection=bool(rich.get("inflection")),
         )
 
         from cloudctl.ai.factory import parse_debug_response  # noqa: PLC0415
@@ -387,161 +390,57 @@ class DebugEngine:
         except Exception:  # noqa: BLE001
             pass
 
-    def _fetch_symptom_context_aws(
+    def _fetch_symptom_context(
         self,
         symptom: str,
+        cloud: str,
         account: Optional[str],
         region: Optional[str],
         context: dict,
     ) -> None:
-        """Fetch symptom-specific logs and metrics from AWS, mutates context in place."""
-        from cloudctl.debug.planner import plan_sources, extract_service_hints  # noqa: PLC0415
-        from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
-        from cloudctl.commands._helpers import get_aws_provider  # noqa: PLC0415
+        """Fetch symptom-specific evidence from every configured provider.
 
-        sources = plan_sources(symptom)
-        hints   = extract_service_hints(symptom)
+        Each provider's fetch_debug_context() encapsulates all cloud-specific
+        logic — this method is a thin dispatcher that keeps the engine cloud-agnostic.
+        """
+        from cloudctl.debug.planner import extract_service_hints  # noqa: PLC0415
 
-        profiles = self._cfg.accounts.get("aws", [])
-        targets  = [p["name"] for p in profiles if not account or p["name"] == account]
-        if not targets:
-            return
+        hints = extract_service_hints(symptom)
 
-        try:
-            prov    = get_aws_provider(targets[0], region)
-            fetcher = DebugFetcher(prov._session)
-        except Exception:
-            return
+        # ── AWS ───────────────────────────────────────────────────────────────
+        if cloud in ("aws", "all"):
+            profiles = self._cfg.accounts.get("aws", [])
+            targets  = [p["name"] for p in profiles if not account or p["name"] == account]
+            if targets:
+                try:
+                    from cloudctl.providers.aws.provider import AWSProvider  # noqa: PLC0415
+                    prov = AWSProvider(profile=targets[0], region=region)
+                    prov.fetch_debug_context(symptom, hints, context)
+                except Exception:  # noqa: BLE001
+                    pass
 
-        # Audit logs — fetch first so resource names can seed log discovery
-        if "audit_logs" in sources:
-            evts = fetcher.cloudtrail(minutes=120)
-            if evts:
-                context["audit_logs"] = evts
-                # Extract Lambda function names and RDS instance IDs from
-                # CloudTrail resource fields so their log groups get discovered.
-                # CloudTrail stores resource names in ev["resource"] as a
-                # comma-separated string of ResourceName values.
-                # Lambda log groups: /aws/lambda/<fn-name>
-                # RDS log groups:    /aws/rds/instance/<id>/postgresql
-                _hint_set = set(hints)
-                for ev in evts:
-                    for part in ev.get("resource", "").split(","):
-                        part = part.strip()
-                        if not part:
-                            continue
-                        # Full ARN → extract function name or RDS instance id
-                        if ":function:" in part:
-                            name = part.split(":function:")[-1].split(":")[0]
-                        elif ":db:" in part:
-                            name = part.split(":db:")[-1]
-                        else:
-                            name = part  # plain resource name (no ARN prefix)
-                        if name and len(name) > 4 and name not in _hint_set:
-                            _hint_set.add(name)
-                            hints.append(name)
+        # ── Azure ─────────────────────────────────────────────────────────────
+        if cloud in ("azure", "all"):
+            az_accounts = self._cfg.accounts.get("azure", [])
+            targets = [p for p in az_accounts if not account or p.get("name") == account]
+            if targets:
+                try:
+                    from cloudctl.providers.azure.provider import AzureProvider  # noqa: PLC0415
+                    sub_id = targets[0].get("subscription_id")
+                    prov = AzureProvider(subscription_id=sub_id)
+                    prov.fetch_debug_context(symptom, hints, context)
+                except Exception:  # noqa: BLE001
+                    pass
 
-        # Network context — fetch before log discovery so target group /
-        # ECS service names can seed log discovery
-        if "network_context" in sources:
-            evts = fetcher.network_context()
-            if evts:
-                context["network_context"] = evts
-
-        # Service logs — discover log groups using symptom hints PLUS names
-        # extracted from already-fetched audit_logs and network_context events.
-        # A source like "TargetGroup/cloudctl-complex-e2e-ecs-tg" yields
-        # "cloudctl-complex-e2e-ecs-tg", matching /ecs/cloudctl-complex-e2e-nginx.
-        if "service_logs" in sources:
-            _seen_hints: set[str] = set()
-            all_hints: list[str] = []
-
-            for h in hints[:5]:
-                if h not in _seen_hints:
-                    _seen_hints.add(h)
-                    all_hints.append(h)
-
-            # Harvest names from event sources already in context.
-            # Two strategies:
-            #   1. Full resource name from "Type/name" sources → matches log groups directly
-            #   2. Shared name prefix (longest common prefix of resource names) →
-            #      catches ECS log groups like /ecs/<stack>-nginx when only
-            #      TargetGroup/<stack>-ecs-tg is in network_context
-            _SKIP_TYPES = {"aws", "ecs", "rds", "lambda", "ec2", "s3", "CloudWatch",
-                           "Logs", "ECS", "VPC", "Subnet", "RouteTable", "SecurityGroup",
-                           "NatGateway", "IGW", "NetworkACL", "ElasticIP",
-                           "InternetGateway", "VPCFlowLogs"}
-            resource_names_seen: list[str] = []
-            for ctx_key in ("audit_logs", "network_context"):
-                for ev in context.get(ctx_key, [])[:100]:
-                    src = ev.get("source", "")
-                    if "/" in src:
-                        # Take the last segment (the resource name, not the type prefix)
-                        name = src.split("/")[-1]
-                        if (name and name not in _seen_hints and len(name) > 4
-                                and not name.startswith(("arn:", "i-", "sg-", "vpc-",
-                                                         "subnet-", "rtb-", "igw-", "nat-",
-                                                         "eni-", "acl-", "eipalloc-",
-                                                         "tgw-", "pcx-", "pl-", "vpce-"))):
-                            _seen_hints.add(name)
-                            all_hints.append(name)
-                            resource_names_seen.append(name)
-
-            # For each resource name, also add a truncated version with the
-            # last 1-2 dash-components stripped — this recovers the stack prefix
-            # e.g. "cloudctl-complex-e2e-ecs-tg" → "cloudctl-complex-e2e"
-            # which matches /ecs/cloudctl-complex-e2e-nginx via logGroupNamePattern
-            for nm in list(resource_names_seen):
-                parts = nm.split("-")
-                if len(parts) >= 4:
-                    # Try dropping last 2 components, then last 1
-                    for drop in (2, 1):
-                        shorter = "-".join(parts[:-drop])
-                        if len(shorter) >= 5 and shorter not in _seen_hints:
-                            _seen_hints.add(shorter)
-                            all_hints.append(shorter)
-                            break
-
-            service_logs: list[dict] = []
-            seen_lgs: set[str] = set()
-            for hint in all_hints[:20]:
-                for lg in fetcher.discover_log_groups(hint, limit=50):
-                    if lg not in seen_lgs:
-                        seen_lgs.add(lg)
-                        evts = fetcher.cloudwatch_logs(
-                            log_group=lg,
-                            filter_pattern="?ERROR ?WARN ?error ?warn",
-                            minutes=180,
-                        )
-                        if not evts:
-                            # Tail last 50 lines unconditionally — catches stack
-                            # traces and structured JSON logs that don't contain
-                            # ERROR/WARN, regardless of the time window.
-                            evts = fetcher.tail_log_group(lg, lines=50)
-                        service_logs.extend(evts)
-
-            # Recently-active sweep — fallback only, runs when hint-based
-            # discovery found fewer than 2 log groups. Catches custom log
-            # groups (/app/payments, /prod/checkout) that hints never match.
-            if len(seen_lgs) < 2:
-                for lg in fetcher.recently_active_log_groups(minutes=180, limit=30):
-                    if lg in seen_lgs:
-                        continue
-                    seen_lgs.add(lg)
-                    evts = fetcher.cloudwatch_logs(
-                        log_group=lg,
-                        filter_pattern="?ERROR ?WARN ?error ?warn",
-                        minutes=180,
-                    )
-                    service_logs.extend(evts)
-
-            if service_logs:
-                context["service_logs"] = service_logs
-
-        # ACM certificate expiry — always fetch, regardless of symptom keywords.
-        # Expired certs cause silent outages with no CPU spike or deployment signal.
-        acm_result = fetcher.acm_certificates()
-        context["acm_expiry_check"] = acm_result
-        # Surface expired certs prominently so the AI treats them as first-class evidence
-        if acm_result.get("has_issues"):
-            context["acm_issues"] = acm_result["issues"]
+        # ── GCP ───────────────────────────────────────────────────────────────
+        if cloud in ("gcp", "all"):
+            gcp_accounts = self._cfg.accounts.get("gcp", [])
+            targets = [p for p in gcp_accounts if not account or p.get("name") == account]
+            if targets:
+                try:
+                    from cloudctl.providers.gcp.provider import GCPProvider  # noqa: PLC0415
+                    project_id = targets[0].get("project_id")
+                    prov = GCPProvider(project_id=project_id)
+                    prov.fetch_debug_context(symptom, hints, context)
+                except Exception:  # noqa: BLE001
+                    pass
