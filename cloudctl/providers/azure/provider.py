@@ -1435,3 +1435,101 @@ class AzureProvider(CloudProvider):
             except Exception:
                 pass
         return results
+
+    # ── SSL / TLS Certificates ────────────────────────────────────────────────
+
+    def list_ssl_certificates(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List SSL/TLS certificates from App Service and Application Gateway.
+
+        Sources:
+          - App Service: custom domain SSL bindings per web app
+          - Application Gateway: SSL certificates attached to listeners
+
+        Returns normalised list (shared schema with AWS/GCP):
+          domain, status, days_to_expiry, expiry, type, auto_renew,
+          in_use_by, id, region, account, cloud, source
+        """
+        from datetime import datetime, timezone as _tz  # noqa: PLC0415
+        now     = datetime.now(_tz.utc)
+        results: list[dict] = []
+        acct_id = self._account_id() if hasattr(self, "_account_id") else account
+
+        def _days(expiry_dt) -> int | None:
+            if not expiry_dt:
+                return None
+            if not hasattr(expiry_dt, "tzinfo"):
+                return None
+            exp = expiry_dt if expiry_dt.tzinfo else expiry_dt.replace(tzinfo=_tz.utc)
+            return (exp - now).days
+
+        def _status(days: int | None, managed: bool) -> str:
+            if days is not None and days < 0:
+                return "EXPIRED"
+            if days is not None and days < 30:
+                return "EXPIRING_SOON"
+            if not managed:
+                return "IMPORTED_NO_AUTO_RENEW"
+            return "OK"
+
+        # App Service SSL bindings
+        if _WEB_AVAILABLE:
+            for sub_id in self._subscriptions:
+                try:
+                    web = WebSiteManagementClient(self._cred, sub_id)
+                    for app in web.web_apps.list():
+                        app_region = app.location or "—"
+                        if region and app_region != region:
+                            continue
+                        for binding in (app.host_name_ssl_states or []):
+                            thumb  = binding.thumbprint or ""
+                            expiry = getattr(binding, "expiry_date", None)
+                            # Managed = SNI binding provisioned by App Service
+                            managed = (binding.ssl_state or "").lower() == "snienabled" and not thumb
+                            days    = _days(expiry)
+                            results.append({
+                                "domain":         binding.name or "—",
+                                "sans":           [],
+                                "status":         _status(days, managed),
+                                "days_to_expiry": days,
+                                "expiry":         expiry.isoformat() if expiry else None,
+                                "type":           "MANAGED" if managed else "IMPORTED",
+                                "auto_renew":     managed,
+                                "in_use_by":      [app.name or ""],
+                                "id":             thumb or f"{app.name}/{binding.name}",
+                                "region":         app_region,
+                                "account":        acct_id,
+                                "cloud":          "azure",
+                                "source":         "AppService",
+                            })
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Application Gateway SSL certificates
+        if _NETWORK_AVAILABLE:
+            for sub_id in self._subscriptions:
+                try:
+                    net = NetworkManagementClient(self._cred, sub_id)
+                    for agw in net.application_gateways.list_all():
+                        agw_region = agw.location or "—"
+                        if region and agw_region != region:
+                            continue
+                        for ssl_cert in (agw.ssl_certificates or []):
+                            results.append({
+                                "domain":         ssl_cert.name or "—",
+                                "sans":           [],
+                                "status":         "OK",    # AGW certs have no built-in expiry field
+                                "days_to_expiry": None,
+                                "expiry":         None,
+                                "type":           "IMPORTED",
+                                "auto_renew":     False,
+                                "in_use_by":      [agw.name or ""],
+                                "id":             ssl_cert.id or ssl_cert.name or "—",
+                                "region":         agw_region,
+                                "account":        acct_id,
+                                "cloud":          "azure",
+                                "source":         "AppGateway",
+                            })
+                except Exception:  # noqa: BLE001
+                    pass
+
+        return results

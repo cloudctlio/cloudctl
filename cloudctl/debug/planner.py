@@ -1,11 +1,13 @@
 """Debug planner — extracts resource hints from symptoms for targeted log discovery."""
 from __future__ import annotations
 
-# Cloud-agnostic data sources — every cloud platform has these three:
-#   service_logs    — application/service logs
-#   audit_logs      — API call history (CloudTrail / Azure Activity Log / GCP Audit Logs)
-#   network_context — network topology (VPC/VNet, security groups, routing, load balancers)
-ALL_SOURCES = ["service_logs", "audit_logs", "network_context"]
+# Cloud-agnostic data sources — every cloud platform has these:
+#   service_logs       — application/service logs
+#   audit_logs         — API call history (CloudTrail / Azure Activity Log / GCP Audit Logs)
+#   network_context    — network topology (VPC/VNet, security groups, routing, load balancers)
+#   deployment_method  — IaC tool detection (CDK/Terraform/Pulumi/etc.)
+#   acm_expiry_check   — SSL/TLS certificate expiry (always-fetch: expired certs cause silent outages)
+ALL_SOURCES = ["service_logs", "audit_logs", "network_context", "deployment_method", "acm_expiry_check"]
 
 
 def plan_sources(symptom: str) -> list[str]:  # noqa: ARG001

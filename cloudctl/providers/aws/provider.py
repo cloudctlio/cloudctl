@@ -793,6 +793,63 @@ class AWSProvider(CloudProvider):
                 })
         return results
 
+    def list_ssl_certificates(self, account: str, region: Optional[str] = None) -> list[dict]:
+        """List ACM certificates with enriched expiry/risk metadata.
+
+        Returns a normalised list (shared schema across all cloud providers):
+          domain, status, days_to_expiry, expiry, type, auto_renew,
+          in_use_by, id, region, account, cloud, source
+        """
+        from datetime import datetime, timezone as _tz  # noqa: PLC0415
+        acm = self._client("acm", region)
+        now = datetime.now(_tz.utc)
+        results: list[dict] = []
+        try:
+            paginator = acm.get_paginator("list_certificates")
+            for page in paginator.paginate(
+                CertificateStatuses=["ISSUED", "EXPIRED", "INACTIVE"]
+            ):
+                for summary in page.get("CertificateSummaryList", []):
+                    try:
+                        detail = acm.describe_certificate(
+                            CertificateArn=summary["CertificateArn"]
+                        )["Certificate"]
+                    except Exception:  # noqa: BLE001
+                        continue
+                    expiry    = detail.get("NotAfter")
+                    cert_type = detail.get("Type", "")
+                    in_use_by = detail.get("InUseBy", [])
+                    days: int | None = None
+                    if expiry:
+                        expiry_utc = expiry if expiry.tzinfo else expiry.replace(tzinfo=_tz.utc)
+                        days = (expiry_utc - now).days
+                    if days is not None and days < 0:
+                        status = "EXPIRED"
+                    elif days is not None and days < 30:
+                        status = "EXPIRING_SOON"
+                    elif cert_type == "IMPORTED":
+                        status = "IMPORTED_NO_AUTO_RENEW"
+                    else:
+                        status = "OK"
+                    results.append({
+                        "domain":         detail.get("DomainName", "—"),
+                        "sans":           detail.get("SubjectAlternativeNames", []),
+                        "status":         status,
+                        "days_to_expiry": days,
+                        "expiry":         expiry.isoformat() if expiry else None,
+                        "type":           cert_type,
+                        "auto_renew":     cert_type == "AMAZON_ISSUED",
+                        "in_use_by":      in_use_by,
+                        "id":             summary["CertificateArn"],
+                        "region":         region or self._region or "—",
+                        "account":        self._account_id(),
+                        "cloud":          "aws",
+                        "source":         "ACM",
+                    })
+        except Exception:  # noqa: BLE001
+            pass
+        return results
+
     # ── GuardDuty ────────────────────────────────────────────────────────────
 
     def list_guardduty_findings(self, account: str, region: Optional[str] = None, severity_min: float = 4.0) -> list[dict]:

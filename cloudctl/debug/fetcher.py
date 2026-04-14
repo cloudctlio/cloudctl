@@ -971,3 +971,92 @@ class DebugFetcher:
             return events
         except Exception:  # noqa: BLE001
             return []
+
+    # ── ACM certificate expiry ────────────────────────────────────────────────
+
+    def acm_certificates(self) -> dict:
+        """List all ACM certificates and flag expiry/import risks.
+
+        Called on EVERY debug session regardless of symptom keywords.
+        Reason: expired certs cause silent outages with no CPU spike,
+        no deployment event, and no CloudWatch alarm — the user describes
+        "app went down" not "certificate expired" because they don't know.
+
+        Flags three conditions:
+          EXPIRED              — cert is past expiry → active outage cause
+          EXPIRING_SOON        — < 30 days remaining → upcoming risk
+          IMPORTED_NO_AUTO_RENEW — ACM-issued certs auto-renew; IMPORTED
+                                   certs NEVER auto-renew regardless of any
+                                   setting. Human must renew manually.
+        """
+        if not self._session:
+            self._mark("acm_certificates", False)
+            return {"total": 0, "issues": [], "has_issues": False}
+        try:
+            acm = self._session.client("acm")
+            now = datetime.now(timezone.utc)
+
+            certs: list[dict] = []
+            paginator = acm.get_paginator("list_certificates")
+            for page in paginator.paginate(
+                CertificateStatuses=["ISSUED", "EXPIRED", "INACTIVE"]
+            ):
+                for summary in page.get("CertificateSummaryList", []):
+                    try:
+                        detail = acm.describe_certificate(
+                            CertificateArn=summary["CertificateArn"]
+                        )["Certificate"]
+                    except Exception:  # noqa: BLE001
+                        continue
+
+                    expiry    = detail.get("NotAfter")
+                    cert_type = detail.get("Type", "")
+                    in_use_by = detail.get("InUseBy", [])
+
+                    days: int | None = None
+                    if expiry:
+                        expiry_utc = expiry if expiry.tzinfo else expiry.replace(tzinfo=timezone.utc)
+                        days = (expiry_utc - now).days
+
+                    if days is not None and days < 0:
+                        status = "EXPIRED"
+                    elif days is not None and days < 30:
+                        status = "EXPIRING_SOON"
+                    elif cert_type == "IMPORTED":
+                        status = "IMPORTED_NO_AUTO_RENEW"
+                    else:
+                        status = "OK"
+
+                    certs.append({
+                        "domain":         detail.get("DomainName", "—"),
+                        "sans":           detail.get("SubjectAlternativeNames", []),
+                        "arn":            summary["CertificateArn"],
+                        "status":         status,
+                        "days_to_expiry": days,
+                        "expiry":         expiry.isoformat() if expiry else None,
+                        "type":           cert_type,
+                        "auto_renew":     cert_type == "AMAZON_ISSUED",
+                        "in_use_by":      in_use_by,
+                    })
+
+            expired       = [c for c in certs if c["status"] == "EXPIRED"]
+            expiring_soon = [c for c in certs if c["status"] == "EXPIRING_SOON"]
+            imported_no_auto = [c for c in certs if c["type"] == "IMPORTED"]
+            issues = sorted(
+                expired + expiring_soon,
+                key=lambda c: c["days_to_expiry"] if c["days_to_expiry"] is not None else -999,
+            )
+
+            self._mark("acm_certificates", True)
+            return {
+                "total":            len(certs),
+                "expired":          expired,
+                "expiring_soon":    expiring_soon,
+                "imported_no_auto": imported_no_auto,
+                "issues":           issues,
+                "all":              certs,
+                "has_issues":       bool(expired or expiring_soon),
+            }
+        except Exception:  # noqa: BLE001
+            self._mark("acm_certificates", False)
+            return {"total": 0, "issues": [], "has_issues": False}

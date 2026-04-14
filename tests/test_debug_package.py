@@ -152,6 +152,113 @@ class TestResolver:
         assert steps[1] == "STEP B"
 
 
+# ─── ACM certificate fetcher ────────────────────────────────────────────────
+
+class TestAcmCertificates:
+    def _make_session(self, certs: list[dict]):
+        """Return a mock boto3 session whose ACM client returns the given certs."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+        from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+
+        acm = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"CertificateSummaryList": [
+            {"CertificateArn": c["arn"]} for c in certs
+        ]}]
+        acm.get_paginator.return_value = paginator
+
+        def _describe(CertificateArn):  # noqa: N803
+            cert = next(c for c in certs if c["arn"] == CertificateArn)
+            return {"Certificate": {
+                "DomainName":               cert["domain"],
+                "SubjectAlternativeNames":  cert.get("sans", []),
+                "Type":                     cert["type"],
+                "NotAfter":                 cert.get("expiry"),
+                "InUseBy":                  cert.get("in_use_by", []),
+            }}
+
+        acm.describe_certificate.side_effect = _describe
+        session = MagicMock()
+        session.client.return_value = acm
+        return session
+
+    def test_expired_cert_flagged(self):
+        from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+        from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+        past = datetime.now(timezone.utc) - timedelta(days=5)
+        session = self._make_session([{
+            "arn": "arn:aws:acm:us-east-1:123:certificate/abc",
+            "domain": "api.example.com",
+            "type": "IMPORTED",
+            "expiry": past,
+            "in_use_by": ["arn:aws:elasticloadbalancing:::loadbalancer/app/payments-alb/x"],
+        }])
+        result = DebugFetcher(session).acm_certificates()
+        assert result["has_issues"] is True
+        assert len(result["expired"]) == 1
+        assert result["expired"][0]["domain"] == "api.example.com"
+        assert result["expired"][0]["status"] == "EXPIRED"
+
+    def test_expiring_soon_cert_flagged(self):
+        from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+        from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+        soon = datetime.now(timezone.utc) + timedelta(days=10)
+        session = self._make_session([{
+            "arn": "arn:aws:acm:us-east-1:123:certificate/def",
+            "domain": "checkout.example.com",
+            "type": "AMAZON_ISSUED",
+            "expiry": soon,
+            "in_use_by": [],
+        }])
+        result = DebugFetcher(session).acm_certificates()
+        assert result["has_issues"] is True
+        assert len(result["expiring_soon"]) == 1
+        assert result["expiring_soon"][0]["status"] == "EXPIRING_SOON"
+
+    def test_imported_not_expiring_flagged_as_no_auto_renew(self):
+        from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+        from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+        future = datetime.now(timezone.utc) + timedelta(days=200)
+        session = self._make_session([{
+            "arn": "arn:aws:acm:us-east-1:123:certificate/ghi",
+            "domain": "internal.example.com",
+            "type": "IMPORTED",
+            "expiry": future,
+            "in_use_by": [],
+        }])
+        result = DebugFetcher(session).acm_certificates()
+        assert result["has_issues"] is False   # not expiring, not expired
+        assert len(result["imported_no_auto"]) == 1
+        assert result["imported_no_auto"][0]["status"] == "IMPORTED_NO_AUTO_RENEW"
+        assert result["imported_no_auto"][0]["auto_renew"] is False
+
+    def test_amazon_issued_valid_cert_ok(self):
+        from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+        from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+        future = datetime.now(timezone.utc) + timedelta(days=300)
+        session = self._make_session([{
+            "arn": "arn:aws:acm:us-east-1:123:certificate/jkl",
+            "domain": "www.example.com",
+            "type": "AMAZON_ISSUED",
+            "expiry": future,
+            "in_use_by": ["arn:aws:cloudfront::123:distribution/ABC"],
+        }])
+        result = DebugFetcher(session).acm_certificates()
+        assert result["has_issues"] is False
+        assert result["all"][0]["status"] == "OK"
+        assert result["all"][0]["auto_renew"] is True
+
+    def test_no_session_returns_empty(self):
+        from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+        result = DebugFetcher(None).acm_certificates()
+        assert result["has_issues"] is False
+        assert result["total"] == 0
+
+    def test_acm_expiry_check_in_all_sources(self):
+        from cloudctl.debug.planner import ALL_SOURCES  # noqa: PLC0415
+        assert "acm_expiry_check" in ALL_SOURCES
+
+
 # ─── deployment_detector ────────────────────────────────────────────────────
 
 class TestDeploymentDetector:
