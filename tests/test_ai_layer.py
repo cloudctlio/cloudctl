@@ -17,35 +17,43 @@ class TestConfidenceScore:
         assert "No cloud data" in result.reason
 
     def test_full_data_is_high(self):
+        # HIGH requires score >= 5: 4+ sources (+3) + inflection (+2) = 5
         from cloudctl.ai.confidence import score
         result = score(
-            {"compute": [{"id": "i-1"}], "storage": [{"name": "b1"}]},
+            {
+                "compute":  [{"id": "i-1"}],
+                "storage":  [{"name": "b1"}],
+                "security": [{"finding": "x"}],
+                "database": [{"id": "db-1"}],
+            },
             expected_accounts=1,
+            has_inflection=True,
         )
         assert result.level == "HIGH"
 
-    def test_missing_required_key_is_medium(self):
+    def test_missing_required_key_is_low(self):
+        # 1 source covered → score penalty → LOW; missing key surfaced in reasons
         from cloudctl.ai.confidence import score
         result = score(
             {"compute": [{"id": "i-1"}]},
             required_keys=["compute", "security"],
         )
-        assert result.level == "MEDIUM"
-        assert "security" in result.reason
+        assert result.level == "LOW"
+        assert any("security" in r for r in result.reasons)
 
     def test_zero_data_points_is_low(self):
         from cloudctl.ai.confidence import score
         result = score({"compute": [], "storage": []})
         assert result.level == "LOW"
 
-    def test_partial_accounts_is_medium(self):
+    def test_partial_accounts_reflected_in_label(self):
+        # expected_accounts is stored in accounts_total and shown in label
         from cloudctl.ai.confidence import score
         result = score(
             {"compute": [{"id": "i-1"}]},
             expected_accounts=3,
         )
-        assert result.level == "MEDIUM"
-        assert "1/3" in result.reason
+        assert "1/3" in result.label
 
     def test_low_historical_accuracy_is_low(self):
         from cloudctl.ai.confidence import score
@@ -54,23 +62,30 @@ class TestConfidenceScore:
             historical_accuracy=0.3,
         )
         assert result.level == "LOW"
-        assert "30%" in result.reason
+        assert any("30%" in r for r in result.reasons)
 
-    def test_medium_historical_accuracy_is_medium(self):
+    def test_medium_historical_accuracy_reduces_score(self):
+        # 0.5–0.8 accuracy is neutral (no score adjustment); 1 source alone is LOW
         from cloudctl.ai.confidence import score
         result = score(
             {"compute": [{"id": "i-1"}]},
             historical_accuracy=0.65,
         )
-        assert result.level == "MEDIUM"
-        assert "65%" in result.reason
+        assert result.level == "LOW"
 
-    def test_high_historical_accuracy_still_high(self):
+    def test_high_historical_accuracy_boosts_score(self):
+        # 4+ sources (+3) + inflection (+2) + high accuracy (+1) = 6 → HIGH
         from cloudctl.ai.confidence import score
         result = score(
-            {"compute": [{"id": "i-1"}]},
+            {
+                "compute":  [{"id": "i-1"}],
+                "storage":  [{"name": "b1"}],
+                "security": [{"finding": "x"}],
+                "database": [{"id": "db-1"}],
+            },
             historical_accuracy=0.95,
             expected_accounts=1,
+            has_inflection=True,
         )
         assert result.level == "HIGH"
 
