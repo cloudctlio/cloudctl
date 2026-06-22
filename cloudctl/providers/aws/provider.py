@@ -1689,11 +1689,25 @@ class AWSProvider(CloudProvider):
                 context["alb_resource_map"] = alb_map
                 break
 
+        # ── ECS service + task definition ─────────────────────────────────────
+        for hint in all_hints[:3]:
+            svc_details = fetcher.ecs_service_details(cluster_hint=hint, service_hint=hint)
+            if svc_details:
+                context["ecs_service_details"] = svc_details
+                break
+
         # ── ECS stopped tasks ─────────────────────────────────────────────────
         for hint in all_hints[:3]:
             evts = fetcher.ecs_stopped_tasks(cluster=hint, service=hint)
             if evts:
                 context.setdefault("ecs_stopped", []).extend(evts)
+                break
+
+        # ── Lambda function config ─────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            fn_cfg = fetcher.lambda_function_config(function_name=hint)
+            if fn_cfg:
+                context["lambda_function_config"] = fn_cfg
                 break
 
         # ── Lambda REPORT metrics ─────────────────────────────────────────────
@@ -1722,6 +1736,97 @@ class AWSProvider(CloudProvider):
             evts = fetcher.codepipeline_for_resource(resource_name=hint)
             if evts:
                 context.setdefault("codepipeline_resource", []).extend(evts)
+                break
+
+        # ── RDS instance config ───────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            rds_cfg = fetcher.rds_instance_config(db_hint=hint)
+            if rds_cfg:
+                context["rds_instance_config"] = rds_cfg
+                break
+
+        # ── Aurora cluster config ─────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            aurora_cfg = fetcher.aurora_cluster_config(cluster_hint=hint)
+            if aurora_cfg:
+                context["aurora_cluster_config"] = aurora_cfg
+                break
+
+        # ── Redshift cluster config ───────────────────────────────────────────
+        for hint in all_hints[:3]:
+            rs_cfg = fetcher.redshift_cluster_config(cluster_hint=hint)
+            if rs_cfg:
+                context["redshift_cluster_config"] = rs_cfg
+                break
+
+        # ── Glue job config ───────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            glue_cfg = fetcher.glue_job_config(job_hint=hint)
+            if glue_cfg:
+                context["glue_job_config"] = glue_cfg
+                break
+
+        # ── API Gateway config ────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            apigw_cfg = fetcher.api_gateway_config(api_hint=hint)
+            if apigw_cfg:
+                context["api_gateway_config"] = apigw_cfg
+                break
+
+        # ── DynamoDB table config ─────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            ddb_cfg = fetcher.dynamodb_table_config(table_hint=hint)
+            if ddb_cfg:
+                context["dynamodb_table_config"] = ddb_cfg
+                break
+
+        # ── S3 bucket config ──────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            s3_cfg = fetcher.s3_bucket_config(bucket_hint=hint)
+            if s3_cfg:
+                context["s3_bucket_config"] = s3_cfg
+                break
+
+        # ── Secrets Manager config ────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            sm_cfg = fetcher.secrets_manager_config(secret_hint=hint)
+            if sm_cfg:
+                context["secrets_manager_config"] = sm_cfg
+                break
+
+        # ── SNS topic config ──────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            sns_cfg = fetcher.sns_topic_config(topic_hint=hint)
+            if sns_cfg:
+                context["sns_topic_config"] = sns_cfg
+                break
+
+        # ── SQS queue config ──────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            sqs_cfg = fetcher.sqs_queue_config(queue_hint=hint)
+            if sqs_cfg:
+                context["sqs_queue_config"] = sqs_cfg
+                break
+
+        # ── ElastiCache config ────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            ec_cfg = fetcher.elasticache_config(cluster_hint=hint)
+            if ec_cfg:
+                context["elasticache_config"] = ec_cfg
+                break
+
+        # ── Kinesis stream config ─────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            kin_cfg = fetcher.kinesis_stream_config(stream_hint=hint)
+            if kin_cfg:
+                context["kinesis_stream_config"] = kin_cfg
+                break
+
+        # ── EKS cluster config ────────────────────────────────────────────────
+        for hint in all_hints[:3]:
+            eks_cfg = fetcher.eks_cluster_config(cluster_hint=hint)
+            if eks_cfg:
+                context["eks_cluster_config"] = eks_cfg
                 break
 
         # ── VPC flow log REJECT records ───────────────────────────────────────

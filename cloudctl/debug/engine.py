@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from cloudctl.debug.planner import plan_sources, extract_service_hints
-from cloudctl.debug.correlator import build_timeline, summarise
+from cloudctl.debug.correlator import build_timeline, build_rich_timeline, summarise
 from cloudctl.debug.resolver import build_steps
 from cloudctl.debug.renderer import (
     diagnosing_banner,
@@ -83,6 +83,7 @@ def run(
     # ── 3. Correlate ──────────────────────────────────────────────
     timeline       = build_timeline(all_evidence)
     timeline_dicts = summarise(timeline)
+    rich_tl        = build_rich_timeline(context)
 
     # ── 4. Analyze ────────────────────────────────────────────────
     from cloudctl.ai.factory import get_ai, is_ai_configured  # noqa: PLC0415
@@ -108,6 +109,9 @@ def run(
     cs = confidence_mod.score(
         context,
         historical_accuracy=hist_acc,
+        timeline_pattern=rich_tl.pattern,
+        timeline_correlation=rich_tl.correlation_pct,
+        has_inflection=rich_tl.inflection_point is not None,
     )
 
     # ── 5. Detect deployment method ───────────────────────────────

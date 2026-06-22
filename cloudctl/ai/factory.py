@@ -165,23 +165,29 @@ def parse_debug_response(text: str) -> DebugResponse:
 
 class BedrockAI(BaseAI):
     def __init__(self, cfg: ConfigManager):
-        import boto3  # noqa: PLC0415
         region  = cfg.get("ai.bedrock_region") or "us-east-1"
         profile = cfg.get("ai.bedrock_profile") or None
         tier    = cfg.get(_CFG_TIER) or "sonnet"
-        self._model = cfg.get("ai.bedrock_model") or _BEDROCK_MODELS.get(tier, _BEDROCK_MODELS["sonnet"])
-        session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-        self._client = session.client("bedrock-runtime", region_name=region)
+        self._model   = cfg.get("ai.bedrock_model") or _BEDROCK_MODELS.get(tier, _BEDROCK_MODELS["sonnet"])
+        self._region  = region
+        self._profile = profile
+        # Client is created lazily in _invoke so SSO credentials are always fresh
 
     def _invoke(self, prompt: str, system: str | None = None) -> str:
         import json  # noqa: PLC0415
+        import boto3  # noqa: PLC0415
+        # Create a fresh session each invocation so SSO tokens are always current.
+        # For long debug runs the data-fetch phase can take 2+ minutes, which
+        # exhausts short-lived SSO access tokens if the client is pre-built.
+        session = boto3.Session(profile_name=self._profile) if self._profile else boto3.Session()
+        client = session.client("bedrock-runtime", region_name=self._region)
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 4096,
             "system": system or _SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}],
         })
-        resp = self._client.invoke_model(modelId=self._model, body=body)
+        resp = client.invoke_model(modelId=self._model, body=body)
         data = json.loads(resp["body"].read())
         return data["content"][0]["text"]
 

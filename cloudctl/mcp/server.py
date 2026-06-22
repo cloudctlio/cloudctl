@@ -22,7 +22,110 @@ _ACCOUNT_PROP = {"type": "string", "description": "AWS profile / Azure subscript
 _REGION_PROP  = {"type": "string", "description": "Cloud region to query"}
 _DRY_RUN_PROP = {"type": "boolean", "description": "Dry run — describe action without executing", "default": True}
 
+_SERVICE_TYPES = [
+    "ecs", "lambda", "rds", "aurora", "redshift", "glue",
+    "api_gateway", "dynamodb", "s3", "secrets_manager",
+    "sns", "sqs", "elasticache", "kinesis", "eks",
+]
+
 _TOOLS = [
+    # ── Debug tools ────────────────────────────────────────────
+    {
+        "name": "cloudctl_debug_incident",
+        "description": (
+            "Diagnose a cloud infrastructure incident end-to-end. "
+            "Fetches logs, events, metrics, CloudTrail, and full service configs "
+            "for ECS, Lambda, RDS, Aurora, Redshift, Glue, API Gateway, DynamoDB, "
+            "S3, Secrets Manager, SNS, SQS, ElastiCache, Kinesis, and EKS. "
+            "Correlates a causal timeline, scores confidence, then calls Bedrock "
+            "Claude for root cause, evidence, and remediation steps. "
+            "Example: 'ECS service payment-api has 5xx errors since 14:30 UTC'"
+        ),
+        "inputSchema": _schema(
+            "Run full incident diagnosis",
+            {
+                "symptom":     {"type": "string",  "description": "Plain-English incident description including service name, error type, and approximate time."},
+                "aws_profile": {"type": "string",  "description": "AWS CLI profile name (optional)"},
+                "region":      {"type": "string",  "description": "AWS region (default: us-east-1)", "default": "us-east-1"},
+                "minutes":     {"type": "integer", "description": "Look-back window in minutes (default: 60)", "default": 60},
+            },
+            required=["symptom"],
+        ),
+    },
+    {
+        "name": "cloudctl_get_service_config",
+        "description": (
+            "Fetch detailed configuration for a specific AWS service resource. "
+            "Returns full config: VPC, SGs, encryption, scaling, capacity, env var keys. "
+            f"Supported: {', '.join(_SERVICE_TYPES)}."
+        ),
+        "inputSchema": _schema(
+            "Fetch service configuration",
+            {
+                "service_type":  {"type": "string",  "enum": _SERVICE_TYPES, "description": "AWS service type"},
+                "resource_hint": {"type": "string",  "description": "Name or partial name of the resource"},
+                "aws_profile":   {"type": "string",  "description": "AWS CLI profile name (optional)"},
+                "region":        {"type": "string",  "description": "AWS region (default: us-east-1)", "default": "us-east-1"},
+            },
+            required=["service_type", "resource_hint"],
+        ),
+    },
+    {
+        "name": "cloudctl_tail_logs",
+        "description": (
+            "Tail recent CloudWatch log events for a resource. "
+            "Auto-discovers the log group from the resource hint. "
+            "Works for Lambda, ECS, API Gateway, RDS, and any CW Logs resource."
+        ),
+        "inputSchema": _schema(
+            "Tail CloudWatch logs",
+            {
+                "resource_hint": {"type": "string",  "description": "Resource name or log group prefix"},
+                "minutes":       {"type": "integer", "description": "How many minutes back (default: 30)", "default": 30},
+                "max_events":    {"type": "integer", "description": "Max events to return (default: 200)", "default": 200},
+                "aws_profile":   {"type": "string",  "description": "AWS CLI profile name (optional)"},
+                "region":        {"type": "string",  "description": "AWS region (default: us-east-1)", "default": "us-east-1"},
+            },
+            required=["resource_hint"],
+        ),
+    },
+    {
+        "name": "cloudctl_get_event_timeline",
+        "description": (
+            "Build a correlated event timeline for an incident. "
+            "Fetches CloudTrail, CW Logs, ECS events, Lambda logs, RDS events, "
+            "and CodePipeline. Detects the inflection point and correlation pct. "
+            "Quick timeline without full AI analysis."
+        ),
+        "inputSchema": _schema(
+            "Get correlated event timeline",
+            {
+                "symptom":     {"type": "string",  "description": "Incident description (used to extract service hints)"},
+                "minutes":     {"type": "integer", "description": "Look-back window in minutes (default: 60)", "default": 60},
+                "aws_profile": {"type": "string",  "description": "AWS CLI profile name (optional)"},
+                "region":      {"type": "string",  "description": "AWS region (default: us-east-1)", "default": "us-east-1"},
+            },
+            required=["symptom"],
+        ),
+    },
+    {
+        "name": "cloudctl_list_resources",
+        "description": (
+            "List all resource names for a given AWS service type. "
+            "Use this when cloudctl_get_service_config returns found=false — "
+            "it shows exact names you can pass as resource_hint. "
+            f"Supported: {', '.join(_SERVICE_TYPES)}."
+        ),
+        "inputSchema": _schema(
+            "List AWS resources by service type",
+            {
+                "service_type": {"type": "string", "enum": _SERVICE_TYPES, "description": "AWS service type to list"},
+                "aws_profile":  {"type": "string", "description": "AWS CLI profile name (optional)"},
+                "region":       {"type": "string", "description": "AWS region (default: us-east-1)", "default": "us-east-1"},
+            },
+            required=["service_type"],
+        ),
+    },
     # ── Infra tools ────────────────────────────────────────────
     {
         "name": "cloudctl_list_accounts",
@@ -114,6 +217,47 @@ _TOOLS = [
 
 def _dispatch(tool_name: str, args: dict) -> str:
     """Route a tool call to the appropriate handler."""
+    # ── Debug ──
+    if tool_name == "cloudctl_debug_incident":
+        from cloudctl.mcp.tools.debug import debug_incident  # noqa: PLC0415
+        return debug_incident(
+            symptom=args["symptom"],
+            profile=args.get("aws_profile") or None,
+            region=args.get("region", "us-east-1"),
+            minutes=int(args.get("minutes", 60)),
+        )
+    if tool_name == "cloudctl_get_service_config":
+        from cloudctl.mcp.tools.debug import get_service_config  # noqa: PLC0415
+        return get_service_config(
+            service_type=args["service_type"],
+            resource_hint=args["resource_hint"],
+            profile=args.get("aws_profile") or None,
+            region=args.get("region", "us-east-1"),
+        )
+    if tool_name == "cloudctl_tail_logs":
+        from cloudctl.mcp.tools.debug import tail_logs  # noqa: PLC0415
+        return tail_logs(
+            resource_hint=args["resource_hint"],
+            minutes=int(args.get("minutes", 30)),
+            profile=args.get("aws_profile") or None,
+            region=args.get("region", "us-east-1"),
+            max_events=int(args.get("max_events", 200)),
+        )
+    if tool_name == "cloudctl_get_event_timeline":
+        from cloudctl.mcp.tools.debug import get_event_timeline  # noqa: PLC0415
+        return get_event_timeline(
+            symptom=args["symptom"],
+            profile=args.get("aws_profile") or None,
+            region=args.get("region", "us-east-1"),
+            minutes=int(args.get("minutes", 60)),
+        )
+    if tool_name == "cloudctl_list_resources":
+        from cloudctl.mcp.tools.debug import list_resources  # noqa: PLC0415
+        return list_resources(
+            service_type=args["service_type"],
+            profile=args.get("aws_profile") or None,
+            region=args.get("region", "us-east-1"),
+        )
     # ── Infra ──
     if tool_name == "cloudctl_list_accounts":
         from cloudctl.mcp.tools.infra import list_accounts  # noqa: PLC0415
@@ -201,8 +345,9 @@ async def main() -> None:
         try:
             result = _dispatch(name, arguments or {})
         except Exception as e:
-            log.exception("Tool %s failed", name)
-            result = json.dumps({"error": str(e)})
+            # Log type only — exception messages can contain ARNs, account IDs, credentials
+            log.error("Tool %s failed: %s", name, type(e).__name__)
+            result = json.dumps({"error": "Tool execution failed"})
         return [TextContent(type="text", text=result)]
 
     async with stdio_server() as (read_stream, write_stream):
@@ -212,3 +357,7 @@ async def main() -> None:
 def sync_main() -> None:
     """Synchronous entry point for the cloudctl-mcp script."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    sync_main()

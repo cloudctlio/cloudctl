@@ -144,6 +144,77 @@ def _render_explain(finding) -> None:
     console.print()
 
 
+def _render_agent_result(d: dict, account: Optional[str]) -> None:
+    """Render the structured JSON from debug_incident_agent in the same table format."""
+    from datetime import timezone as _tz
+    ts       = datetime.now(_tz.utc).strftime("%Y-%m-%d  %H:%M UTC")
+    cs_level = d.get("confidence", "MEDIUM")
+    cs_color = {"HIGH": "green", "MEDIUM": "yellow", "LOW": "red"}.get(cs_level, "dim")
+
+    t = Table(box=box.DOUBLE, show_header=False, padding=(0, 1), expand=True, show_edge=True)
+    t.add_column(style="bold cyan", no_wrap=True, min_width=14, max_width=14)
+    t.add_column(overflow="fold")
+
+    t.add_row(
+        Text(""),
+        Text(f"INCIDENT ANALYSIS  ·  {ts}  ·  account: {account or '—'}", style="bold"),
+        end_section=True,
+    )
+    t.add_row(
+        Text("STATUS"),
+        Text(f"DEGRADED  —  {d.get('root_cause', '?')[:80]}", style="bold red"),
+        end_section=True,
+    )
+    t.add_row(
+        Text("CONFIDENCE"),
+        Text(cs_level, style=f"bold {cs_color}"),
+        end_section=True,
+    )
+    t.add_row(
+        Text("ROOT CAUSE"),
+        Markdown((d.get("root_cause") or "").strip()),
+        end_section=True,
+    )
+
+    deploy = d.get("deployment_source", "")
+    if deploy and deploy not in ("unknown", ""):
+        t.add_row(
+            Text("DEPLOYED VIA"),
+            Text(deploy.upper(), style="bold blue"),
+            end_section=True,
+        )
+    iac_hint = d.get("iac_file_hint", "")
+    if iac_hint:
+        t.add_row(
+            Text("IaC HINT"),
+            Text(iac_hint),
+            end_section=True,
+        )
+
+    evidence = d.get("evidence") or []
+    if evidence:
+        t.add_row(
+            Text("EVIDENCE"),
+            Markdown("\n".join(f"- {e}" for e in evidence)),
+            end_section=True,
+        )
+
+    fix_steps = d.get("remediation_steps") or []
+    if fix_steps:
+        t.add_row(
+            Text("FIX NOW", style="bold cyan"),
+            Text("\n".join(fix_steps)),
+            end_section=True,
+        )
+
+    investigated = d.get("resources_investigated") or []
+    src_str = "  +  ".join(investigated) if investigated else "—"
+    t.add_row(Text(""), Text(f"investigated: {src_str}", style="dim"))
+
+    console.print(t)
+    console.print()
+
+
 @app.command()
 def debug_issue(
     issue:    str           = typer.Argument(..., metavar="TEXT", help="Describe what's wrong, e.g. 'payments returning 502s'"),
@@ -162,6 +233,26 @@ def debug_issue(
         False, "--explain",
         help="Show how cloudctl fetched and analyzed this incident after the result",
     ),
+    agent:    bool          = typer.Option(
+        False, "--agent",
+        help="Agentic mode: Claude drives the investigation, fetching only what it needs",
+    ),
+    verdict:  Optional[str] = typer.Option(
+        None, "--verdict", "-v",
+        help="Skip prompt and feed verdict into the learning loop. One of: y, n, partial, skip. Use in CI/scripts.",
+    ),
+    correction: Optional[str] = typer.Option(
+        None, "--correction",
+        help="Free-text correction passed to live_learner when --verdict is n or partial.",
+    ),
+    resolve: bool = typer.Option(
+        False, "--resolve",
+        help="After a confirmed diagnosis, run the resolution agent to create a fix branch and PR.",
+    ),
+    iac_root: Optional[str] = typer.Option(
+        None, "--iac-root",
+        help="Local path to IaC root directory (Terraform / CDK). Required when --resolve is set.",
+    ),
 ) -> None:
     """
     Debug a cloud infrastructure issue using AI analysis of real data.
@@ -173,6 +264,139 @@ def debug_issue(
       cloudctl debug "something broke" --dry-run
     """
     cfg = require_init()
+
+    if agent:
+        import json as _json  # noqa: PLC0415
+        from cloudctl.mcp.tools.debug import debug_incident_agent  # noqa: PLC0415
+        from cloudctl.ai.live_learner  import (  # noqa: PLC0415
+            on_confirmed_correct, on_confirmed_wrong, best_pattern_match,
+        )
+
+        console.print(f"\n[bold]Agent investigating:[/bold] {issue}")
+        with console.status("[dim]Claude is driving the investigation...[/dim]"):
+            raw, all_fetched = debug_incident_agent(
+                symptom=issue,
+                profile=account,
+                region=region or "us-east-1",
+            )
+        d = _json.loads(raw)
+
+        # Surface guardrail errors before rendering
+        if "error" in d and len(d) == 1:
+            warn(d["error"])
+            raise typer.Exit(1)
+
+        # Fixture-match boost: when this symptom has been confirmed correct N>=3
+        # times before with the agent's chosen evidence sources, promote
+        # MEDIUM -> HIGH. Stops the agent self-rating MEDIUM on incidents we've
+        # already validated repeatedly.
+        match = best_pattern_match(issue)
+        if match and match.get("confirmed_count", 0) >= 3:
+            agent_sources = {k.split(":", 1)[0] for k in (all_fetched or {})}
+            pattern_sources = set(match.get("data_sources") or [])
+            if pattern_sources and pattern_sources.issubset(agent_sources):
+                if d.get("confidence") == "MEDIUM":
+                    d["confidence"] = "HIGH"
+                    d.setdefault("evidence", []).append(
+                        f"Pattern '{match['pattern_id']}' confirmed correct "
+                        f"{match['confirmed_count']}x previously; confidence promoted."
+                    )
+
+        _render_agent_result(d, account)
+
+        # y/n confirmation — feeds the live learning loop
+        if verdict is not None:
+            verdict_value = verdict.strip().lower()
+        else:
+            try:
+                verdict_value = console.input(
+                    "[dim]Was this diagnosis correct? [[bold]y[/bold]/[bold]n[/bold]/partial/skip]: [/dim]"
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                verdict_value = "skip"
+
+        if verdict_value in ("y", "yes"):
+            meta = d.get("_guardrails", {})
+            on_confirmed_correct(
+                query=issue,
+                fetched_data=all_fetched,
+                agent_output=d,
+                account_id=meta.get("account_id") or account or "",
+                region=region or "us-east-1",
+                turns_used=meta.get("turns_used", 0),
+            )
+
+            # ── Resolution agent ───────────────────────────────────────────
+            if resolve:
+                import os as _os  # noqa: PLC0415
+                from cloudctl.ai.resolution_agent import run as _resolve_run  # noqa: PLC0415
+
+                root = iac_root
+                if not root:
+                    try:
+                        root = console.input(
+                            "[dim]IaC root directory (Terraform/CDK): [/dim]"
+                        ).strip()
+                    except (EOFError, KeyboardInterrupt):
+                        root = ""
+                if not root or not _os.path.isdir(root):
+                    warn("--iac-root is required and must be a valid directory. Skipping resolution.")
+                else:
+                    base = "develop"
+                    try:
+                        base = console.input(
+                            "[dim]Base branch for fix PR [develop]: [/dim]"
+                        ).strip() or "develop"
+                    except (EOFError, KeyboardInterrupt):
+                        pass
+
+                    console.print(f"\n[bold]Resolution agent starting (base: {base})...[/bold]")
+                    with console.status("[dim]Claude is drafting the fix...[/dim]"):
+                        result = _resolve_run(
+                            diagnosis=d,
+                            iac_root=root,
+                            base_branch=base,
+                            profile=account,
+                            region=region or "us-east-1",
+                        )
+
+                    status = result.get("status", "error")
+                    if status == "success":
+                        console.print(
+                            f"\n[green bold]PR created:[/green bold] {result.get('pr_url', '—')}"
+                        )
+                        console.print(f"  Branch:  {result.get('branch', '—')}")
+                        console.print(f"  Summary: {result.get('pr_summary', '—')}")
+                    elif status == "manual_required":
+                        console.print(
+                            "\n[yellow bold]Manual steps required "
+                            "(resource is not IaC-managed):[/yellow bold]"
+                        )
+                        for step in result.get("manual_steps", []):
+                            console.print(f"  - {step}")
+                    else:
+                        warn(f"Resolution failed: {result.get('detail', 'unknown error')}")
+
+        elif verdict_value in ("n", "no", "partial"):
+            if correction is not None:
+                correction_value = correction.strip()
+            else:
+                try:
+                    correction_value = console.input(
+                        "[dim]What was wrong or missing? (Enter to skip): [/dim]"
+                    ).strip()
+                except (EOFError, KeyboardInterrupt):
+                    correction_value = ""
+            meta = d.get("_guardrails", {})
+            on_confirmed_wrong(
+                query=issue,
+                fetched_data=all_fetched,
+                agent_output=d,
+                user_correction=correction_value,
+                account_id=meta.get("account_id") or account or "",
+            )
+
+        return
 
     if dry_run:
         from cloudctl.debug.planner import plan_sources, extract_service_hints  # noqa: PLC0415
