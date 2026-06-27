@@ -818,17 +818,13 @@ class DebugFetcher:
 
     # ── P2.6: SQS DLQ discovery ───────────────────────────────────────────────
 
-    def sqs_with_dlq(self, queue_name_hint: str) -> list[dict]:
-        """Discover SQS queues matching a hint and fetch metrics including DLQ depth.
-
-        Returns events for: queue depth, DLQ depth (if configured), message age.
-        """
+    def sqs_with_dlq(self, queue_name: str) -> list[dict]:
+        """Discover SQS queues matching a name and fetch metrics including DLQ depth."""
         if not self._session:
             return []
         try:
             sqs    = self._session.client("sqs")
-            cw     = self._session.client("cloudwatch")
-            queues = sqs.list_queues(QueueNamePrefix=queue_name_hint).get("QueueUrls", [])[:5]
+            queues = sqs.list_queues(QueueNamePrefix=queue_name).get("QueueUrls", [])[:5]
             events = []
             for url in queues:
                 attrs = sqs.get_queue_attributes(
@@ -1274,6 +1270,7 @@ class DebugFetcher:
         "secret", "password", "passwd", "token", "api_key", "apikey",
         "auth", "credential", "private_key", "access_key", "signing_key",
         "encryption_key", "client_secret", "db_pass", "database_pass",
+        "incident_mode",
     )
 
     def _redact(self, key: str, value: str) -> str:
@@ -1416,7 +1413,7 @@ class DebugFetcher:
 
     # ── Lambda function configuration ─────────────────────────────────────────
 
-    def lambda_function_config(self, function_name: str) -> dict:
+    def lambda_function_config(self, resource_name: str) -> dict:
         """Fetch Lambda function configuration: runtime, memory, timeout, VPC,
         env vars (redacted), layers, concurrency, and last invocation errors.
 
@@ -1434,11 +1431,11 @@ class DebugFetcher:
             lmb = self._session.client("lambda")
 
             # Resolve function name — try direct, then list with hint match
-            fn_name = function_name
+            fn_name = resource_name
             try:
                 resp = lmb.list_functions(MaxItems=50)
                 fns  = resp.get("Functions", [])
-                matched = [f for f in fns if function_name.lower() in f["FunctionName"].lower()]
+                matched = [f for f in fns if resource_name.lower() in f["FunctionName"].lower()]
                 if matched:
                     fn_name = matched[0]["FunctionName"]
             except Exception:  # noqa: BLE001
@@ -1489,6 +1486,31 @@ class DebugFetcher:
             except Exception:  # noqa: BLE001
                 pass
 
+            # Event source mappings (Kafka/MSK, DynamoDB Streams, Kinesis,
+            # SQS) — when the poller's own auth fails, the function is never
+            # invoked at all, so logs are empty and this is the ONLY place
+            # AWS surfaces the real failure (StateTransitionReason /
+            # LastProcessingResult, e.g. "PROBLEM: Service is unable to ...").
+            # Missing this fetcher field was a confirmed root cause of a
+            # wrong diagnosis (msk_auth_denied, 2026-06-24): the agent had no
+            # tool-visible way to see the ESM was failing auth and guessed
+            # "cluster was recreated" from circumstantial metric timing.
+            try:
+                mappings = lmb.list_event_source_mappings(FunctionName=fn_name).get("EventSourceMappings", [])
+                result["event_source_mappings"] = [
+                    {
+                        "uuid":                     m.get("UUID"),
+                        "event_source_arn":         m.get("EventSourceArn"),
+                        "state":                    m.get("State"),
+                        "state_transition_reason":  m.get("StateTransitionReason"),
+                        "last_processing_result":   m.get("LastProcessingResult"),
+                        "last_modified":            str(m.get("LastModified", "")),
+                    }
+                    for m in mappings
+                ]
+            except Exception:  # noqa: BLE001
+                pass
+
             return result
         except Exception:  # noqa: BLE001
             return {}
@@ -1497,7 +1519,7 @@ class DebugFetcher:
     # RDS / Aurora
     # ─────────────────────────────────────────────────────────────────────────
 
-    def rds_instance_config(self, db_hint: str) -> dict:
+    def rds_instance_config(self, resource_name: str) -> dict:
         """Fetch RDS / Aurora instance config — engine, version, SGs, parameter group, events."""
         if not self._session:
             return {}
@@ -1506,8 +1528,8 @@ class DebugFetcher:
             instances = rds.describe_db_instances().get("DBInstances", [])
             matched = [
                 i for i in instances
-                if db_hint.lower() in i.get("DBInstanceIdentifier", "").lower()
-                or db_hint.lower() in i.get("DBName", "").lower()
+                if resource_name.lower() in i.get("DBInstanceIdentifier", "").lower()
+                or resource_name.lower() in i.get("DBName", "").lower()
             ]
             if not matched:
                 return {}
@@ -1578,7 +1600,7 @@ class DebugFetcher:
         except Exception:  # noqa: BLE001
             return {}
 
-    def aurora_cluster_config(self, cluster_hint: str) -> dict:
+    def aurora_cluster_config(self, resource_name: str) -> dict:
         """Fetch Aurora cluster config — members, failover, serverless scaling."""
         if not self._session:
             return {}
@@ -1587,8 +1609,8 @@ class DebugFetcher:
             clusters = rds.describe_db_clusters().get("DBClusters", [])
             matched = [
                 c for c in clusters
-                if cluster_hint.lower() in c.get("DBClusterIdentifier", "").lower()
-                or cluster_hint.lower() in c.get("DatabaseName", "").lower()
+                if resource_name.lower() in c.get("DBClusterIdentifier", "").lower()
+                or resource_name.lower() in c.get("DatabaseName", "").lower()
             ]
             if not matched:
                 return {}
@@ -1635,7 +1657,7 @@ class DebugFetcher:
     # Redshift
     # ─────────────────────────────────────────────────────────────────────────
 
-    def redshift_cluster_config(self, cluster_hint: str) -> dict:
+    def redshift_cluster_config(self, resource_name: str) -> dict:
         """Fetch Redshift cluster config — node type, count, VPC, encryption, maintenance."""
         if not self._session:
             return {}
@@ -1644,8 +1666,8 @@ class DebugFetcher:
             clusters = rs.describe_clusters().get("Clusters", [])
             matched = [
                 c for c in clusters
-                if cluster_hint.lower() in c.get("ClusterIdentifier", "").lower()
-                or cluster_hint.lower() in c.get("DBName", "").lower()
+                if resource_name.lower() in c.get("ClusterIdentifier", "").lower()
+                or resource_name.lower() in c.get("DBName", "").lower()
             ]
             if not matched:
                 return {}
@@ -1700,14 +1722,14 @@ class DebugFetcher:
     # Glue
     # ─────────────────────────────────────────────────────────────────────────
 
-    def glue_job_config(self, job_hint: str) -> dict:
+    def glue_job_config(self, resource_name: str) -> dict:
         """Fetch Glue job config — worker type, capacity, connections, bookmarks, last runs."""
         if not self._session:
             return {}
         try:
             glue = self._session.client("glue")
             jobs = glue.get_jobs(MaxResults=50).get("Jobs", [])
-            matched = [j for j in jobs if job_hint.lower() in j.get("Name", "").lower()]
+            matched = [j for j in jobs if resource_name.lower() in j.get("Name", "").lower()]
             if not matched:
                 return {}
             job = matched[0]
@@ -1753,7 +1775,7 @@ class DebugFetcher:
     # API Gateway
     # ─────────────────────────────────────────────────────────────────────────
 
-    def api_gateway_config(self, api_hint: str) -> dict:
+    def api_gateway_config(self, resource_name: str) -> dict:
         """Fetch API Gateway config — HTTP API v2 + REST v1, stages, throttling, CORS."""
         if not self._session:
             return {}
@@ -1762,8 +1784,8 @@ class DebugFetcher:
             apis_v2 = apiv2.get_apis().get("Items", [])
             matched_v2 = [
                 a for a in apis_v2
-                if api_hint.lower() in a.get("Name", "").lower()
-                or api_hint.lower() in a.get("ApiId", "").lower()
+                if resource_name.lower() in a.get("Name", "").lower()
+                or resource_name.lower() in a.get("ApiId", "").lower()
             ]
             if matched_v2:
                 api = matched_v2[0]
@@ -1795,13 +1817,34 @@ class DebugFetcher:
             apis_v1 = apiv1.get_rest_apis().get("items", [])
             matched_v1 = [
                 a for a in apis_v1
-                if api_hint.lower() in a.get("name", "").lower()
-                or api_hint.lower() in a.get("id", "").lower()
+                if resource_name.lower() in a.get("name", "").lower()
+                or resource_name.lower() in a.get("id", "").lower()
             ]
             if matched_v1:
                 api = matched_v1[0]
                 api_id = api["id"]
                 stages = apiv1.get_stages(restApiId=api_id).get("item", [])
+                integrations = []
+                try:
+                    resources = apiv1.get_resources(restApiId=api_id, limit=50).get("items", [])
+                    for r in resources:
+                        r_id = r.get("id")
+                        path = r.get("path")
+                        methods = r.get("resourceMethods", {}).keys()
+                        for m in methods:
+                            try:
+                                integ = apiv1.get_integration(restApiId=api_id, resourceId=r_id, httpMethod=m)
+                                integrations.append({
+                                    "resource_path": path,
+                                    "http_method": m,
+                                    "type": integ.get("type"),
+                                    "uri": integ.get("uri"),
+                                    "timeout_ms": integ.get("timeoutInMillis")
+                                })
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 return {
                     "type":        "REST_API_V1",
                     "api_id":      api_id,
@@ -1810,12 +1853,16 @@ class DebugFetcher:
                     "stages": [
                         {
                             "name":            s.get("stageName"),
+                            "web_acl_arn":     s.get("webAclArn"),
                             "logging_level":   s.get("methodSettings", {}).get("*/*", {}).get("loggingLevel", "OFF"),
                             "metrics_enabled": s.get("methodSettings", {}).get("*/*", {}).get("metricsEnabled", False),
                             "caching_enabled": s.get("cacheClusterEnabled", False),
+                            "throttling_burst": s.get("methodSettings", {}).get("*/*", {}).get("throttlingBurstLimit"),
+                            "throttling_rate":  s.get("methodSettings", {}).get("*/*", {}).get("throttlingRateLimit"),
                         }
                         for s in stages[:5]
                     ],
+                    "integrations": integrations,
                 }
             return {}
         except Exception:  # noqa: BLE001
@@ -1825,14 +1872,14 @@ class DebugFetcher:
     # DynamoDB
     # ─────────────────────────────────────────────────────────────────────────
 
-    def dynamodb_table_config(self, table_hint: str) -> dict:
+    def dynamodb_table_config(self, resource_name: str) -> dict:
         """Fetch DynamoDB table config — billing, capacity, GSIs, TTL, streams."""
         if not self._session:
             return {}
         try:
             ddb = self._session.client("dynamodb")
             tables = ddb.list_tables().get("TableNames", [])
-            matched = [t for t in tables if table_hint.lower() in t.lower()]
+            matched = [t for t in tables if resource_name.lower() in t.lower()]
             if not matched:
                 return {}
             table_name = matched[0]
@@ -1882,14 +1929,14 @@ class DebugFetcher:
     # S3
     # ─────────────────────────────────────────────────────────────────────────
 
-    def s3_bucket_config(self, bucket_hint: str) -> dict:
+    def s3_bucket_config(self, resource_name: str) -> dict:
         """Fetch S3 bucket config — versioning, encryption, CORS, lifecycle, notifications."""
         if not self._session:
             return {}
         try:
             s3 = self._session.client("s3")
             buckets = [b["Name"] for b in s3.list_buckets().get("Buckets", [])]
-            matched = [b for b in buckets if bucket_hint.lower() in b.lower()]
+            matched = [b for b in buckets if resource_name.lower() in b.lower()]
             if not matched:
                 return {}
             bucket = matched[0]
@@ -1954,7 +2001,7 @@ class DebugFetcher:
     # Secrets Manager
     # ─────────────────────────────────────────────────────────────────────────
 
-    def secrets_manager_config(self, secret_hint: str) -> dict:
+    def secrets_manager_config(self, resource_name: str) -> dict:
         """Fetch Secrets Manager metadata — rotation, KMS key.  Secret VALUE is never fetched."""
         if not self._session:
             return {}
@@ -1963,20 +2010,20 @@ class DebugFetcher:
             secrets = sm.list_secrets(MaxResults=50).get("SecretList", [])
             matched = [
                 s for s in secrets
-                if secret_hint.lower() in s.get("Name", "").lower()
-                or secret_hint.lower() in s.get("ARN", "").lower()
+                if resource_name.lower() in s.get("Name", "").lower()
+                or resource_name.lower() in s.get("ARN", "").lower()
             ]
             if not matched:
                 return {}
             secret = matched[0]
             result: dict = {
+                "rotation_enabled":    secret.get("RotationEnabled", False),
+                "rotation_lambda_arn": secret.get("RotationLambdaARN", ""),
+                "rotation_rules":      secret.get("RotationRules", {}),
                 "secret_name":         secret.get("Name"),
                 "secret_arn":          secret.get("ARN"),
                 "description":         secret.get("Description", ""),
                 "kms_key_id":          secret.get("KmsKeyId", "aws/secretsmanager"),
-                "rotation_enabled":    secret.get("RotationEnabled", False),
-                "rotation_lambda_arn": secret.get("RotationLambdaARN", ""),
-                "rotation_rules":      secret.get("RotationRules", {}),
                 "last_rotated_date":   str(secret.get("LastRotatedDate", "")),
                 "last_accessed_date":  str(secret.get("LastAccessedDate", "")),
                 "last_changed_date":   str(secret.get("LastChangedDate", "")),
@@ -1993,6 +2040,18 @@ class DebugFetcher:
                 ]
             except Exception:  # noqa: BLE001
                 pass
+            # Fetch resource-based policy — an explicit Deny here blocks access
+            # even when the caller's IAM identity policy grants the action.
+            try:
+                rp = sm.get_resource_policy(SecretId=secret["ARN"])
+                policy_str = rp.get("ResourcePolicy", "")
+                if policy_str:
+                    import json as _json
+                    result["resource_policy"] = _json.loads(policy_str)
+                else:
+                    result["resource_policy"] = None
+            except Exception:  # noqa: BLE001
+                result["resource_policy"] = None
             return result
         except Exception:  # noqa: BLE001
             return {}
@@ -2001,14 +2060,14 @@ class DebugFetcher:
     # SNS
     # ─────────────────────────────────────────────────────────────────────────
 
-    def sns_topic_config(self, topic_hint: str) -> dict:
+    def sns_topic_config(self, resource_name: str) -> dict:
         """Fetch SNS topic attributes and subscription counts."""
         if not self._session:
             return {}
         try:
             sns = self._session.client("sns")
             topics = sns.list_topics().get("Topics", [])
-            matched = [t for t in topics if topic_hint.lower() in t.get("TopicArn", "").lower()]
+            matched = [t for t in topics if resource_name.lower() in t.get("TopicArn", "").lower()]
             if not matched:
                 return {}
             topic_arn = matched[0]["TopicArn"]
@@ -2030,7 +2089,7 @@ class DebugFetcher:
                     {
                         "protocol":         s.get("Protocol"),
                         "subscription_arn": s.get("SubscriptionArn"),
-                        "endpoint_hint":    s.get("Endpoint", "")[:60],
+                        "endpoint":         s.get("Endpoint", "")[:60],
                     }
                     for s in subs[:10]
                 ]
@@ -2044,7 +2103,7 @@ class DebugFetcher:
     # SQS
     # ─────────────────────────────────────────────────────────────────────────
 
-    def sqs_queue_config(self, queue_hint: str) -> dict:
+    def sqs_queue_config(self, resource_name: str) -> dict:
         """Fetch SQS queue config — visibility timeout, DLQ, delay, encryption, message counts."""
         if not self._session:
             return {}
@@ -2052,7 +2111,7 @@ class DebugFetcher:
             import json as _json
             sqs = self._session.client("sqs")
             queues = sqs.list_queues(QueueNamePrefix="").get("QueueUrls", [])
-            matched = [q for q in queues if queue_hint.lower() in q.lower()]
+            matched = [q for q in queues if resource_name.lower() in q.lower()]
             if not matched:
                 return {}
             queue_url = matched[0]
@@ -2110,7 +2169,7 @@ class DebugFetcher:
     # ElastiCache
     # ─────────────────────────────────────────────────────────────────────────
 
-    def elasticache_config(self, cluster_hint: str) -> dict:
+    def elasticache_config(self, resource_name: str) -> dict:
         """Fetch ElastiCache config — Redis replication group or Memcached cluster."""
         if not self._session:
             return {}
@@ -2119,8 +2178,8 @@ class DebugFetcher:
             rgs = ec.describe_replication_groups().get("ReplicationGroups", [])
             matched_rg = [
                 r for r in rgs
-                if cluster_hint.lower() in r.get("ReplicationGroupId", "").lower()
-                or cluster_hint.lower() in r.get("Description", "").lower()
+                if resource_name.lower() in r.get("ReplicationGroupId", "").lower()
+                or resource_name.lower() in r.get("Description", "").lower()
             ]
             if matched_rg:
                 rg = matched_rg[0]
@@ -2164,7 +2223,7 @@ class DebugFetcher:
                         pass
                 return result
             clusters = ec.describe_cache_clusters(ShowCacheNodeInfo=True).get("CacheClusters", [])
-            matched_mc = [c for c in clusters if cluster_hint.lower() in c.get("CacheClusterId", "").lower()]
+            matched_mc = [c for c in clusters if resource_name.lower() in c.get("CacheClusterId", "").lower()]
             if matched_mc:
                 cls = matched_mc[0]
                 return {
@@ -2188,14 +2247,14 @@ class DebugFetcher:
     # Kinesis
     # ─────────────────────────────────────────────────────────────────────────
 
-    def kinesis_stream_config(self, stream_hint: str) -> dict:
+    def kinesis_stream_config(self, resource_name: str) -> dict:
         """Fetch Kinesis Data Streams config — shard count, retention, encryption, consumers."""
         if not self._session:
             return {}
         try:
             kin = self._session.client("kinesis")
             streams = kin.list_streams().get("StreamNames", [])
-            matched = [s for s in streams if stream_hint.lower() in s.lower()]
+            matched = [s for s in streams if resource_name.lower() in s.lower()]
             if not matched:
                 return {}
             stream_name = matched[0]
@@ -2228,14 +2287,14 @@ class DebugFetcher:
     # Step Functions
     # ─────────────────────────────────────────────────────────────────────────
 
-    def stepfunctions_config(self, machine_hint: str) -> dict:
+    def stepfunctions_config(self, resource_name: str) -> dict:
         """Fetch Step Functions state machine config and recent execution summary."""
         if not self._session:
             return {}
         try:
             sf = self._session.client("stepfunctions")
             machines = sf.list_state_machines().get("stateMachines", [])
-            matched = [m for m in machines if machine_hint.lower() in m.get("name", "").lower()]
+            matched = [m for m in machines if resource_name.lower() in m.get("name", "").lower()]
             if not matched:
                 return {}
             arn = matched[0]["stateMachineArn"]
@@ -2270,14 +2329,14 @@ class DebugFetcher:
     # OpenSearch
     # ─────────────────────────────────────────────────────────────────────────
 
-    def opensearch_config(self, domain_hint: str) -> dict:
+    def opensearch_config(self, resource_name: str) -> dict:
         """Fetch OpenSearch domain config and cluster health."""
         if not self._session:
             return {}
         try:
             os_client = self._session.client("opensearch")
             domains = os_client.list_domain_names().get("DomainNames", [])
-            matched = [d for d in domains if domain_hint.lower() in d.get("DomainName", "").lower()]
+            matched = [d for d in domains if resource_name.lower() in d.get("DomainName", "").lower()]
             if not matched:
                 return {}
             name = matched[0]["DomainName"]
@@ -2314,20 +2373,43 @@ class DebugFetcher:
     # EventBridge
     # ─────────────────────────────────────────────────────────────────────────
 
-    def eventbridge_rule_config(self, rule_hint: str) -> dict:
-        """Fetch EventBridge rule config — schedule/pattern, targets, state."""
+    def eventbridge_rule_config(self, resource_name: str) -> dict:
+        """Fetch EventBridge rule config — schedule/pattern, targets, state.
+
+        list_rules()/list_targets_by_rule() without EventBusName only search
+        the DEFAULT bus — a rule on a custom bus is invisible otherwise.
+        Confirmed the hard way (streaming-etl, eventbridge_rule_misfire,
+        2026-06-24): the agent concluded "no rule exists" with HIGH
+        confidence because its only rule lived on a custom bus this call
+        never looked at. Enumerate every bus, not just the default one.
+        """
         if not self._session:
             return {}
         try:
             eb = self._session.client("events")
-            rules = eb.list_rules(NamePrefix=rule_hint[:64]).get("Rules", [])
-            if not rules:
-                rules = [r for r in eb.list_rules().get("Rules", [])
-                         if rule_hint.lower() in r.get("Name", "").lower()]
-            if not rules:
+            bus_names = ["default"] + [
+                b["Name"] for b in eb.list_event_buses().get("EventBuses", [])
+                if b["Name"] != "default"
+            ]
+
+            rule = None
+            event_bus_name = "default"
+            for bus in bus_names:
+                try:
+                    candidates = eb.list_rules(NamePrefix=resource_name[:64], EventBusName=bus).get("Rules", [])
+                    if not candidates:
+                        candidates = [r for r in eb.list_rules(EventBusName=bus).get("Rules", [])
+                                      if resource_name.lower() in r.get("Name", "").lower()]
+                except Exception:  # noqa: BLE001
+                    candidates = []
+                if candidates:
+                    rule = candidates[0]
+                    event_bus_name = bus
+                    break
+
+            if rule is None:
                 return {}
-            rule = rules[0]
-            targets = eb.list_targets_by_rule(Rule=rule["Name"]).get("Targets", [])
+            targets = eb.list_targets_by_rule(Rule=rule["Name"], EventBusName=event_bus_name).get("Targets", [])
             return {
                 "name":               rule.get("Name"),
                 "state":              rule.get("State"),
@@ -2350,7 +2432,7 @@ class DebugFetcher:
     # CloudFront
     # ─────────────────────────────────────────────────────────────────────────
 
-    def cloudfront_config(self, dist_hint: str) -> dict:
+    def cloudfront_config(self, resource_name: str) -> dict:
         """Fetch CloudFront distribution config — origins, behaviors, cache policy."""
         if not self._session:
             return {}
@@ -2358,9 +2440,9 @@ class DebugFetcher:
             cf = self._session.client("cloudfront")
             items = cf.list_distributions().get("DistributionList", {}).get("Items", [])
             matched = [d for d in items
-                       if dist_hint.lower() in d.get("Id", "").lower()
-                       or dist_hint.lower() in d.get("DomainName", "").lower()
-                       or any(dist_hint.lower() in a.lower()
+                       if resource_name.lower() in d.get("Id", "").lower()
+                       or resource_name.lower() in d.get("DomainName", "").lower()
+                       or any(resource_name.lower() in a.lower()
                               for a in d.get("Aliases", {}).get("Items", []))]
             if not matched:
                 return {}
@@ -2396,14 +2478,14 @@ class DebugFetcher:
     # ALB (ELBv2)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def alb_config(self, lb_hint: str) -> dict:
+    def alb_config(self, resource_name: str) -> dict:
         """Fetch ALB/NLB config — listeners, target groups, health."""
         if not self._session:
             return {}
         try:
             elb = self._session.client("elbv2")
             lbs = elb.describe_load_balancers().get("LoadBalancers", [])
-            matched = [lb for lb in lbs if lb_hint.lower() in lb.get("LoadBalancerName", "").lower()]
+            matched = [lb for lb in lbs if resource_name.lower() in lb.get("LoadBalancerName", "").lower()]
             if not matched:
                 return {}
             lb = matched[0]
@@ -2444,14 +2526,14 @@ class DebugFetcher:
     # SSM Parameter Store
     # ─────────────────────────────────────────────────────────────────────────
 
-    def ssm_parameter_config(self, param_hint: str) -> dict:
+    def ssm_parameter_config(self, resource_name: str) -> dict:
         """Fetch SSM Parameter Store parameter metadata (no secret values)."""
         if not self._session:
             return {}
         try:
             ssm = self._session.client("ssm")
             params = ssm.describe_parameters(
-                ParameterFilters=[{"Key": "Name", "Option": "Contains", "Values": [param_hint]}],
+                ParameterFilters=[{"Key": "Name", "Option": "Contains", "Values": [resource_name]}],
                 MaxResults=10,
             ).get("Parameters", [])
             if not params:
@@ -2474,7 +2556,7 @@ class DebugFetcher:
     # ACM
     # ─────────────────────────────────────────────────────────────────────────
 
-    def acm_certificate_config(self, domain_hint: str) -> dict:
+    def acm_certificate_config(self, resource_name: str) -> dict:
         """Fetch ACM certificate status, expiry, and validation state."""
         if not self._session:
             return {}
@@ -2482,7 +2564,7 @@ class DebugFetcher:
             acm = self._session.client("acm")
             certs = acm.list_certificates().get("CertificateSummaryList", [])
             matched = [c for c in certs
-                       if domain_hint.lower() in c.get("DomainName", "").lower()]
+                       if resource_name.lower() in c.get("DomainName", "").lower()]
             if not matched:
                 return {}
             arn = matched[0]["CertificateArn"]
@@ -2509,14 +2591,14 @@ class DebugFetcher:
     # MSK (Managed Kafka)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def msk_cluster_config(self, cluster_hint: str) -> dict:
+    def msk_cluster_config(self, resource_name: str) -> dict:
         """Fetch MSK cluster config — broker type, version, storage, monitoring."""
         if not self._session:
             return {}
         try:
             msk = self._session.client("kafka")
             clusters = msk.list_clusters_v2().get("ClusterInfoList", [])
-            matched = [c for c in clusters if cluster_hint.lower() in c.get("ClusterName", "").lower()]
+            matched = [c for c in clusters if resource_name.lower() in c.get("ClusterName", "").lower()]
             if not matched:
                 return {}
             c = matched[0]
@@ -2543,14 +2625,14 @@ class DebugFetcher:
     # ECR
     # ─────────────────────────────────────────────────────────────────────────
 
-    def ecr_repository_config(self, repo_hint: str) -> dict:
+    def ecr_repository_config(self, resource_name: str) -> dict:
         """Fetch ECR repository config — image count, scan findings, lifecycle policy."""
         if not self._session:
             return {}
         try:
             ecr = self._session.client("ecr")
             repos = ecr.describe_repositories().get("repositories", [])
-            matched = [r for r in repos if repo_hint.lower() in r.get("repositoryName", "").lower()]
+            matched = [r for r in repos if resource_name.lower() in r.get("repositoryName", "").lower()]
             if not matched:
                 return {}
             repo = matched[0]
@@ -2572,6 +2654,14 @@ class DebugFetcher:
                 ))
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                policy_resp = ecr.get_repository_policy(repositoryName=name)
+                import json as _json
+                result["repository_policy"] = _json.loads(policy_resp.get("policyText", "{}"))
+            except ecr.exceptions.RepositoryPolicyNotFoundException:
+                result["repository_policy"] = None
+            except Exception:  # noqa: BLE001
+                pass
             return result
         except Exception:  # noqa: BLE001
             return {}
@@ -2580,14 +2670,14 @@ class DebugFetcher:
     # Route 53
     # ─────────────────────────────────────────────────────────────────────────
 
-    def route53_zone_config(self, zone_hint: str) -> dict:
+    def route53_zone_config(self, resource_name: str) -> dict:
         """Fetch Route53 hosted zone config and health check summary."""
         if not self._session:
             return {}
         try:
             r53 = self._session.client("route53")
             zones = r53.list_hosted_zones().get("HostedZones", [])
-            matched = [z for z in zones if zone_hint.lower() in z.get("Name", "").lower()]
+            matched = [z for z in zones if resource_name.lower() in z.get("Name", "").lower()]
             if not matched:
                 return {}
             z = matched[0]
@@ -2611,14 +2701,14 @@ class DebugFetcher:
     # CodePipeline
     # ─────────────────────────────────────────────────────────────────────────
 
-    def codepipeline_config(self, pipeline_hint: str) -> dict:
+    def codepipeline_config(self, resource_name: str) -> dict:
         """Fetch CodePipeline config and latest execution status."""
         if not self._session:
             return {}
         try:
             cp = self._session.client("codepipeline")
             pipelines = cp.list_pipelines().get("pipelines", [])
-            matched = [p for p in pipelines if pipeline_hint.lower() in p.get("name", "").lower()]
+            matched = [p for p in pipelines if resource_name.lower() in p.get("name", "").lower()]
             if not matched:
                 return {}
             name = matched[0]["name"]
@@ -2649,14 +2739,14 @@ class DebugFetcher:
     # SageMaker
     # ─────────────────────────────────────────────────────────────────────────
 
-    def sagemaker_endpoint_config(self, endpoint_hint: str) -> dict:
+    def sagemaker_endpoint_config(self, resource_name: str) -> dict:
         """Fetch SageMaker endpoint or training job config and status."""
         if not self._session:
             return {}
         try:
             sm = self._session.client("sagemaker")
             endpoints = sm.list_endpoints().get("Endpoints", [])
-            matched = [e for e in endpoints if endpoint_hint.lower() in e.get("EndpointName", "").lower()]
+            matched = [e for e in endpoints if resource_name.lower() in e.get("EndpointName", "").lower()]
             if matched:
                 ep = matched[0]
                 name = ep["EndpointName"]
@@ -2686,7 +2776,7 @@ class DebugFetcher:
                     pass
                 return result
             jobs = sm.list_training_jobs(MaxResults=20).get("TrainingJobSummaries", [])
-            matched_jobs = [j for j in jobs if endpoint_hint.lower() in j.get("TrainingJobName", "").lower()]
+            matched_jobs = [j for j in jobs if resource_name.lower() in j.get("TrainingJobName", "").lower()]
             if matched_jobs:
                 jname = matched_jobs[0]["TrainingJobName"]
                 jdesc = sm.describe_training_job(TrainingJobName=jname)
@@ -2707,14 +2797,14 @@ class DebugFetcher:
     # Bedrock Agent
     # ─────────────────────────────────────────────────────────────────────────
 
-    def bedrock_agent_config(self, agent_hint: str) -> dict:
+    def bedrock_agent_config(self, resource_name: str) -> dict:
         """Fetch Bedrock Agent config — foundation model, aliases, action groups."""
         if not self._session:
             return {}
         try:
             ba = self._session.client("bedrock-agent")
             agents = ba.list_agents().get("agentSummaries", [])
-            matched = [a for a in agents if agent_hint.lower() in a.get("agentName", "").lower()]
+            matched = [a for a in agents if resource_name.lower() in a.get("agentName", "").lower()]
             if not matched:
                 return {}
             agent_id = matched[0]["agentId"]
@@ -2745,6 +2835,14 @@ class DebugFetcher:
                 ]
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                kbs = ba.list_agent_knowledge_bases(agentId=agent_id, agentVersion="DRAFT").get("agentKnowledgeBaseSummaries", [])
+                result["knowledge_bases"] = [
+                    {"knowledge_base_id": kb.get("knowledgeBaseId"), "state": kb.get("knowledgeBaseState")}
+                    for kb in kbs
+                ]
+            except Exception:  # noqa: BLE001
+                pass
             return result
         except Exception:  # noqa: BLE001
             return {}
@@ -2753,14 +2851,14 @@ class DebugFetcher:
     # Bedrock Knowledge Base
     # ─────────────────────────────────────────────────────────────────────────
 
-    def bedrock_kb_config(self, kb_hint: str) -> dict:
+    def bedrock_kb_config(self, resource_name: str) -> dict:
         """Fetch Bedrock Knowledge Base config and data source sync status."""
         if not self._session:
             return {}
         try:
             ba = self._session.client("bedrock-agent")
             kbs = ba.list_knowledge_bases().get("knowledgeBaseSummaries", [])
-            matched = [kb for kb in kbs if kb_hint.lower() in kb.get("name", "").lower()]
+            matched = [kb for kb in kbs if resource_name.lower() in kb.get("name", "").lower()]
             if not matched:
                 return {}
             kb_id = matched[0]["knowledgeBaseId"]
@@ -2796,14 +2894,14 @@ class DebugFetcher:
     # Bedrock AgentCore
     # ─────────────────────────────────────────────────────────────────────────
 
-    def agentcore_config(self, store_hint: str) -> dict:
+    def agentcore_config(self, resource_name: str) -> dict:
         """Fetch Bedrock AgentCore memory store config."""
         if not self._session:
             return {}
         try:
             ac = self._session.client("bedrock-agentcore")
             stores = ac.list_memory_stores().get("memoryStoreSummaries", [])
-            matched = [s for s in stores if store_hint.lower() in s.get("memoryStoreId", "").lower()]
+            matched = [s for s in stores if resource_name.lower() in s.get("memoryStoreId", "").lower()]
             if not matched:
                 return {}
             store_id = matched[0]["memoryStoreId"]
@@ -2821,14 +2919,14 @@ class DebugFetcher:
     # EKS
     # ─────────────────────────────────────────────────────────────────────────
 
-    def eks_cluster_config(self, cluster_hint: str) -> dict:
+    def eks_cluster_config(self, resource_name: str) -> dict:
         """Fetch EKS cluster config — K8s version, VPC, logging, OIDC, add-ons, node groups."""
         if not self._session:
             return {}
         try:
             eks = self._session.client("eks")
             clusters = eks.list_clusters().get("clusters", [])
-            matched = [c for c in clusters if cluster_hint.lower() in c.lower()]
+            matched = [c for c in clusters if resource_name.lower() in c.lower()]
             if not matched:
                 return {}
             cluster_name  = matched[0]
@@ -2907,3 +3005,1367 @@ class DebugFetcher:
             return result
         except Exception:  # noqa: BLE001
             return {}
+
+    def waf_web_acl_config(self, resource_name: str) -> dict:
+        """Fetch details for a WAFv2 WebACL by name or ID hint."""
+        if not self._session:
+            return {}
+        try:
+            scopes = [
+                ("REGIONAL", self._session.region_name),
+                ("CLOUDFRONT", "us-east-1")
+            ]
+            for scope, region in scopes:
+                try:
+                    waf = self._session.client("wafv2", region_name=region)
+                    acls = waf.list_web_acls(Scope=scope).get("WebACLs", [])
+                    matched = [
+                        a for a in acls
+                        if resource_name.lower() in a.get("Name", "").lower()
+                        or resource_name.lower() in a.get("Id", "").lower()
+                    ]
+                    if matched:
+                        acl = matched[0]
+                        acl_id = acl["Id"]
+                        acl_name = acl["Name"]
+                        details = waf.get_web_acl(
+                            Name=acl_name,
+                            Scope=scope,
+                            Id=acl_id
+                        ).get("WebACL", {})
+                        return {
+                            "name": acl_name,
+                            "id": acl_id,
+                            "arn": acl.get("ARN"),
+                            "scope": scope,
+                            "region": region,
+                            "default_action": details.get("DefaultAction"),
+                            "rules": [
+                                {
+                                    "name": r.get("Name"),
+                                    "priority": r.get("Priority"),
+                                    "action": r.get("Action"),
+                                    "statement": r.get("Statement"),
+                                    "visibility_config": r.get("VisibilityConfig")
+                                }
+                                for r in details.get("Rules", [])
+                            ],
+                            "visibility_config": details.get("VisibilityConfig"),
+                            "capacity": details.get("Capacity")
+                        }
+                except Exception:
+                    pass
+            return {}
+        except Exception:
+            return {}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cognito User Pool
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def cognito_user_pool_config(self, resource_name: str) -> dict:
+        """Fetch Cognito User Pool config — Lambda trigger wiring, App Client
+        auth flows. Without this, the agent can see the trigger Lambdas
+        themselves (via the lambda fetcher) but has no way to see WHICH
+        triggers are actually wired to the pool, or whether an App Client's
+        explicit_auth_flows excludes a flow the symptom depends on — both
+        config-drift classes that produce no log/metric signal at all.
+        """
+        if not self._session:
+            return {}
+        try:
+            idp = self._session.client("cognito-idp")
+            pools = idp.list_user_pools(MaxResults=60).get("UserPools", [])
+            matched = [
+                p for p in pools
+                if resource_name.lower() in p.get("Name", "").lower()
+                or resource_name.lower() in p.get("Id", "").lower()
+            ]
+            if not matched:
+                return {}
+            pool_id = matched[0]["Id"]
+            pool = idp.describe_user_pool(UserPoolId=pool_id).get("UserPool", {})
+
+            clients = idp.list_user_pool_clients(UserPoolId=pool_id, MaxResults=60).get("UserPoolClients", [])
+            client_details = []
+            for c in clients:
+                try:
+                    detail = idp.describe_user_pool_client(
+                        UserPoolId=pool_id, ClientId=c["ClientId"],
+                    ).get("UserPoolClient", {})
+                    client_details.append({
+                        "client_id":            detail.get("ClientId"),
+                        "client_name":          detail.get("ClientName"),
+                        "explicit_auth_flows":  detail.get("ExplicitAuthFlows", []),
+                        "access_token_validity": detail.get("AccessTokenValidity"),
+                        "id_token_validity":     detail.get("IdTokenValidity"),
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+
+            return {
+                "pool_id":            pool_id,
+                "pool_name":          pool.get("Name"),
+                "arn":                pool.get("Arn"),
+                "status":             pool.get("Status"),
+                "mfa_configuration":  pool.get("MfaConfiguration"),
+                "lambda_config":      pool.get("LambdaConfig", {}),
+                "auto_verified_attributes": pool.get("AutoVerifiedAttributes", []),
+                "estimated_users":    pool.get("EstimatedNumberOfUsers"),
+                "app_clients":        client_details,
+            }
+        except Exception:  # noqa: BLE001
+            return {}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AppSync
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def appsync_api_config(self, resource_name: str) -> dict:
+        """Fetch AppSync GraphQL API config — auth mode(s), data source
+        service roles, and resolver mapping templates. Without this, a
+        resolver VTL bug or an auth-mode mismatch produces zero log/metric
+        signal the agent could find any other way — AppSync only logs
+        errors if request-level logging is explicitly enabled, and a
+        resolver returning a wrong-but-valid value (e.g. null) is
+        indistinguishable from "no data" without reading the template.
+        """
+        if not self._session:
+            return {}
+        try:
+            appsync = self._session.client("appsync")
+            apis = appsync.list_graphql_apis(maxResults=25).get("graphqlApis", [])
+            matched = [
+                a for a in apis
+                if resource_name.lower() in a.get("name", "").lower()
+                or resource_name.lower() in a.get("apiId", "").lower()
+            ]
+            if not matched:
+                return {}
+            api = matched[0]
+            api_id = api["apiId"]
+
+            data_sources = appsync.list_data_sources(apiId=api_id).get("dataSources", [])
+            ds_details = [
+                {
+                    "name":             ds.get("name"),
+                    "type":             ds.get("type"),
+                    "service_role_arn": ds.get("serviceRoleArn"),
+                    "dynamodb_table":   ds.get("dynamodbConfig", {}).get("tableName"),
+                }
+                for ds in data_sources
+            ]
+
+            resolvers = []
+            for type_name in ("Query", "Mutation"):
+                try:
+                    for r in appsync.list_resolvers(apiId=api_id, typeName=type_name).get("resolvers", []):
+                        resolvers.append({
+                            "type_name":        type_name,
+                            "field_name":       r.get("fieldName"),
+                            "data_source_name": r.get("dataSourceName"),
+                            "kind":             r.get("kind"),
+                            "request_mapping_template_len":  len(r.get("requestMappingTemplate") or ""),
+                            "response_mapping_template":      r.get("responseMappingTemplate"),
+                        })
+                except Exception:  # noqa: BLE001
+                    pass
+
+            api_keys = []
+            try:
+                for k in appsync.list_api_keys(apiId=api_id).get("apiKeys", []):
+                    api_keys.append({"id": k.get("id"), "expires": k.get("expires")})
+            except Exception:  # noqa: BLE001
+                pass
+
+            return {
+                "api_id":                          api_id,
+                "name":                            api.get("name"),
+                "authentication_type":             api.get("authenticationType"),
+                "additional_authentication_providers": [
+                    {
+                        "type": p.get("authenticationType"),
+                        "user_pool_id": p.get("userPoolConfig", {}).get("userPoolId"),
+                    }
+                    for p in api.get("additionalAuthenticationProviders", [])
+                ],
+                "data_sources":  ds_details,
+                "resolvers":     resolvers,
+                "api_keys":      api_keys,
+            }
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def batch_config(self, resource_name: str) -> dict:
+        """Fetch AWS Batch configuration — compute environments, job queues, job definitions, and recent jobs matching the resource name."""
+        if not self._session:
+            return {}
+        try:
+            batch = self._session.client("batch")
+
+            # 1. Compute Environments
+            envs = batch.describe_compute_environments().get("computeEnvironments", [])
+            matched_envs = [
+                e for e in envs
+                if resource_name.lower() in e.get("computeEnvironmentName", "").lower()
+                or resource_name.lower() in e.get("computeEnvironmentArn", "").lower()
+            ]
+            env_details = []
+            for env in matched_envs:
+                resources = env.get("computeResources", {})
+                env_details.append({
+                    "name":                  env.get("computeEnvironmentName"),
+                    "arn":                   env.get("computeEnvironmentArn"),
+                    "type":                  env.get("type"),
+                    "state":                 env.get("state"),
+                    "status":                env.get("status"),
+                    "status_reason":         env.get("statusReason", ""),
+                    "service_role":          env.get("serviceRole", ""),
+                    "compute_resources": {
+                        "type":               resources.get("type"),
+                        "max_vcpus":          resources.get("maxvCpus"),
+                        "min_vcpus":          resources.get("minvCpus"),
+                        "desired_vcpus":      resources.get("desiredvCpus"),
+                        "subnets":            resources.get("subnets", []),
+                        "security_group_ids": resources.get("securityGroupIds", []),
+                        "instance_types":     resources.get("instanceTypes", []),
+                    },
+                })
+
+            # 2. Job Queues
+            queues = batch.describe_job_queues().get("jobQueues", [])
+            matched_queues = [
+                q for q in queues
+                if resource_name.lower() in q.get("jobQueueName", "").lower()
+                or resource_name.lower() in q.get("jobQueueArn", "").lower()
+            ]
+            queue_details = []
+            for q in matched_queues:
+                queue_details.append({
+                    "name":     q.get("jobQueueName"),
+                    "arn":      q.get("jobQueueArn"),
+                    "state":    q.get("state"),
+                    "status":   q.get("status"),
+                    "priority": q.get("priority"),
+                    "compute_environment_order": [
+                        {
+                            "order":               item.get("order"),
+                            "compute_environment": item.get("computeEnvironment"),
+                        }
+                        for item in q.get("computeEnvironmentOrder", [])
+                    ],
+                })
+
+            # 3. Job Definitions
+            jds = batch.describe_job_definitions(status="ACTIVE").get("jobDefinitions", [])
+            matched_jds = [
+                j for j in jds
+                if resource_name.lower() in j.get("jobDefinitionName", "").lower()
+                or resource_name.lower() in j.get("jobDefinitionArn", "").lower()
+            ]
+
+            jd_by_name = {}
+            for jd in matched_jds:
+                name = jd.get("jobDefinitionName")
+                if name not in jd_by_name or jd.get("revision", 0) > jd_by_name[name].get("revision", 0):
+                    jd_by_name[name] = jd
+
+            jd_details = []
+            for jd in jd_by_name.values():
+                container = jd.get("containerProperties", {})
+                jd_details.append({
+                    "name":                   jd.get("jobDefinitionName"),
+                    "arn":                    jd.get("jobDefinitionArn"),
+                    "revision":               jd.get("revision"),
+                    "status":                 jd.get("status"),
+                    "type":                   jd.get("type"),
+                    "platform_capabilities":  jd.get("platformCapabilities", []),
+                    "image":                  container.get("image"),
+                    "command":                container.get("command", []),
+                    "execution_role_arn":     container.get("executionRoleArn", ""),
+                    "job_role_arn":           container.get("jobRoleArn", ""),
+                    "resource_requirements":  container.get("resourceRequirements", []),
+                    "environment": [
+                        {"name": e.get("name"), "value": e.get("value")}
+                        for e in container.get("environment", [])
+                    ],
+                    "log_configuration":      container.get("logConfiguration", {}),
+                    "network_configuration":  container.get("networkConfiguration", {}),
+                })
+
+            # 4. Recent Jobs
+            recent_jobs = []
+            for q in matched_queues:
+                q_name = q.get("jobQueueName")
+                q_arn = q.get("jobQueueArn")
+                try:
+                    job_ids = []
+                    for status in ("FAILED", "RUNNABLE", "RUNNING", "SUCCEEDED"):
+                        resp = batch.list_jobs(jobQueue=q_arn, jobStatus=status, maxResults=5)
+                        job_ids.extend(j["jobId"] for j in resp.get("jobSummaryList", []))
+                    if job_ids:
+                        jobs = batch.describe_jobs(jobs=job_ids[:10]).get("jobs", [])
+                        for j in jobs:
+                            recent_jobs.append({
+                                "job_queue":    q_name,
+                                "job_id":       j.get("jobId"),
+                                "job_name":     j.get("jobName"),
+                                "status":       j.get("status"),
+                                "status_reason": j.get("statusReason", ""),
+                                "created_at":   j.get("createdAt"),
+                                "started_at":   j.get("startedAt"),
+                                "stopped_at":   j.get("stoppedAt"),
+                                "log_stream":   j.get("container", {}).get("logStreamName", ""),
+                            })
+                except Exception:
+                    pass
+
+            if not (env_details or queue_details or jd_details or recent_jobs):
+                return {}
+
+            return {
+                "compute_environments": env_details,
+                "job_queues":           queue_details,
+                "job_definitions":      jd_details,
+                "recent_jobs":          recent_jobs,
+            }
+        except Exception:
+            return {}
+
+    def batch_jobs_recent(self, resource_name: str, limit: int = 10) -> list[dict]:
+        """List recent Batch jobs in a queue with their status and reason."""
+        if not self._session:
+            return []
+        try:
+            batch = self._session.client("batch")
+            queues = batch.describe_job_queues().get("jobQueues", [])
+            matched = [q for q in queues if resource_name.lower() in q.get("jobQueueName", "").lower()]
+            if not matched:
+                return []
+            queue_arn = matched[0]["jobQueueArn"]
+            job_ids: list[str] = []
+            for status in ("FAILED", "RUNNABLE", "RUNNING", "SUCCEEDED"):
+                resp = batch.list_jobs(jobQueue=queue_arn, jobStatus=status, maxResults=5)
+                job_ids.extend(j["jobId"] for j in resp.get("jobSummaryList", []))
+                if len(job_ids) >= limit:
+                    break
+            if not job_ids:
+                return []
+            jobs = batch.describe_jobs(jobs=job_ids[:limit]).get("jobs", [])
+            return [
+                {
+                    "job_id":       j.get("jobId"),
+                    "job_name":     j.get("jobName"),
+                    "status":       j.get("status"),
+                    "status_reason": j.get("statusReason", ""),
+                    "created_at":   j.get("createdAt"),
+                    "started_at":   j.get("startedAt"),
+                    "stopped_at":   j.get("stoppedAt"),
+                    "log_stream":   j.get("container", {}).get("logStreamName", ""),
+                }
+                for j in jobs
+            ]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def efs_filesystem_config(self, resource_name: str) -> dict:
+        """Fetch EFS filesystem config — mount targets, access points, security groups, POSIX settings."""
+        if not self._session:
+            return {}
+        try:
+            efs = self._session.client("efs")
+            ec2 = self._session.client("ec2")
+
+            filesystems = efs.describe_file_systems().get("FileSystems", [])
+            matched = [
+                fs for fs in filesystems
+                if resource_name.lower() in fs.get("FileSystemId", "").lower()
+                or resource_name.lower() in fs.get("Name", "").lower()
+                or any(
+                    resource_name.lower() in tag.get("Value", "").lower()
+                    for tag in fs.get("Tags", [])
+                    if tag.get("Key") == "Name"
+                )
+            ]
+            if not matched:
+                return {}
+            fs = matched[0]
+            fs_id = fs["FileSystemId"]
+
+            # Mount targets
+            mt_resp = efs.describe_mount_targets(FileSystemId=fs_id)
+            mount_targets = []
+            for mt in mt_resp.get("MountTargets", []):
+                mt_entry = {
+                    "mount_target_id":  mt.get("MountTargetId"),
+                    "subnet_id":        mt.get("SubnetId"),
+                    "availability_zone": mt.get("AvailabilityZoneName"),
+                    "lifecycle_state":  mt.get("LifeCycleState"),
+                    "ip_address":       mt.get("IpAddress"),
+                }
+                try:
+                    sg_resp = efs.describe_mount_target_security_groups(
+                        MountTargetId=mt["MountTargetId"]
+                    )
+                    sg_ids = sg_resp.get("SecurityGroups", [])
+                    mt_entry["security_groups"] = sg_ids
+                    # Fetch SG ingress rules to surface NFS port 2049 configuration
+                    if sg_ids:
+                        sgs = ec2.describe_security_groups(GroupIds=sg_ids).get("SecurityGroups", [])
+                        mt_entry["security_group_rules"] = [
+                            {
+                                "sg_id": sg.get("GroupId"),
+                                "sg_name": sg.get("GroupName"),
+                                "ingress": [
+                                    {
+                                        "protocol": r.get("IpProtocol"),
+                                        "from_port": r.get("FromPort"),
+                                        "to_port": r.get("ToPort"),
+                                        "source_sg": r.get("UserIdGroupPairs", [{}])[0].get("GroupId") if r.get("UserIdGroupPairs") else None,
+                                        "source_cidr": r.get("IpRanges", [{}])[0].get("CidrIp") if r.get("IpRanges") else None,
+                                    }
+                                    for r in sg.get("IpPermissions", [])
+                                ],
+                            }
+                            for sg in sgs
+                        ]
+                except Exception:  # noqa: BLE001
+                    pass
+                mount_targets.append(mt_entry)
+
+            # Access points
+            ap_resp = efs.describe_access_points(FileSystemId=fs_id)
+            access_points = []
+            for ap in ap_resp.get("AccessPoints", []):
+                root_dir = ap.get("RootDirectory", {})
+                creation_info = root_dir.get("CreationInfo", {})
+                posix_user = ap.get("PosixUser", {})
+                access_points.append({
+                    "access_point_id":  ap.get("AccessPointId"),
+                    "access_point_arn": ap.get("AccessPointArn"),
+                    "name": next(
+                        (t["Value"] for t in ap.get("Tags", []) if t["Key"] == "Name"), ""
+                    ),
+                    "lifecycle_state":  ap.get("LifeCycleState"),
+                    "posix_user": {
+                        "uid": posix_user.get("Uid"),
+                        "gid": posix_user.get("Gid"),
+                    },
+                    "root_directory": {
+                        "path":        root_dir.get("Path"),
+                        "owner_uid":   creation_info.get("OwnerUid"),
+                        "owner_gid":   creation_info.get("OwnerGid"),
+                        "permissions": creation_info.get("Permissions"),
+                    },
+                })
+
+            return {
+                "filesystem_id":       fs_id,
+                "name": fs.get("Name") or next(
+                    (t["Value"] for t in fs.get("Tags", []) if t["Key"] == "Name"), ""
+                ),
+                "lifecycle_state":     fs.get("LifeCycleState"),
+                "performance_mode":    fs.get("PerformanceMode"),
+                "throughput_mode":     fs.get("ThroughputMode"),
+                "provisioned_throughput_mibps": fs.get("ProvisionedThroughputInMibps"),
+                "encrypted":           fs.get("Encrypted"),
+                "kms_key_id":          fs.get("KmsKeyId", ""),
+                "size_in_bytes":       fs.get("SizeInBytes", {}).get("Value"),
+                "number_of_mount_targets": fs.get("NumberOfMountTargets"),
+                "mount_targets":       mount_targets,
+                "access_points":       access_points,
+            }
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def generic_resource_config(self, service_type: str, resource_name: str) -> dict:
+        """Fetch AWS resource config generically using Cloud Control API or Boto3 client reflection.
+        Enriches the returned config payload with ingress/egress rules for referenced Security Groups,
+        policy documents for referenced IAM Roles, key policies/rotation for referenced KMS Keys,
+        and subnet/VPC routing and CIDR settings.
+
+        Note: service_type should be formatted as the exact service namespace/prefix expected by the
+        AWS Resource Groups Tagging API (e.g. "kafka" for MSK, "elasticfilesystem" for EFS) rather
+        than generic shorthands.
+        """
+        import re
+        import json
+        from botocore import xform_name
+
+        if not self._session:
+            return {}
+
+        # 1. Resolve matching resource ARN via tagging API
+        arn = None
+        tags_dict = {}
+        try:
+            tagger = self._session.client("resourcegroupstaggingapi")
+            # Map shorthand service names to their ARN namespace used by the Tagging API.
+            # ResourceTypeFilters expects the ARN service prefix (e.g. "kafka" for MSK,
+            # "elasticfilesystem" for EFS) — not the console/CLI shorthand.
+            _ARN_NAMESPACE: dict[str, str] = {
+                "msk":            "kafka",
+                "opensearch":     "es",
+                "efs":            "elasticfilesystem",
+                "stepfunctions":  "states",
+                "step-functions": "states",
+                "alb":            "elasticloadbalancing",
+                "elb":            "elasticloadbalancing",
+                "waf":            "wafv2",
+                "cognito":        "cognito-idp",
+            }
+            tag_filter = _ARN_NAMESPACE.get(service_type, service_type)
+            resp = tagger.get_resources(ResourceTypeFilters=[tag_filter])
+            matched_items = []
+            for item in resp.get("ResourceTagMappingList", []):
+                item_arn = item.get("ResourceARN", "")
+                name_tag = next((t["Value"] for t in item.get("Tags", []) if t["Key"].lower() == "name"), "")
+                if (resource_name.lower() in item_arn.lower() or 
+                        resource_name.lower() in name_tag.lower()):
+                    matched_items.append(item)
+            
+            if matched_items:
+                best_match = matched_items[0]
+                arn = best_match["ResourceARN"]
+                tags_dict = {t["Key"]: t["Value"] for t in best_match.get("Tags", [])}
+        except Exception:
+            pass
+
+        # If resource name looks like an ARN directly, use it
+        if not arn and resource_name.startswith("arn:aws:"):
+            arn = resource_name
+
+        if not arn:
+            return {}
+
+        # 2. Convert ARN to CloudFormation TypeName
+        # Format: arn:aws:<service>:<region>:<account>:<resource_type>/<resource_id>
+        cfn_type = None
+        arn_parts = arn.split(":")
+        if len(arn_parts) >= 6:
+            svc_name = arn_parts[2]
+            res_part = arn_parts[5]
+            if "/" in res_part:
+                res_type = res_part.split("/")[0]
+            elif ":" in res_part:
+                res_type = res_part.split(":")[0]
+            else:
+                res_type = svc_name
+            
+            def to_pascal(s: str) -> str:
+                return "".join(word.capitalize() for word in s.replace("-", "_").split("_"))
+            
+            service_map = {
+                "mq": "AmazonMQ",
+                "apigateway": "ApiGateway",
+                "elasticsearch": "Elasticsearch",
+                "opensearch": "OpenSearchService",
+                "states": "StepFunctions",
+                "logs": "Logs",
+            }
+            svc_pascal = service_map.get(svc_name, to_pascal(svc_name))
+            type_pascal = to_pascal(res_type)
+            cfn_type = f"AWS::{svc_pascal}::{type_pascal}"
+
+        config_data = {}
+        fetch_method = "none"
+
+        # 3. Attempt Cloud Control API call
+        if cfn_type:
+            try:
+                cc = self._session.client("cloudcontrol")
+                cc_resp = cc.get_resource(TypeName=cfn_type, Identifier=arn)
+                res_desc = cc_resp.get("ResourceDescription", {})
+                props = json.loads(res_desc.get("Properties", "{}"))
+                if props:
+                    config_data = props
+                    fetch_method = "cloudcontrol"
+            except Exception:
+                pass
+
+        # 4. Fallback to Dynamic Boto3 Client Reflection
+        if not config_data and len(arn_parts) >= 6:
+            try:
+                svc_name = arn_parts[2]
+                res_part = arn_parts[5]
+                res_id = res_part.split("/")[-1] if "/" in res_part else res_part.split(":")[-1] if ":" in res_part else res_part
+                
+                client = self._session.client(svc_name)
+                ops = client.meta.service_model.operation_names
+                candidates = []
+                r_type_clean = (res_part.split("/")[0] if "/" in res_part else res_part.split(":")[0] if ":" in res_part else res_part).lower().rstrip("s")
+                for op in ops:
+                    op_lower = op.lower()
+                    if op_lower.startswith(("describe", "get")) and r_type_clean in op_lower:
+                        candidates.append(op)
+                
+                candidates.sort(key=len)
+                for op in candidates:
+                    op_model = client.meta.service_model.operation_model(op)
+                    input_shape = op_model.input_shape
+                    if not input_shape:
+                        continue
+                    
+                    param_name = None
+                    members = input_shape.members
+                    
+                    # Match ARN input
+                    for m in members:
+                        if "arn" in m.lower():
+                            param_name = m
+                            break
+                    
+                    # Match ID/Name input
+                    if not param_name:
+                        for m in members:
+                            m_lower = m.lower()
+                            if m_lower in ("id", "identifier", "name"):
+                                param_name = m
+                                break
+                            if r_type_clean in m_lower and ("id" in m_lower or "name" in m_lower):
+                                param_name = m
+                                break
+                    
+                    # Generic ID/Name fallback
+                    if not param_name:
+                        for m in members:
+                            m_lower = m.lower()
+                            if "id" in m_lower or "name" in m_lower:
+                                param_name = m
+                                break
+                    
+                    if param_name:
+                        try:
+                            func = getattr(client, xform_name(op))
+                            val_to_pass = arn if "arn" in param_name.lower() else res_id
+                            res = func(**{param_name: val_to_pass})
+                            if isinstance(res, dict):
+                                res.pop("ResponseMetadata", None)
+                                config_data = res
+                                fetch_method = "boto3_reflection"
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # If both failed, use tags as base config payload
+        if not config_data:
+            config_data = {
+                "resource_arn": arn,
+                "cfn_type": cfn_type,
+                "tags": tags_dict,
+                "note": "Configuration properties could not be described directly; showing metadata and tags.",
+            }
+            fetch_method = "tagging_api"
+        else:
+            if "tags" not in config_data:
+                config_data["tags"] = tags_dict
+
+        # 5. Restricted Dependency Enrichment
+        SG_RE = re.compile(r"^sg-[a-f0-9]+$")
+        SUBNET_RE = re.compile(r"^subnet-[a-f0-9]+$")
+        VPC_RE = re.compile(r"^vpc-[a-f0-9]+$")
+        ROLE_RE = re.compile(r"^arn:aws:iam::\d+:role/([\w\-+=,.@_/]+)$")
+        KMS_ARN_RE = re.compile(r"^arn:aws:kms:[a-z0-9\-]+:\d+:key/([a-f0-9\-]{36})$")
+        KMS_UUID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
+
+        found_sgs = set()
+        found_roles = set()
+        found_kms = set()
+        found_subnets = set()
+        found_vpcs = set()
+
+        def _scan(val):
+            if isinstance(val, str):
+                val_clean = val.strip()
+                if SG_RE.match(val_clean):
+                    found_sgs.add(val_clean)
+                elif SUBNET_RE.match(val_clean):
+                    found_subnets.add(val_clean)
+                elif VPC_RE.match(val_clean):
+                    found_vpcs.add(val_clean)
+                elif ROLE_RE.match(val_clean):
+                    found_roles.add(val_clean)
+                elif KMS_ARN_RE.match(val_clean) or KMS_UUID_RE.match(val_clean):
+                    found_kms.add(val_clean)
+            elif isinstance(val, dict):
+                for v in val.values():
+                    _scan(v)
+            elif isinstance(val, list):
+                for item in val:
+                    _scan(item)
+
+        _scan(config_data)
+
+        # Resolve Security Groups
+        sg_details = {}
+        if found_sgs:
+            try:
+                ec2 = self._session.client("ec2")
+                for sg_id in found_sgs:
+                    try:
+                        resp = ec2.describe_security_groups(GroupIds=[sg_id]).get("SecurityGroups", [])
+                        if resp:
+                            sg = resp[0]
+                            sg_details[sg_id] = {
+                                "group_name": sg.get("GroupName"),
+                                "vpc_id": sg.get("VpcId"),
+                                "ingress": [
+                                    {
+                                        "protocol": r.get("IpProtocol"),
+                                        "from_port": r.get("FromPort"),
+                                        "to_port": r.get("ToPort"),
+                                        "cidr_ips": [ip.get("CidrIp") for ip in r.get("IpRanges", []) if ip.get("CidrIp")],
+                                        "source_sgs": [pair.get("GroupId") for pair in r.get("UserIdGroupPairs", []) if pair.get("GroupId")],
+                                    }
+                                    for r in sg.get("IpPermissions", [])
+                                ],
+                                "egress": [
+                                    {
+                                        "protocol": r.get("IpProtocol"),
+                                        "from_port": r.get("FromPort"),
+                                        "to_port": r.get("ToPort"),
+                                        "cidr_ips": [ip.get("CidrIp") for ip in r.get("IpRanges", []) if ip.get("CidrIp")],
+                                        "dest_sgs": [pair.get("GroupId") for pair in r.get("UserIdGroupPairs", []) if pair.get("GroupId")],
+                                    }
+                                    for r in sg.get("IpPermissionsEgress", [])
+                                ],
+                            }
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Resolve IAM Roles
+        role_details = {}
+        if found_roles:
+            try:
+                iam = self._session.client("iam")
+                for role_arn in found_roles:
+                    try:
+                        m = ROLE_RE.match(role_arn)
+                        if m:
+                            role_name = m.group(1)
+                            if "/" in role_name:
+                                role_name = role_name.split("/")[-1]
+                            role_info = iam.get_role(RoleName=role_name).get("Role", {})
+                            role_policies = []
+                            try:
+                                inline_names = iam.list_role_policies(RoleName=role_name).get("PolicyNames", [])
+                                for p_name in inline_names[:3]:
+                                    p_doc = iam.get_role_policy(RoleName=role_name, PolicyName=p_name).get("PolicyDocument", {})
+                                    role_policies.append({"policy_name": p_name, "type": "inline", "document": p_doc})
+                            except Exception:
+                                pass
+                            try:
+                                attached = iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", [])
+                                for p in attached[:3]:
+                                    role_policies.append({"policy_name": p.get("PolicyName"), "policy_arn": p.get("PolicyArn"), "type": "attached"})
+                            except Exception:
+                                pass
+                            role_details[role_arn] = {
+                                "role_name": role_info.get("RoleName"),
+                                "assume_role_policy": role_info.get("AssumeRolePolicyDocument"),
+                                "policies": role_policies,
+                            }
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Resolve KMS Keys
+        kms_details = {}
+        if found_kms:
+            try:
+                kms = self._session.client("kms")
+                for kms_key in found_kms:
+                    try:
+                        desc = kms.describe_key(KeyId=kms_key).get("KeyMetadata", {})
+                        key_id = desc.get("KeyId")
+                        rotation_enabled = False
+                        try:
+                            rotation_enabled = kms.get_key_rotation_status(KeyId=key_id).get("KeyRotationEnabled", False)
+                        except Exception:
+                            pass
+                        policy = {}
+                        try:
+                            policy = json.loads(kms.get_key_policy(KeyId=key_id, PolicyName="default").get("Policy", "{}"))
+                        except Exception:
+                            pass
+                        kms_details[kms_key] = {
+                            "key_id": key_id,
+                            "arn": desc.get("Arn"),
+                            "enabled": desc.get("Enabled"),
+                            "state": desc.get("KeyState"),
+                            "key_usage": desc.get("KeyUsage"),
+                            "rotation_enabled": rotation_enabled,
+                            "policy": policy,
+                        }
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Resolve Subnets / VPCs
+        network_details = {}
+        if found_subnets or found_vpcs:
+            try:
+                ec2 = self._session.client("ec2")
+                for subnet_id in found_subnets:
+                    try:
+                        resp = ec2.describe_subnets(SubnetIds=[subnet_id]).get("Subnets", [])
+                        if resp:
+                            sub = resp[0]
+                            routes = []
+                            try:
+                                rt_resp = ec2.describe_route_tables(
+                                    Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}]
+                                ).get("RouteTables", [])
+                                if not rt_resp:
+                                    rt_resp = ec2.describe_route_tables(
+                                        Filters=[
+                                            {"Name": "vpc-id", "Values": [sub["VpcId"]]},
+                                            {"Name": "association.main", "Values": ["true"]},
+                                        ]
+                                    ).get("RouteTables", [])
+                                if rt_resp:
+                                    routes = [
+                                        {
+                                            "destination": r.get("DestinationCidrBlock"),
+                                            "gateway_id": r.get("GatewayId"),
+                                            "state": r.get("State"),
+                                        }
+                                        for r in rt_resp[0].get("Routes", [])
+                                    ]
+                            except Exception:
+                                pass
+                            network_details[subnet_id] = {
+                                "subnet_id": subnet_id,
+                                "vpc_id": sub.get("VpcId"),
+                                "cidr_block": sub.get("CidrBlock"),
+                                "availability_zone": sub.get("AvailabilityZone"),
+                                "available_ips": sub.get("AvailableIpAddressCount"),
+                                "routes": routes,
+                            }
+                    except Exception:
+                        pass
+                for vpc_id in found_vpcs:
+                    try:
+                        resp = ec2.describe_vpcs(VpcIds=[vpc_id]).get("Vpcs", [])
+                        if resp:
+                            vpc = resp[0]
+                            network_details[vpc_id] = {
+                                "vpc_id": vpc_id,
+                                "cidr_block": vpc.get("CidrBlock"),
+                                "state": vpc.get("State"),
+                                "dhcp_options_id": vpc.get("DhcpOptionsId"),
+                            }
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Append details if found
+        if sg_details:
+            config_data["_resolved_security_groups"] = sg_details
+        if role_details:
+            config_data["_resolved_iam_roles"] = role_details
+        if kms_details:
+            config_data["_resolved_kms_keys"] = kms_details
+        if network_details:
+            config_data["_resolved_network_resources"] = network_details
+
+        config_data["_fetch_method"] = fetch_method
+        return config_data
+
+    # ── IAM role configuration ─────────────────────────────────────────────────
+
+    def iam_role_config(self, resource_name: str) -> dict:
+        """Fetch an IAM role's complete permission picture:
+        inline policies (with full policy documents), attached managed policies
+        (with their statements), permission boundary, and trust policy.
+
+        This is the primary tool for diagnosing authorization failures — it shows
+        exactly what actions the role is and is not allowed to perform, and which
+        services or accounts are trusted to assume it.
+        """
+        if not self._session:
+            return {}
+        try:
+            iam = self._session.client("iam")
+
+            # Resolve role name — accept full name, ARN, or partial match
+            role_name = resource_name
+            if resource_name.startswith("arn:aws:iam:"):
+                role_name = resource_name.split("/")[-1]
+
+            try:
+                role = iam.get_role(RoleName=role_name)["Role"]
+            except Exception:
+                # Fuzzy match: list roles and find best match
+                paginator = iam.get_paginator("list_roles")
+                all_roles = []
+                for page in paginator.paginate(MaxItems=200):
+                    all_roles.extend(page.get("Roles", []))
+                matched = [
+                    r for r in all_roles
+                    if resource_name.lower() in r["RoleName"].lower()
+                ]
+                if not matched:
+                    return {}
+                role = iam.get_role(RoleName=matched[0]["RoleName"])["Role"]
+                role_name = role["RoleName"]
+
+            result: dict = {
+                "role_name":    role["RoleName"],
+                "role_arn":     role["Arn"],
+                "trust_policy": role.get("AssumeRolePolicyDocument", {}),
+                "path":         role.get("Path", "/"),
+                "created":      str(role.get("CreateDate", "")),
+            }
+
+            # Permission boundary
+            pb = role.get("PermissionsBoundary", {})
+            if pb:
+                result["permission_boundary"] = {
+                    "type": pb.get("PermissionsBoundaryType"),
+                    "arn":  pb.get("PermissionsBoundaryArn"),
+                }
+
+            # Inline policies — fetch the full document for each
+            inline_names = iam.list_role_policies(RoleName=role_name).get("PolicyNames", [])
+            inline_policies = []
+            for pname in inline_names:
+                try:
+                    import urllib.parse
+                    doc_resp = iam.get_role_policy(RoleName=role_name, PolicyName=pname)
+                    raw_doc = doc_resp.get("PolicyDocument", {})
+                    if isinstance(raw_doc, str):
+                        import json as _j
+                        raw_doc = _j.loads(urllib.parse.unquote(raw_doc))
+                    inline_policies.append({"name": pname, "document": raw_doc})
+                except Exception:
+                    inline_policies.append({"name": pname, "document": "could not fetch"})
+            result["inline_policies"] = inline_policies
+            result["inline_policy_count"] = len(inline_policies)
+
+            # Attached managed policies — include statements from customer-managed ones
+            attached = iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", [])
+            managed_policies = []
+            for p in attached:
+                entry: dict = {
+                    "policy_name": p["PolicyName"],
+                    "policy_arn":  p["PolicyArn"],
+                    "aws_managed": p["PolicyArn"].startswith("arn:aws:iam::aws:policy/"),
+                }
+                # Fetch the default version document for customer-managed policies
+                if not entry["aws_managed"]:
+                    try:
+                        pv = iam.get_policy(PolicyArn=p["PolicyArn"])["Policy"]
+                        ver_id = pv.get("DefaultVersionId", "v1")
+                        doc = iam.get_policy_version(
+                            PolicyArn=p["PolicyArn"], VersionId=ver_id
+                        )["PolicyVersion"]["Document"]
+                        if isinstance(doc, str):
+                            import json as _j2, urllib.parse as _up
+                            doc = _j2.loads(_up.unquote(doc))
+                        entry["document"] = doc
+                    except Exception:
+                        pass
+                managed_policies.append(entry)
+            result["attached_managed_policies"] = managed_policies
+            result["managed_policy_count"] = len(managed_policies)
+
+            return result
+        except Exception:  # noqa: BLE001
+            return {}
+
+    # ── CloudTrail event search ────────────────────────────────────────────────
+
+    def search_cloudtrail_events(
+        self,
+        resource_name: str,
+        event_names: list[str] | None = None,
+        minutes: int = 1440,
+    ) -> list[dict]:
+        """Search CloudTrail for all events touching a specific resource.
+
+        Returns events sorted newest-first. Each event includes: time, event_name,
+        actor (IAM principal), resource names, error_code, and a summary of the
+        request parameters. Useful for finding what changed (a deletion, a policy
+        detachment, a config modification) that caused the incident.
+
+        Args:
+            resource_name: resource name or ARN to search for
+            event_names: optional list of specific event names to filter by
+                         (e.g. ["DeleteRolePolicy", "DetachRolePolicy"])
+            minutes: lookback window in minutes (default 1440 = 24 hours, max 10080 = 7 days)
+        """
+        if not self._session:
+            return []
+        try:
+            import json as _j
+            ct    = self._session.client("cloudtrail")
+            end   = datetime.now(timezone.utc)
+            start = end - timedelta(minutes=min(int(minutes), 10080))
+
+            events: list[dict] = []
+
+            if event_names:
+                # Search for each event name individually (CloudTrail API only accepts one
+                # LookupAttribute at a time) and merge results
+                for en in event_names[:5]:
+                    try:
+                        resp = ct.lookup_events(
+                            LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": en}],
+                            StartTime=start,
+                            EndTime=end,
+                            MaxResults=20,
+                        )
+                        for e in resp.get("Events", []):
+                            resources = [r.get("ResourceName", "") for r in e.get("Resources", [])]
+                            if resource_name and not any(
+                                resource_name.lower() in (r or "").lower() for r in resources
+                            ):
+                                continue
+                            detail = _j.loads(e.get("CloudTrailEvent", "{}"))
+                            uid    = detail.get("userIdentity", {})
+                            actor  = (
+                                uid.get("userName")
+                                or uid.get("sessionContext", {})
+                                   .get("sessionIssuer", {}).get("userName", "")
+                                or uid.get("arn", "").split("/")[-1]
+                            )
+                            events.append({
+                                "time":          str(e.get("EventTime", "")),
+                                "event_name":    e.get("EventName", ""),
+                                "actor":         actor,
+                                "resources":     resources,
+                                "error_code":    detail.get("errorCode", ""),
+                                "error_message": detail.get("errorMessage", "")[:200],
+                                "request_params": str(detail.get("requestParameters") or "")[:300],
+                            })
+                    except Exception:
+                        pass
+            else:
+                # Search by resource name
+                search_values = list(dict.fromkeys(filter(None, [
+                    resource_name,
+                    resource_name.split("/")[-1] if "/" in resource_name else None,
+                    resource_name.split(":")[-1] if ":" in resource_name else None,
+                ])))
+                for sv in search_values[:2]:
+                    try:
+                        resp = ct.lookup_events(
+                            LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": sv}],
+                            StartTime=start,
+                            EndTime=end,
+                            MaxResults=30,
+                        )
+                        for e in resp.get("Events", []):
+                            detail = _j.loads(e.get("CloudTrailEvent", "{}"))
+                            uid    = detail.get("userIdentity", {})
+                            actor  = (
+                                uid.get("userName")
+                                or uid.get("sessionContext", {})
+                                   .get("sessionIssuer", {}).get("userName", "")
+                                or uid.get("arn", "").split("/")[-1]
+                            )
+                            resources = [r.get("ResourceName", "") for r in e.get("Resources", [])]
+                            events.append({
+                                "time":          str(e.get("EventTime", "")),
+                                "event_name":    e.get("EventName", ""),
+                                "actor":         actor,
+                                "resources":     resources,
+                                "error_code":    detail.get("errorCode", ""),
+                                "error_message": detail.get("errorMessage", "")[:200],
+                                "request_params": str(detail.get("requestParameters") or "")[:300],
+                            })
+                        if events:
+                            break
+                    except Exception:
+                        pass
+
+            # Deduplicate and sort newest-first
+            seen = set()
+            unique: list[dict] = []
+            for ev in events:
+                key = (ev["time"], ev["event_name"], ev.get("actor", ""))
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(ev)
+            unique.sort(key=lambda e: e["time"], reverse=True)
+            return unique[:30]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def firehose_delivery_config(self, resource_name: str) -> dict:
+        """Fetch Kinesis Firehose (Amazon Data Firehose) delivery stream config.
+        Returns stream status, destination S3/Redshift/etc config with IAM role ARN,
+        buffering hints, error output prefix, and recent delivery metrics."""
+        client = self._session.client("firehose")
+        cw = self._session.client("cloudwatch")
+        streams = client.list_delivery_streams(Limit=100).get("DeliveryStreamNames", [])
+        match = next((s for s in streams if resource_name.lower() in s.lower()), None)
+        if not match:
+            return {"found": False, "resource_name": resource_name, "available": streams}
+        desc = client.describe_delivery_stream(DeliveryStreamName=match)["DeliveryStreamDescription"]
+
+        # Extract destination details (S3 is most common)
+        destinations = []
+        for dest in desc.get("Destinations", []):
+            d: dict = {"destination_id": dest.get("DestinationId")}
+            if "S3DestinationDescription" in dest:
+                s3d = dest["S3DestinationDescription"]
+                d["type"] = "S3"
+                d["bucket_arn"] = s3d.get("BucketARN")
+                d["prefix"] = s3d.get("Prefix")
+                d["error_output_prefix"] = s3d.get("ErrorOutputPrefix")
+                d["role_arn"] = s3d.get("RoleARN")
+                d["buffering_hints"] = s3d.get("BufferingHints")
+                d["compression_format"] = s3d.get("CompressionFormat")
+            if "ExtendedS3DestinationDescription" in dest:
+                s3d = dest["ExtendedS3DestinationDescription"]
+                d["type"] = "ExtendedS3"
+                d["bucket_arn"] = s3d.get("BucketARN")
+                d["prefix"] = s3d.get("Prefix")
+                d["error_output_prefix"] = s3d.get("ErrorOutputPrefix")
+                d["role_arn"] = s3d.get("RoleARN")
+                d["buffering_hints"] = s3d.get("BufferingHints")
+                d["compression_format"] = s3d.get("CompressionFormat")
+            destinations.append(d)
+
+        # Delivery metrics
+        import datetime
+        end = datetime.datetime.utcnow()
+        start = end - datetime.timedelta(minutes=60)
+        metrics: dict = {}
+        for metric in ("DeliveryToS3.DataFreshness", "DeliveryToS3.Success",
+                       "DeliveryToS3.Records", "IncomingRecords", "IncomingBytes",
+                       "FailedConversionRecords"):
+            try:
+                resp = cw.get_metric_statistics(
+                    Namespace="AWS/Firehose",
+                    MetricName=metric,
+                    Dimensions=[{"Name": "DeliveryStreamName", "Value": match}],
+                    StartTime=start, EndTime=end,
+                    Period=300, Statistics=["Average", "Sum", "Maximum"],
+                )
+                pts = resp.get("Datapoints", [])
+                if pts:
+                    pts.sort(key=lambda p: p["Timestamp"], reverse=True)
+                    latest = pts[0]
+                    metrics[metric] = {
+                        "avg": round(latest.get("Average", 0), 2),
+                        "sum": round(latest.get("Sum", 0), 2),
+                        "max": round(latest.get("Maximum", 0), 2),
+                    }
+            except Exception:
+                pass
+
+        return {
+            "found": True,
+            "stream_name": desc["DeliveryStreamName"],
+            "stream_arn": desc.get("DeliveryStreamARN"),
+            "status": desc.get("DeliveryStreamStatus"),
+            "stream_type": desc.get("DeliveryStreamType"),
+            "has_more_destinations": desc.get("HasMoreDestinations", False),
+            "destinations": destinations,
+            "create_timestamp": str(desc.get("CreateTimestamp", "")),
+            "metrics_last_60min": metrics,
+        }
+
+    def athena_workgroup_config(self, resource_name: str) -> dict:
+        """Fetch Athena workgroup config: output location, enforcement, engine version,
+        query scan limits, and recent query execution counts."""
+        client = self._session.client("athena")
+        cw = self._session.client("cloudwatch")
+        workgroups = [w["Name"] for w in client.list_work_groups().get("WorkGroups", [])]
+        match = next((w for w in workgroups if resource_name.lower() in w.lower()), None)
+        if not match:
+            return {"found": False, "resource_name": resource_name, "available": workgroups}
+        wg = client.get_work_group(WorkGroup=match)["WorkGroup"]
+        cfg = wg.get("Configuration", {})
+        result_cfg = cfg.get("ResultConfiguration", {})
+
+        # Recent query history — last 5 executions
+        recent_queries: list[dict] = []
+        try:
+            ids = client.list_query_executions(WorkGroup=match, MaxResults=5).get("QueryExecutionIds", [])
+            if ids:
+                execs = client.batch_get_query_execution(QueryExecutionIds=ids).get("QueryExecutions", [])
+                for qe in execs:
+                    stat = qe.get("Status", {})
+                    recent_queries.append({
+                        "query_id": qe.get("QueryExecutionId"),
+                        "state": stat.get("State"),
+                        "state_change_reason": stat.get("StateChangeReason", ""),
+                        "submission_time": str(stat.get("SubmissionDateTime", "")),
+                        "completion_time": str(stat.get("CompletionDateTime", "")),
+                        "data_scanned_bytes": qe.get("Statistics", {}).get("DataScannedInBytes"),
+                    })
+        except Exception:
+            pass
+
+        # CloudWatch metrics
+        import datetime
+        end = datetime.datetime.utcnow()
+        start = end - datetime.timedelta(minutes=60)
+        metrics: dict = {}
+        for metric in ("ProcessedBytes", "QueryExecutionTime"):
+            try:
+                resp = cw.get_metric_statistics(
+                    Namespace="AWS/Athena",
+                    MetricName=metric,
+                    Dimensions=[{"Name": "WorkGroup", "Value": match}],
+                    StartTime=start, EndTime=end,
+                    Period=300, Statistics=["Sum", "Average"],
+                )
+                pts = resp.get("Datapoints", [])
+                if pts:
+                    pts.sort(key=lambda p: p["Timestamp"], reverse=True)
+                    metrics[metric] = {
+                        "sum": round(pts[0].get("Sum", 0), 2),
+                        "avg": round(pts[0].get("Average", 0), 2),
+                    }
+            except Exception:
+                pass
+
+        return {
+            "found": True,
+            "workgroup_name": wg["Name"],
+            "state": wg.get("State"),
+            "description": wg.get("Description"),
+            "output_location": result_cfg.get("OutputLocation"),
+            "encryption_config": result_cfg.get("EncryptionConfiguration"),
+            "enforce_workgroup_config": cfg.get("EnforceWorkgroupConfiguration"),
+            "publish_cloudwatch_metrics": cfg.get("PublishCloudWatchMetricsEnabled"),
+            "bytes_scanned_cutoff_per_query": cfg.get("BytesScannedCutoffPerQuery"),
+            "requester_pays": cfg.get("RequesterPaysEnabled"),
+            "engine_version": cfg.get("EngineVersion", {}).get("SelectedEngineVersion"),
+            "recent_queries": recent_queries,
+            "metrics_last_60min": metrics,
+        }
+
+    def dms_replication_config(self, resource_name: str) -> dict:
+        """Fetch DMS replication task config with inline replication instance and endpoint details.
+        Returns task status, migration type, table mappings, last failure message,
+        plus full source/target endpoint config and replication instance state."""
+        client = self._session.client("dms")
+
+        # Find the task
+        tasks = client.describe_replication_tasks(
+            Filters=[{"Name": "replication-task-id", "Values": [resource_name]}]
+        ).get("ReplicationTasks", [])
+        if not tasks:
+            # Fuzzy match
+            all_tasks = client.describe_replication_tasks().get("ReplicationTasks", [])
+            tasks = [t for t in all_tasks if resource_name.lower() in t["ReplicationTaskIdentifier"].lower()]
+        if not tasks:
+            all_ids = [t["ReplicationTaskIdentifier"] for t in
+                       client.describe_replication_tasks().get("ReplicationTasks", [])]
+            return {"found": False, "resource_name": resource_name, "available": all_ids}
+
+        task = tasks[0]
+        result: dict = {
+            "found": True,
+            "task_identifier": task["ReplicationTaskIdentifier"],
+            "task_arn": task["ReplicationTaskArn"],
+            "status": task["Status"],
+            "migration_type": task["MigrationType"],
+            "table_mappings": task.get("TableMappings"),
+            "replication_task_settings": task.get("ReplicationTaskSettings"),
+            "last_failure_message": task.get("LastFailureMessage"),
+            "stop_reason": task.get("StopReason"),
+            "task_creation_date": str(task.get("ReplicationTaskCreationDate", "")),
+            "task_start_date": str(task.get("ReplicationTaskStartDate", "")),
+            "stats": task.get("ReplicationTaskStats", {}),
+        }
+
+        # Fetch replication instance
+        try:
+            instances = client.describe_replication_instances(
+                Filters=[{"Name": "replication-instance-arn",
+                          "Values": [task["ReplicationInstanceArn"]]}]
+            ).get("ReplicationInstances", [])
+            if instances:
+                inst = instances[0]
+                result["replication_instance"] = {
+                    "identifier": inst["ReplicationInstanceIdentifier"],
+                    "arn": inst["ReplicationInstanceArn"],
+                    "class": inst["ReplicationInstanceClass"],
+                    "allocated_storage_gb": inst["AllocatedStorage"],
+                    "availability_zone": inst.get("AvailabilityZone"),
+                    "status": inst["ReplicationInstanceStatus"],
+                    "publicly_accessible": inst.get("PubliclyAccessible"),
+                    "multi_az": inst.get("MultiAZ"),
+                    "engine_version": inst.get("EngineVersion"),
+                    "vpc_id": inst.get("ReplicationSubnetGroup", {}).get("VpcId"),
+                    "vpc_security_groups": [
+                        {"id": sg["VpcSecurityGroupId"], "status": sg["Status"]}
+                        for sg in inst.get("VpcSecurityGroups", [])
+                    ],
+                }
+        except Exception:
+            pass
+
+        # Fetch both endpoints
+        endpoint_arns = [task["SourceEndpointArn"], task["TargetEndpointArn"]]
+        try:
+            endpoints = client.describe_endpoints(
+                Filters=[{"Name": "endpoint-arn", "Values": endpoint_arns}]
+            ).get("Endpoints", [])
+            result["endpoints"] = []
+            for ep in endpoints:
+                ep_info: dict = {
+                    "endpoint_identifier": ep["EndpointIdentifier"],
+                    "endpoint_arn": ep["EndpointArn"],
+                    "endpoint_type": ep["EndpointType"],
+                    "engine_name": ep["EngineName"],
+                    "status": ep["Status"],
+                    "server_name": ep.get("ServerName"),
+                    "port": ep.get("Port"),
+                    "database_name": ep.get("DatabaseName"),
+                    "username": ep.get("Username"),
+                    "ssl_mode": ep.get("SslMode"),
+                    "external_id": ep.get("ExternalId"),
+                    "last_failure_message": ep.get("Status") == "failed" and ep.get("StatusReason", ""),
+                }
+                # Test-connection results are in endpoint status
+                result["endpoints"].append(ep_info)
+        except Exception:
+            pass
+
+        # Recent CloudWatch metrics for the task
+        import datetime
+        cw = self._session.client("cloudwatch")
+        end = datetime.datetime.utcnow()
+        start = end - datetime.timedelta(minutes=60)
+        metrics: dict = {}
+        task_id = task["ReplicationTaskIdentifier"]
+        for metric in ("FullLoadRowsInserted", "FullLoadRowsUpdated", "CDCRowsInserted",
+                       "CDCRowsDeleted", "FullLoadThroughputRowsLoaded",
+                       "NetworkTransmitThroughput"):
+            try:
+                resp = cw.get_metric_statistics(
+                    Namespace="AWS/DMS",
+                    MetricName=metric,
+                    Dimensions=[{"Name": "ReplicationInstanceIdentifier",
+                                 "Value": task_id}],
+                    StartTime=start, EndTime=end,
+                    Period=300, Statistics=["Sum", "Average"],
+                )
+                pts = resp.get("Datapoints", [])
+                if pts:
+                    pts.sort(key=lambda p: p["Timestamp"], reverse=True)
+                    metrics[metric] = {
+                        "sum": round(pts[0].get("Sum", 0), 2),
+                        "avg": round(pts[0].get("Average", 0), 2),
+                    }
+            except Exception:
+                pass
+        result["metrics_last_60min"] = metrics
+        return result
+
+

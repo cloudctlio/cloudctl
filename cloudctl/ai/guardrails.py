@@ -57,19 +57,14 @@ _INJECTION_PATTERNS = [
     r"do anything now",
     r"developer mode",
     r"sudo (mode|prompt|override)",
+    r"reveal (your |the )?(system |initial )?prompt",
+    r"print (your |the )?(system |initial )?(prompt|instructions)",
+    r"repeat (the words|everything|the text) above",
+    r"what (are|were) your (initial |system )?instructions",
+    r"show me your (system )?prompt",
 ]
 
 _MAX_QUERY_LENGTH = 500
-
-_INFRA_SIGNALS = [
-    "error", "fail", "slow", "down", "502", "503", "504", "500",
-    "timeout", "crash", "oom", "memory", "cpu", "disk", "queue",
-    "deploy", "lambda", "ecs", "rds", "s3", "ec2", "alb", "vpc",
-    "pod", "container", "service", "function", "database", "api",
-    "latency", "throttl", "spike", "alert", "alarm", "incident",
-    "outage", "degraded", "unhealthy", "unreachable", "certificate",
-    "permission", "access denied", "cost", "billing",
-]
 
 
 def validate_query(query: str) -> GuardrailResult:
@@ -107,14 +102,14 @@ def validate_query(query: str) -> GuardrailResult:
                 sanitised="",
             )
 
-    if not any(sig in query_lower for sig in _INFRA_SIGNALS):
-        return GuardrailResult(
-            allowed=False,
-            reason="Please describe a cloud infrastructure symptom "
-                   "(e.g. 'payments API returning 502s', 'Lambda timing out').",
-            sanitised="",
-        )
-
+    # No positive "is this on-topic" keyword gate: a fixed allow-list for
+    # open-ended natural language has unbounded false-rejection risk (this
+    # function has already had two legitimate symptoms wrongly rejected —
+    # "kb sync failure" phrasing and "consumer lag" phrasing — because they
+    # didn't happen to contain a listed word). The deny-list checks above
+    # (off-topic, injection) are the real security boundary; anything that
+    # clears them is allowed through, and the agent's own system prompt
+    # declines genuinely unrelated requests gracefully downstream.
     return GuardrailResult(allowed=True, reason="", sanitised=query)
 
 
@@ -250,7 +245,7 @@ _SECRET_PATTERNS: list[tuple[str, str]] = [
 
 _SENSITIVE_KEY_WORDS = {
     "password", "passwd", "secret", "token", "key",
-    "credential", "auth", "api_key", "private",
+    "credential", "auth", "api_key", "private", "incident_mode",
 }
 
 
@@ -341,6 +336,7 @@ _ALLOWED_TOOLS = {
     "tail_logs",
     "get_event_timeline",
     "query_metrics",
+    "get_deployment_info",
 }
 
 
@@ -416,11 +412,11 @@ def enforce_confidence(
         )
         return output
 
-    if hal_rate > 0.0 and claimed == "HIGH":
+    if hal_rate > 0.1 and claimed == "HIGH":
         output["confidence"] = "MEDIUM"
         output["confidence_override_reason"] = (
             "Confidence downgraded from HIGH to MEDIUM: "
-            "some evidence claims not traceable to fetched data."
+            f"{hal_rate:.0%} of evidence claims not traceable to fetched data."
         )
         return output
 
@@ -437,6 +433,86 @@ def enforce_confidence(
         return output
 
     return output
+
+
+@dataclass
+class CausalSupportResult:
+    sufficient: bool
+    reason:     str
+
+
+_CAUSAL_CRITIQUE_SYSTEM = """\
+You are a skeptical senior SRE reviewing another engineer's incident
+root-cause claim before it ships to an on-call page. You did not
+investigate this incident yourself — you only see the claimed root cause
+and the evidence offered for it.
+
+Your only question: does the evidence, taken at face value, actually
+establish THIS SPECIFIC causal claim — or does it equally support "this is
+within normal variation", "inconclusive", or a different cause entirely?
+
+Do not fact-check whether the evidence is true (that is handled
+elsewhere). Judge causal sufficiency only: would a careful engineer accept
+this evidence as proof of this specific claim, or is it a
+plausible-sounding story built on circumstantial or normal-looking data?
+
+Respond with EXACTLY one line in this format, nothing else:
+VERDICT: SUFFICIENT|INSUFFICIENT — one sentence reason"""
+
+
+def verify_causal_support(
+    symptom: str,
+    agent_output: dict,
+    profile: str | None,
+    region: str,
+) -> CausalSupportResult:
+    """Guardrail — an isolated, cheap LLM self-critique of the agent's own
+    root-cause claim. Replaces an earlier keyword-based anomaly check that
+    proved too imprecise in both directions (confirmed in production,
+    2026-06-24): it let a fabricated story through because its evidence
+    text happened to contain "unreachable" incidentally, and separately it
+    wrongly downgraded a genuinely correct, well-evidenced answer whose
+    phrasing didn't happen to match the keyword list. A keyword scan
+    cannot distinguish "describes an anomaly" from "uses anomaly-adjacent
+    vocabulary" — only a semantic read of the actual claim can.
+
+    Fails open: if the critique call itself errors (throttling, network),
+    that should not become the reason a correct answer gets downgraded.
+    """
+    confidence = agent_output.get("confidence", "MEDIUM")
+    if confidence == "LOW":
+        return CausalSupportResult(sufficient=True, reason="")
+
+    root_cause = agent_output.get("root_cause", "")
+    if not root_cause:
+        return CausalSupportResult(sufficient=True, reason="")
+
+    try:
+        import boto3  # noqa: PLC0415
+
+        from botocore.config import Config as BotoConfig  # noqa: PLC0415
+        session = boto3.Session(profile_name=profile, region_name=region) \
+            if profile else boto3.Session(region_name=region)
+        config = BotoConfig(connect_timeout=10, read_timeout=120)
+        bedrock = session.client("bedrock-runtime", region_name=region, config=config)
+
+        prompt = json.dumps({
+            "symptom": symptom,
+            "claimed_root_cause": root_cause,
+            "evidence_offered": agent_output.get("evidence", []),
+        }, indent=2)
+
+        resp = bedrock.converse(
+            modelId="us.anthropic.claude-sonnet-4-6",
+            system=[{"text": _CAUSAL_CRITIQUE_SYSTEM}],
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+        )
+        text = resp["output"]["message"]["content"][0]["text"].strip()
+        if text.upper().startswith("VERDICT: INSUFFICIENT"):
+            return CausalSupportResult(sufficient=False, reason=text)
+        return CausalSupportResult(sufficient=True, reason="")
+    except Exception:  # noqa: BLE001
+        return CausalSupportResult(sufficient=True, reason="")
 
 
 # ── Guardrail 6 — Rate Limiting ───────────────────────────────────────────────
@@ -625,23 +701,99 @@ class HallucinationReport:
     unsupported:        list[str]    # evidence items not traceable to fetched data
 
 
+_DERIVED_VALUE_RE = re.compile(r'(\d[\d,]*(?:\.\d+)?)\s*(×|x\b|%|/1|:1)', re.IGNORECASE)
+_TOLERANCE_PREFIX_RE = re.compile(r'[~≈]\s*$')
+
+_NUMERIC_TOLERANCE = 0.05  # 5% relative tolerance for rounding/formatting drift
+
+_DATETIME_RE = re.compile(
+    r'\b\d{4}-\d{2}-\d{2}\b'              # YYYY-MM-DD
+    r'|\b\d{2}:\d{2}(?::\d{2})?\b'        # HH:MM or HH:MM:SS
+    r'|\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b' # 23 June / 23 Jun
+    r'|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b' # June 23 / Jun 23
+    r'|\b\d{1,2}/\d{1,2}/\d{2,4}\b',      # MM/DD/YYYY or DD/MM/YYYY
+    re.IGNORECASE
+)
+
+_SAFE_NUMBERS = {
+    "80", "443", "8080", "3306", "5432", "6379", "11211", "27017",
+    "200", "201", "301", "302", "400", "401", "403", "404", "500", "502", "503", "504"
+}
+
+_CONVERSION_FACTORS = [
+    1000.0, 1000000.0, 1000000000.0,
+    1024.0, 1024.0 * 1024.0, 1024.0 * 1024.0 * 1024.0,
+    60.0, 3600.0
+]
+
+
+def _corpus_numbers(corpus: str) -> list[float]:
+    out = []
+    for tok in re.findall(r'(?<![A-Za-z_])\d+(?:\.\d+)?(?![A-Za-z_])', corpus):
+        try:
+            out.append(float(tok))
+        except ValueError:
+            pass
+    return out
+
+
+def _number_in_corpus(value: float, corpus_nums: list[float]) -> bool:
+    for c in corpus_nums:
+        if c == 0:
+            if value == 0:
+                return True
+            continue
+        if abs(value - c) / abs(c) <= _NUMERIC_TOLERANCE:
+            return True
+    return False
+
+
+def _number_in_corpus_with_conversions(value: float, corpus_nums: list[float]) -> bool:
+    if _number_in_corpus(value, corpus_nums):
+        return True
+    for f in _CONVERSION_FACTORS:
+        if _number_in_corpus(value * f, corpus_nums):
+            return True
+        if _number_in_corpus(value / f, corpus_nums):
+            return True
+    return False
+
+
+def _overlaps(start: int, end: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(s <= start < e or s < end <= e for s, e in ranges)
+
+
 def verify_cited_values(
     agent_output: dict,
     fetched_data: dict,
 ) -> tuple[list[str], list[str]]:
     """
     Stricter than detect_hallucinations: every numeric value (>=2 digits) and
-    every quoted string in an evidence item must appear verbatim in the fetched
+    every quoted string in an evidence item must be traceable to the fetched
     data corpus. Returns (verified_items, unverified_items).
 
     This is the value-level check that catches "max_connections=66" when the
     actual fetched value was 50 — the word match passes, the number does not.
+
+    Two relaxations versus a strict verbatim-substring check:
+      - Numeric tolerance: a value within 5% of some number in the corpus is
+        accepted, so rounding/formatting drift ("20,245" vs raw "20245.34")
+        doesn't get treated as a fabricated number.
+      - Derived markers: numbers immediately followed by a ratio/percent
+        marker (×, x, %, :1, /1) — e.g. "13×", "47%" — are skipped, since
+        these are computed relationships between two other cited values, not
+        themselves a single fetched datapoint. The harness instructs the
+        model to cite the underlying values separately; those are still
+        checked normally.
+      - Safe/standard numbers and dates/times are excluded from validation.
+      - Unit conversion (e.g. seconds to ms, bytes to MB/GB) is supported.
 
     Items that make no numeric or quoted claim (purely qualitative) are passed
     through as verified; we cannot disprove a claim that names no value.
     """
     corpus = json.dumps(fetched_data, default=str)
     corpus_lower = corpus.lower()
+    corpus_nums = _corpus_numbers(corpus)
     verified: list[str] = []
     unverified: list[str] = []
 
@@ -649,7 +801,20 @@ def verify_cited_values(
         if not isinstance(item, str):
             continue
 
-        numbers = re.findall(r'(?<![A-Za-z_])\d{2,}(?:\.\d+)?(?![A-Za-z_])', item)
+        derived_spans = {m.start(1) for m in _DERIVED_VALUE_RE.finditer(item)}
+        datetime_ranges = [(m.start(), m.end()) for m in _DATETIME_RE.finditer(item)]
+
+        numbers = []
+        for m in re.finditer(
+            r'(?<![A-Za-z_0-9])(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{2,}(?:\.\d+)?)(?![A-Za-z_])',
+            item,
+        ):
+            if m.start() in derived_spans:
+                continue
+            if _overlaps(m.start(), m.end(), datetime_ranges):
+                continue
+            numbers.append(m.group(0).replace(",", ""))
+
         quoted  = re.findall(r'"([^"]{3,80})"|\'([^\']{3,80})\'', item)
         quoted_strs = [q for pair in quoted for q in pair if q]
 
@@ -657,8 +822,21 @@ def verify_cited_values(
             verified.append(item)
             continue
 
-        nums_ok    = all(n in corpus for n in numbers)
-        quoted_ok  = all(q.lower() in corpus_lower for q in quoted_strs)
+        nums_ok = True
+        for n in numbers:
+            if n in _SAFE_NUMBERS:
+                continue
+            if n in corpus:
+                continue
+            try:
+                if _number_in_corpus_with_conversions(float(n), corpus_nums):
+                    continue
+            except ValueError:
+                pass
+            nums_ok = False
+            break
+
+        quoted_ok = all(q.lower() in corpus_lower for q in quoted_strs)
 
         if nums_ok and quoted_ok:
             verified.append(item)
@@ -711,3 +889,151 @@ def detect_hallucinations(
         verdict=verdict,
         unsupported=unsupported,
     )
+
+
+# ── Guardrail 8 — Tool Coverage Enforcement ───────────────────────────────────
+#
+# harness.py *instructs* the model to always call tail_logs/query_metrics
+# before concluding, but nothing checked compliance — confirmed in production
+# (rag-assistant vector_bucket_access_denied, 2026-06-23): the model concluded
+# from CloudTrail timing correlation alone, never called tail_logs, and landed
+# on the wrong specific permission/resource because the real exception text
+# was never read. This guardrail makes the instruction enforceable.
+
+@dataclass
+class ToolCoverageResult:
+    satisfied:      bool
+    missing_tools:  list[str]
+    missing_metrics: list[str]
+    reason:         str
+
+
+_ERROR_SIGNAL_WORDS = {
+    "error", "errors", "fail", "fails", "failing", "failed", "denied",
+    "exception", "crash", "crashing", "502", "503", "504", "500", "403",
+    "401", "timeout", "timing out", "unavailable", "broken", "down",
+}
+_LATENCY_SIGNAL_WORDS = {
+    "slow", "slower", "latency", "delay", "delayed", "lag", "lagging",
+    "p99", "p95", "p90", "spike", "spiking",
+}
+# Found in production (api-gateway-perimeter, throttling_misconfigured,
+# 2026-06-24): the agent investigated a "429 rate-limited" symptom by
+# checking IntegrationLatency/4XXError and never checked the resource's
+# configured throttle limits, landing on a wrong "backend is slow"
+# diagnosis instead of the real throttle-limit misconfiguration. A first
+# attempt at fixing this required a metric *name* containing "throttl" —
+# but that metric doesn't exist for every service (confirmed: AWS/ApiGateway
+# has no such metric at all; throttling there shows up as 4XXError). A
+# metric-name requirement that's wrong for a given service actively makes
+# things worse — it sends the agent searching for something that can't be
+# found instead of concluding with what it already has. Tool coverage
+# (query_metrics + get_service_config, to cross-reference observed errors
+# against configured limits) is the part that generalizes; the specific
+# metric name does not, so it isn't gated here — see harness.py's
+# anti-pattern hint instead.
+_THROTTLE_SIGNAL_WORDS = {
+    "429", "throttl", "rate limit", "rate-limit", "rate limited",
+}
+
+# Tool every investigation must run, regardless of symptom wording, plus the
+# symptom-class-specific tools that close the exact gap found above.
+_MANDATORY_TOOLS: dict[str, tuple[str, ...]] = {
+    "always":          ("list_resources", "get_service_config"),
+    "error_signal":    ("tail_logs",),
+    "latency_signal":  ("query_metrics",),
+    "throttle_signal": ("query_metrics", "get_service_config"),
+}
+
+# Symptom class -> substring (case-insensitive) that must appear in at least
+# one *queried metric name*, not just a tool call — calling query_metrics
+# at all isn't enough if it's pointed at the wrong metric. Empty on purpose
+# for throttle_signal — see comment above.
+_MANDATORY_METRIC_PATTERNS: dict[str, tuple[str, ...]] = {}
+
+
+def _classify_symptom(symptom: str) -> set[str]:
+    s = symptom.lower()
+    classes = {"always"}
+    if any(w in s for w in _ERROR_SIGNAL_WORDS):
+        classes.add("error_signal")
+    if any(w in s for w in _LATENCY_SIGNAL_WORDS):
+        classes.add("latency_signal")
+    if any(w in s for w in _THROTTLE_SIGNAL_WORDS):
+        classes.add("throttle_signal")
+    return classes
+
+
+def verify_tool_coverage(
+    symptom: str,
+    tools_called: set[str],
+    metrics_queried: set[str] = frozenset(),
+) -> ToolCoverageResult:
+    """
+    Check that the agent actually called the tools — and, for some symptom
+    classes, the specific metric names — its symptom class requires before
+    concluding. Pure/stateless — the caller is responsible for tracking
+    which tool names were dispatched and which "namespace/metric_name"
+    strings were queried during the session.
+    """
+    classes = _classify_symptom(symptom)
+    required_tools: set[str] = set()
+    for cls in classes:
+        required_tools.update(_MANDATORY_TOOLS.get(cls, ()))
+
+    missing_tools = sorted(required_tools - tools_called)
+
+    missing_metrics: list[str] = []
+    metrics_lower = {m.lower() for m in metrics_queried}
+    for cls in classes:
+        for pattern in _MANDATORY_METRIC_PATTERNS.get(cls, ()):
+            if not any(pattern in m for m in metrics_lower):
+                missing_metrics.append(pattern)
+
+    if not missing_tools and not missing_metrics:
+        return ToolCoverageResult(satisfied=True, missing_tools=[], missing_metrics=[], reason="")
+
+    reasons = []
+    if missing_tools:
+        reasons.append(f"required tool(s) not called: {', '.join(missing_tools)}")
+    if missing_metrics:
+        reasons.append(f"no metric matching {', '.join(missing_metrics)} was queried")
+
+    return ToolCoverageResult(
+        satisfied=False,
+        missing_tools=missing_tools,
+        missing_metrics=missing_metrics,
+        reason="Concluded without coverage: " + "; ".join(reasons),
+    )
+
+
+@dataclass
+class AlternativesCoverageResult:
+    satisfied: bool
+    reason:    str
+
+
+def verify_alternatives_considered(
+    agent_output: dict,
+) -> AlternativesCoverageResult:
+    """Verify that the agent considered and evaluated at least 2 distinct alternative hypotheses."""
+    alternatives = agent_output.get("alternatives_considered", [])
+    if not isinstance(alternatives, list):
+        return AlternativesCoverageResult(
+            satisfied=False,
+            reason="alternatives_considered field must be a list of objects"
+        )
+    valid_count = 0
+    for alt in alternatives:
+        if isinstance(alt, dict) and alt.get("hypothesis") and alt.get("ruled_out_because"):
+            h = str(alt.get("hypothesis")).strip()
+            r = str(alt.get("ruled_out_because")).strip()
+            if h and r:
+                valid_count += 1
+    if valid_count < 2:
+        return AlternativesCoverageResult(
+            satisfied=False,
+            reason=f"only {valid_count} alternative hypotheses evaluated in alternatives_considered, but at least 2 are required for MEDIUM/HIGH confidence"
+        )
+    return AlternativesCoverageResult(satisfied=True, reason="")
+

@@ -235,7 +235,7 @@ def debug_issue(
     ),
     agent:    bool          = typer.Option(
         False, "--agent",
-        help="Agentic mode: Claude drives the investigation, fetching only what it needs",
+        help="Agentic mode: Claude drives the investigation across parallel hypothesis branches",
     ),
     verdict:  Optional[str] = typer.Option(
         None, "--verdict", "-v",
@@ -253,6 +253,13 @@ def debug_issue(
         None, "--iac-root",
         help="Local path to IaC root directory (Terraform / CDK). Required when --resolve is set.",
     ),
+    json_out: Optional[str] = typer.Option(
+        None, "--json-out",
+        help="With --agent: also write the raw agent JSON (root_cause, evidence, "
+             "confidence, etc.) to this file path, alongside the normal rendered "
+             "table. For automated grading (tests/harness/scorer.py) — the "
+             "rendered table is lossy, the raw JSON is the actual grading input.",
+    ),
 ) -> None:
     """
     Debug a cloud infrastructure issue using AI analysis of real data.
@@ -267,14 +274,14 @@ def debug_issue(
 
     if agent:
         import json as _json  # noqa: PLC0415
-        from cloudctl.mcp.tools.debug import debug_incident_agent  # noqa: PLC0415
+        from cloudctl.ai.graph_agent import debug_incident_graph  # noqa: PLC0415
         from cloudctl.ai.live_learner  import (  # noqa: PLC0415
             on_confirmed_correct, on_confirmed_wrong, best_pattern_match,
         )
 
         console.print(f"\n[bold]Agent investigating:[/bold] {issue}")
-        with console.status("[dim]Claude is driving the investigation...[/dim]"):
-            raw, all_fetched = debug_incident_agent(
+        with console.status("[dim]Claude is driving the investigation (3 parallel branches)...[/dim]"):
+            raw, all_fetched = debug_incident_graph(
                 symptom=issue,
                 profile=account,
                 region=region or "us-east-1",
@@ -303,6 +310,10 @@ def debug_issue(
                     )
 
         _render_agent_result(d, account)
+
+        if json_out:
+            from pathlib import Path as _Path  # noqa: PLC0415
+            _Path(json_out).write_text(_json.dumps(d, indent=2), encoding="utf-8")
 
         # y/n confirmation — feeds the live learning loop
         if verdict is not None:
