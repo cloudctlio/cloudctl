@@ -86,26 +86,30 @@ symptom
   │
   ▼
 triage  ──────────────────────────────────────────────────────────────
-  │                                                                    │
-  │  generates 3 competing hypotheses                                  │
-  │                                                                    │
-  ▼                                                                    │
-investigate (parallel)                                                 │
-  ├── branch 1: Phase 1 config check → Phase 2 operational (if needed)│
-  ├── branch 2: Phase 1 config check → Phase 2 operational (if needed)│
-  └── branch 3: Phase 1 config check → Phase 2 operational (if needed)│
-  │                                                                    │
-  ▼                                                                    │
-synthesize — picks strongest evidence across branches                  │
-  │                                                                    │
-  ▼                                                                    │
-critique  — devil's advocate pass: challenges conclusion, can revise   │
-  │                                                                    │
-  ▼                                                                    │
-root cause + IaC-aware fix steps ◄──────────────────────────────────── ┘
+  │  generates 3 competing hypotheses
+  ▼
+investigate (parallel)
+  ├── branch 1 ─┬─ Phase 1: config check   (enabled flags, bound ARNs, rule counts)
+  │              └─ Phase 2: operational    (logs, metrics, events — only if Phase 1 inconclusive)
+  ├── branch 2 ─┬─ Phase 1: config check
+  │              └─ Phase 2: operational
+  └── branch 3 ─┬─ Phase 1: config check
+                 └─ Phase 2: operational
+  │
+  ▼
+synthesize — picks strongest evidence across branches
+  │
+  ▼
+critique  — devil's advocate pass: can revise if a stronger finding was missed
+  │
+  ▼
+root cause + confidence + IaC-aware fix steps
+  │
+  ▼
+verdict prompt  — was this correct? (feeds the live learning loop)
 ```
 
-Each branch runs **two phases**: first it checks whether the feature is even configured (enabled flags, bound ARNs, rule counts). If the configuration is definitively broken, it concludes immediately without touching operational state — the same order a human SRE would check.
+Each branch checks **configuration state first** (enabled flags, bound ARNs, rule counts — the same order a human SRE would). If the config is definitively broken it concludes in 2 tool calls without touching operational state. Phase 2 only runs when Phase 1 is inconclusive.
 
 ### Deployment detection
 
@@ -119,6 +123,18 @@ cloudctl identifies how a resource is managed and tailors fix steps to your tool
 | ARM deployment history | Azure Bicep / ARM |
 | GCP Deployment Manager manifests | Deployment Manager |
 | GitHub Actions / Azure DevOps runs | CI/CD pipelines |
+
+### Gets smarter over time
+
+Every confirmed diagnosis is stored locally. On repeat incidents, cloudctl pattern-matches against past confirmed fixes and can promote confidence automatically — so the third time you diagnose the same class of misconfiguration, it converges faster.
+
+```bash
+# Confirm a diagnosis was correct — stored for future pattern matching
+cloudctl debug --agent --verdict y "ECS tasks crashing after deploy"
+
+# Pass verdict non-interactively in scripts / run loops
+cloudctl debug --agent --verdict skip "..."
+```
 
 ---
 
@@ -148,7 +164,9 @@ cloudctl identifies how a resource is managed and tailors fix steps to your tool
 | Command | What it does |
 |---|---|
 | `cloudctl debug "<symptom>"` | Parallel hypothesis investigation → root cause + fix |
-| `cloudctl debug --agent "<symptom>"` | Full agentic mode with triage → investigate → synthesize → critique |
+| `cloudctl debug --agent "<symptom>"` | Full agentic mode: triage → investigate → synthesize → critique |
+| `cloudctl debug --agent --verdict y/n "<symptom>"` | Diagnose and record whether the answer was correct (trains the learning loop) |
+| `cloudctl debug --agent --json-out result.json "<symptom>"` | Save structured JSON output alongside the rendered result |
 | `cloudctl ask "<question>"` | Answer cloud questions from live data |
 | `cloudctl ask --interactive` | Multi-turn chat, context preserved |
 | `cloudctl feedback list/accuracy` | Review AI answer history and accuracy |

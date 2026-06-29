@@ -27,3 +27,6 @@ tests/harness/
 CLAUDE.md
 .coverage
 coverage.xml
+
+# Demo recording — tape file is internal, gif gets committed after recording
+demo.tape

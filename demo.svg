@@ -6,7 +6,6 @@
       .sz13 { font-size: 13px; }
       .sz11 { font-size: 11px; }
 
-      /* colours */
       .c-white   { fill: #cdd6f4; }
       .c-green   { fill: #a6e3a1; }
       .c-yellow  { fill: #f9e2af; }
@@ -17,36 +16,69 @@
       .c-dim     { fill: #6c7086; }
       .c-prompt  { fill: #89b4fa; }
 
-      /* individual line appearances */
-      @keyframes appear { from { opacity: 0; } to { opacity: 1; } }
-      @keyframes blink  { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
-      @keyframes typing {
-        from { clip-path: inset(0 100% 0 0); }
-        to   { clip-path: inset(0 0% 0 0); }
+      /*
+       * Loop: 12s total, all animations use duration=12s iteration=infinite.
+       * Each keyframe encodes: hidden → appear at T% → hold → fade 83%→91% → dark 91%→100%.
+       * No SVG-level animation — eliminates the blink/flash entirely.
+       *
+       * Time → percentage (T / 12 * 100):
+       *   cmd typing  0.4s→1.5s   = 3.3%→12.5%
+       *   l1  1.7s = 14.2%   l2  2.1s = 17.5%   l3  2.5s = 20.8%
+       *   l4  3.3s = 27.5%   l5  3.6s = 30.0%   l6  3.9s = 32.5%
+       *   l7  4.2s = 35.0%   l8  4.6s = 38.3%   l9  4.9s = 40.8%
+       *   l10 5.2s = 43.3%   l11 5.5s = 45.8%   l12 5.8s = 48.3%
+       *   l13 6.1s = 50.8%   l14 6.4s = 53.3%
+       */
+
+      /* cmd: typing via clip-path */
+      @keyframes k-cmd {
+        0%, 3.3%  { clip-path: inset(0 100% 0 0); }
+        12.5%     { clip-path: inset(0   0% 0 0); }
+        83%       { clip-path: inset(0   0% 0 0); }
+        91%       { clip-path: inset(0 100% 0 0); }
+        100%      { clip-path: inset(0 100% 0 0); }
       }
+      /* baseline: all animated elements start invisible so there's no flash
+         at the loop boundary when the browser briefly drops the animation */
+      .cmd  { clip-path: inset(0 100% 0 0); animation: k-cmd 12s linear infinite; }
+      .cursor { opacity: 0; }
+      .l1,.l2,.l3,.l3b,.l3c,.l4,.l5,.l6,.l7,
+      .l8,.l9,.l10,.l11,.l12,.l13,.l14 { opacity: 0; }
 
-      .cmd      { animation: typing 1.1s steps(48,end) 0.4s both; }
-      .l1       { animation: appear 0.2s ease 1.7s both; }
-      .l2       { animation: appear 0.2s ease 2.1s both; }
-      .l3       { animation: appear 0.2s ease 2.5s both; }
-      .l3b      { animation: appear 0.2s ease 2.5s both; }
-      .l3c      { animation: appear 0.2s ease 2.5s both; }
-      .l4       { animation: appear 0.2s ease 3.3s both; }
-      .l5       { animation: appear 0.2s ease 3.6s both; }
-      .l6       { animation: appear 0.2s ease 3.9s both; }
-      .l7       { animation: appear 0.2s ease 4.2s both; }
-      .l8       { animation: appear 0.2s ease 4.6s both; }
-      .l9       { animation: appear 0.2s ease 4.9s both; }
-      .l10      { animation: appear 0.2s ease 5.2s both; }
-      .l11      { animation: appear 0.2s ease 5.5s both; }
-      .l12      { animation: appear 0.2s ease 5.8s both; }
-      .l13      { animation: appear 0.2s ease 6.1s both; }
-      .l14      { animation: appear 0.2s ease 6.4s both; }
-      .l15      { animation: appear 0.2s ease 6.7s both; }
-      .cursor   { animation: blink 1s ease 1.5s infinite; }
 
-      /* restart loop after 12s total */
-      svg { animation: appear 0.01s ease 12s both; animation-iteration-count: infinite; animation-direction: alternate; }
+      /* individual line keyframes — all share the same fade-out window */
+      @keyframes k-l1  { 0%,14.2%{opacity:0} 14.4%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l2  { 0%,17.5%{opacity:0} 17.7%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l3  { 0%,20.8%{opacity:0} 21.0%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l4  { 0%,27.5%{opacity:0} 27.7%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l5  { 0%,30.0%{opacity:0} 30.2%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l6  { 0%,32.5%{opacity:0} 32.7%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l7  { 0%,35.0%{opacity:0} 35.2%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l8  { 0%,38.3%{opacity:0} 38.5%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l9  { 0%,40.8%{opacity:0} 41.0%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l10 { 0%,43.3%{opacity:0} 43.5%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l11 { 0%,45.8%{opacity:0} 46.0%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l12 { 0%,48.3%{opacity:0} 48.5%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l13 { 0%,50.8%{opacity:0} 51.0%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+      @keyframes k-l14 { 0%,53.3%{opacity:0} 53.5%{opacity:1} 83%{opacity:1} 91%{opacity:0} 100%{opacity:0} }
+
+      .l1  { animation: k-l1  12s linear infinite; }
+      .l2  { animation: k-l2  12s linear infinite; }
+      .l3  { animation: k-l3  12s linear infinite; }
+      .l3b { animation: k-l3  12s linear infinite; }
+      .l3c { animation: k-l3  12s linear infinite; }
+      .l4  { animation: k-l4  12s linear infinite; }
+      .l5  { animation: k-l5  12s linear infinite; }
+      .l6  { animation: k-l6  12s linear infinite; }
+      .l7  { animation: k-l7  12s linear infinite; }
+      .l8  { animation: k-l8  12s linear infinite; }
+      .l9  { animation: k-l9  12s linear infinite; }
+      .l10 { animation: k-l10 12s linear infinite; }
+      .l11 { animation: k-l11 12s linear infinite; }
+      .l12 { animation: k-l12 12s linear infinite; }
+      .l13 { animation: k-l13 12s linear infinite; }
+      .l14 { animation: k-l14 12s linear infinite; }
+
     </style>
   </defs>
 
@@ -64,7 +96,6 @@
   <!-- ── prompt + command ── -->
   <text x="20" y="72" class="mono sz13 c-prompt">❯</text>
   <text x="34" y="72" class="mono sz13 c-white cmd">cloudctl debug --agent "payments service 502s"</text>
-  <rect x="614" y="59" width="8" height="15" fill="#cdd6f4" class="cursor"/>
 
   <!-- ── triage output ── -->
   <text x="20" y="98" class="mono sz12 c-dim l1">  Agent investigating: payments service 502s</text>
@@ -74,7 +105,6 @@
     <tspan class="c-dim">  →  generating 3 parallel hypotheses…</tspan>
   </text>
 
-  <!-- 3 branch lines appear together -->
   <text x="20" y="141" class="mono sz12 l3">
     <tspan class="c-blue">  ├─ branch 1</tspan>
     <tspan class="c-dim">  ECS task memory / OOM kills</tspan>
@@ -107,7 +137,6 @@
   </text>
 
   <!-- ── result box ── -->
-  <!-- top border -->
   <text x="20" y="278" class="mono sz12 c-dim l8">  ╔══════════════╦═══════════════════════════════════════════════════════╗</text>
   <text x="20" y="295" class="mono sz12 l9">
     <tspan class="c-dim">  ║ </tspan><tspan class="c-yellow">STATUS</tspan><tspan class="c-dim">       ║ </tspan><tspan class="c-red">DEGRADED</tspan><tspan class="c-dim"> — ECS connection pool exhausted                  ║</tspan>
