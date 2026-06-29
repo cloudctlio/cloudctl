@@ -1,4 +1,4 @@
-"""cloudctl ai — natural language cloud queries powered by configured AI provider."""
+"""cloudctl ai — AI provider configuration and model management."""
 from __future__ import annotations
 
 import json
@@ -6,17 +6,12 @@ from typing import Optional
 
 import typer
 from rich.console import Console
-from rich.panel import Panel
 
 from cloudctl.commands._helpers import require_init
 from cloudctl.output.formatter import error, warn
 
-app    = typer.Typer(help="Ask questions about your cloud infrastructure using AI.")
+app     = typer.Typer(help="AI provider configuration and model management.")
 console = Console()
-
-_CLOUD   = typer.Option("all",  "--cloud",   "-c", help="Cloud provider: aws | azure | gcp | all")
-_ACCOUNT = typer.Option(None,   "--account", "-a", help="Scope to a specific account/profile.")
-_REGION  = typer.Option(None,   "--region",  "-r", help="Scope to a specific region.")
 
 
 def _get_ai(cfg):
@@ -44,43 +39,6 @@ def _fetch_context(cfg, cloud, account, region) -> dict:
     return fetcher.fetch_summary(cloud=cloud, account=account, region=region)
 
 
-@app.command("ask")
-def ai_ask(
-    question: str           = typer.Argument(..., help="Natural language question about your infrastructure."),
-    cloud:    str           = _CLOUD,
-    account:  Optional[str] = _ACCOUNT,
-    region:   Optional[str] = _REGION,
-    no_data:  bool          = typer.Option(False, "--no-data", help="Skip data fetch, answer from config only."),
-) -> None:
-    """Ask a natural language question about your cloud infrastructure."""
-    cfg = require_init()
-    ai  = _get_ai(cfg)
-
-    context: dict = {}
-    if not no_data:
-        with console.status("[dim]Fetching cloud data...[/dim]"):
-            try:
-                context = _fetch_context(cfg, cloud, account, region)
-            except Exception as e:
-                warn(f"Could not fetch cloud context: {e}")
-
-    with console.status("[dim]Thinking...[/dim]"):
-        try:
-            result = ai.ask(question, context=context)
-        except Exception as e:
-            error(f"AI error: {e}")
-            raise typer.Exit(1)
-
-    answer     = result.get("answer", str(result))
-    confidence = result.get("confidence", "UNKNOWN")
-    sources    = result.get("sources", [])
-
-    confidence_color = {"HIGH": "green", "MEDIUM": "yellow", "LOW": "red"}.get(confidence, "dim")
-    footer = f"[{confidence_color}]{confidence} confidence[/{confidence_color}]"
-    if sources:
-        footer += f"  |  sources: {', '.join(sources)}"
-
-    console.print(Panel(answer, title=f"[bold cyan]{question}[/bold cyan]", subtitle=footer))
 
 
 @app.command("status")
