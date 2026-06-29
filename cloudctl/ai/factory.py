@@ -179,8 +179,10 @@ class BedrockAI(BaseAI):
         # Create a fresh session each invocation so SSO tokens are always current.
         # For long debug runs the data-fetch phase can take 2+ minutes, which
         # exhausts short-lived SSO access tokens if the client is pre-built.
+        from botocore.config import Config as BotoConfig  # noqa: PLC0415
         session = boto3.Session(profile_name=self._profile) if self._profile else boto3.Session()
-        client = session.client("bedrock-runtime", region_name=self._region)
+        config = BotoConfig(connect_timeout=10, read_timeout=120)
+        client = session.client("bedrock-runtime", region_name=self._region, config=config)
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 4096,

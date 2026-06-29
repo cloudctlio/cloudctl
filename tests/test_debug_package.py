@@ -1184,3 +1184,715 @@ class TestGenericResourceHarvest:
             result = engine._detect_deployment_method("aws", "test-profile", None, context)
 
         assert result == "terraform"
+
+
+# ─── fetcher: bedrock_agent_config ──────────────────────────────────────────
+
+class TestBedrockAgentConfigFetcher:
+    """Regression test for a real production miss: bedrock_agent_config
+    fetched action_groups but never called list_agent_knowledge_bases, so
+    the agent had no way to see a real KB association and twice concluded
+    "no KB attached to the agent" when the actual fault was elsewhere
+    (a bad S3 data-source prefix, an S3 Vectors permission denial)."""
+
+    def test_includes_knowledge_base_association(self):
+        from unittest.mock import MagicMock
+
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        ba = MagicMock()
+        ba.list_agents.return_value = {
+            "agentSummaries": [{"agentId": "AG123", "agentName": "rag-assistant-agent"}],
+        }
+        ba.get_agent.return_value = {"agent": {
+            "agentName": "rag-assistant-agent", "agentStatus": "PREPARED",
+            "foundationModel": "anthropic.claude-3", "instruction": "x",
+            "idleSessionTTLInSeconds": 600,
+        }}
+        ba.list_agent_aliases.return_value = {"agentAliasSummaries": []}
+        ba.list_agent_action_groups.return_value = {"actionGroupSummaries": []}
+        ba.list_agent_knowledge_bases.return_value = {
+            "agentKnowledgeBaseSummaries": [
+                {"knowledgeBaseId": "KB456", "knowledgeBaseState": "ENABLED"},
+            ],
+        }
+
+        session = MagicMock()
+        session.client.return_value = ba
+
+        result = DebugFetcher(session).bedrock_agent_config("rag-assistant-agent")
+
+        assert result["knowledge_bases"] == [
+            {"knowledge_base_id": "KB456", "state": "ENABLED"},
+        ]
+
+    def test_missing_knowledge_base_yields_empty_list(self):
+        from unittest.mock import MagicMock
+
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        ba = MagicMock()
+        ba.list_agents.return_value = {
+            "agentSummaries": [{"agentId": "AG123", "agentName": "rag-assistant-agent"}],
+        }
+        ba.get_agent.return_value = {"agent": {
+            "agentName": "rag-assistant-agent", "agentStatus": "PREPARED",
+            "foundationModel": "anthropic.claude-3", "instruction": "x",
+            "idleSessionTTLInSeconds": 600,
+        }}
+        ba.list_agent_aliases.return_value = {"agentAliasSummaries": []}
+        ba.list_agent_action_groups.return_value = {"actionGroupSummaries": []}
+        ba.list_agent_knowledge_bases.return_value = {"agentKnowledgeBaseSummaries": []}
+
+        session = MagicMock()
+        session.client.return_value = ba
+
+        result = DebugFetcher(session).bedrock_agent_config("rag-assistant-agent")
+
+        assert result["knowledge_bases"] == []
+
+
+class TestLambdaEventSourceMappingsFetcher:
+    """Regression test for a real production miss: lambda_function_config
+    never fetched event source mappings, so when an MSK/Kafka poller's own
+    auth fails, the Lambda is never invoked at all (zero logs, zero
+    metrics) and the agent had no tool-visible way to see the real failure
+    — it guessed "cluster was recreated" from circumstantial CloudTrail
+    timing instead of the actual AccessDenied surfaced in
+    StateTransitionReason/LastProcessingResult."""
+
+    def _make_session(self, mappings):
+        from unittest.mock import MagicMock
+
+        lmb = MagicMock()
+        lmb.list_functions.return_value = {"Functions": [{"FunctionName": "streaming-etl-consumer"}]}
+        lmb.get_function_configuration.return_value = {
+            "FunctionName": "streaming-etl-consumer", "Runtime": "python3.11",
+            "Handler": "handler.handler", "MemorySize": 256, "Timeout": 30,
+            "State": "Active",
+        }
+        lmb.get_function_concurrency.return_value = {}
+        lmb.list_event_source_mappings.return_value = {"EventSourceMappings": mappings}
+
+        session = MagicMock()
+        session.client.return_value = lmb
+        return session
+
+    def test_surfaces_access_denied_state_transition_reason(self):
+        from cloudctl.debug.fetcher import DebugFetcher
+        session = self._make_session([{
+            "UUID": "abc-123",
+            "EventSourceArn": "arn:aws:kafka:us-east-1:123:cluster/streaming-etl-cluster/xyz",
+            "State": "Enabled",
+            "StateTransitionReason": "PROBLEM: AccessDeniedException calling kafka-cluster:Connect",
+            "LastProcessingResult": "PROBLEM: KMSAccessDeniedException encountered",
+            "LastModified": "2026-06-24T01:00:00Z",
+        }])
+
+        result = DebugFetcher(session).lambda_function_config("streaming-etl-consumer")
+
+        assert len(result["event_source_mappings"]) == 1
+        esm = result["event_source_mappings"][0]
+        assert "AccessDeniedException" in esm["state_transition_reason"]
+        assert "AccessDeniedException" in esm["last_processing_result"]
+
+    def test_no_mappings_yields_empty_list(self):
+        from cloudctl.debug.fetcher import DebugFetcher
+        session = self._make_session([])
+
+        result = DebugFetcher(session).lambda_function_config("streaming-etl-consumer")
+
+        assert result["event_source_mappings"] == []
+
+
+class TestEventBridgeCustomBusFetcher:
+    """Regression test for a real production miss: eventbridge_rule_config
+    called list_rules()/list_targets_by_rule() without EventBusName, which
+    only searches the DEFAULT bus — a rule on a custom bus is invisible.
+    The agent concluded "no rule exists" with HIGH confidence on
+    streaming-etl (whose only rule lives on a custom bus), when the rule
+    was there all along."""
+
+    def _make_session(self):
+        from unittest.mock import MagicMock
+
+        eb = MagicMock()
+        eb.list_event_buses.return_value = {"EventBuses": [
+            {"Name": "default"}, {"Name": "streaming-etl-bus"},
+        ]}
+
+        def _list_rules(NamePrefix=None, EventBusName=None):  # noqa: N803
+            if EventBusName == "streaming-etl-bus":
+                return {"Rules": [{"Name": "streaming-etl-rule", "State": "ENABLED",
+                                   "EventPattern": '{"source":["streaming-etl.app"]}',
+                                   "EventBusName": "streaming-etl-bus"}]}
+            return {"Rules": []}
+
+        eb.list_rules.side_effect = _list_rules
+        eb.list_targets_by_rule.return_value = {"Targets": [
+            {"Id": "1", "Arn": "arn:aws:lambda:us-east-1:123:function:streaming-etl-eb-target"},
+        ]}
+
+        session = MagicMock()
+        session.client.return_value = eb
+        return session
+
+    def test_finds_rule_on_custom_bus(self):
+        from cloudctl.debug.fetcher import DebugFetcher
+        session = self._make_session()
+
+        result = DebugFetcher(session).eventbridge_rule_config("streaming-etl-rule")
+
+        assert result["name"] == "streaming-etl-rule"
+        assert result["event_bus"] == "streaming-etl-bus"
+        assert len(result["targets"]) == 1
+
+    def test_no_rule_anywhere_yields_empty_dict(self):
+        from unittest.mock import MagicMock
+
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        eb = MagicMock()
+        eb.list_event_buses.return_value = {"EventBuses": [{"Name": "default"}]}
+        eb.list_rules.return_value = {"Rules": []}
+        session = MagicMock()
+        session.client.return_value = eb
+
+        result = DebugFetcher(session).eventbridge_rule_config("nonexistent-rule")
+
+        assert result == {}
+
+
+class TestSerialise:
+    """Regression test for a real production miss: get_service_config's
+    _serialise() helper had no bytes handling, so when waf_web_acl_config
+    surfaced a WAF rule's byte_match_statement.search_string (which AWS
+    returns as a raw bytes Blob, not str), json.dumps crashed with
+    'Object of type bytes is not JSON serializable' — and crashed the
+    entire run_incidents.sh batch, not just that one tool call."""
+
+    def test_utf8_bytes_decoded_to_string(self):
+        import json
+
+        from cloudctl.mcp.tools.debug import _serialise
+        result = _serialise({"search_string": b"v2"})
+        assert result == {"search_string": "v2"}
+        json.dumps(result)  # must not raise
+
+    def test_non_utf8_bytes_get_a_placeholder_not_a_crash(self):
+        import json
+
+        from cloudctl.mcp.tools.debug import _serialise
+        result = _serialise({"blob": b"\xff\xfe\x00\x01"})
+        assert "not UTF-8" in result["blob"]
+        json.dumps(result)  # must not raise
+
+    def test_bytes_nested_in_list_and_dict(self):
+        import json
+
+        from cloudctl.mcp.tools.debug import _serialise
+        result = _serialise({"rules": [{"statement": {"search_string": b"v2"}}]})
+        assert result["rules"][0]["statement"]["search_string"] == "v2"
+        json.dumps(result)  # must not raise
+
+
+class TestCognitoUserPoolConfigFetcher:
+    """cognito-auth's user_pool_client_misconfigured incident hinges entirely
+    on the App Client's explicit_auth_flows — a config-drift fault with no
+    log or metric signal at all. Before this fetcher, cloudctl had zero
+    Cognito support anywhere; the agent could see the trigger Lambdas
+    themselves but had no way to see which triggers are wired to the pool
+    or what auth flows an App Client allows."""
+
+    def _make_session(self, lambda_config=None, explicit_auth_flows=None):
+        from unittest.mock import MagicMock
+
+        idp = MagicMock()
+        idp.list_user_pools.return_value = {"UserPools": [
+            {"Id": "us-east-1_abc123", "Name": "cognito-auth-pool"},
+        ]}
+        idp.describe_user_pool.return_value = {"UserPool": {
+            "Id": "us-east-1_abc123", "Name": "cognito-auth-pool",
+            "Arn": "arn:aws:cognito-idp:us-east-1:123:userpool/us-east-1_abc123",
+            "Status": "ACTIVE", "MfaConfiguration": "OFF",
+            "LambdaConfig": lambda_config or {},
+            "AutoVerifiedAttributes": ["email"], "EstimatedNumberOfUsers": 0,
+        }}
+        idp.list_user_pool_clients.return_value = {"UserPoolClients": [
+            {"ClientId": "client123"},
+        ]}
+        idp.describe_user_pool_client.return_value = {"UserPoolClient": {
+            "ClientId": "client123", "ClientName": "cognito-auth-client",
+            "ExplicitAuthFlows": explicit_auth_flows or [],
+            "AccessTokenValidity": 1, "IdTokenValidity": 1,
+        }}
+        session = MagicMock()
+        session.client.return_value = idp
+        return session
+
+    def test_surfaces_lambda_trigger_wiring(self):
+        from cloudctl.debug.fetcher import DebugFetcher
+        session = self._make_session(lambda_config={
+            "PreAuthentication": "arn:aws:lambda:us-east-1:123:function:cognito-auth-pre-auth",
+            "PostConfirmation": "arn:aws:lambda:us-east-1:123:function:cognito-auth-post-confirmation",
+        })
+
+        result = DebugFetcher(session).cognito_user_pool_config("cognito-auth-pool")
+
+        assert result["lambda_config"]["PreAuthentication"].endswith("cognito-auth-pre-auth")
+        assert result["lambda_config"]["PostConfirmation"].endswith("cognito-auth-post-confirmation")
+
+    def test_surfaces_app_client_auth_flows(self):
+        from cloudctl.debug.fetcher import DebugFetcher
+        session = self._make_session(explicit_auth_flows=["ALLOW_REFRESH_TOKEN_AUTH"])
+
+        result = DebugFetcher(session).cognito_user_pool_config("cognito-auth-pool")
+
+        flows = result["app_clients"][0]["explicit_auth_flows"]
+        assert "ALLOW_USER_PASSWORD_AUTH" not in flows
+        assert "ALLOW_REFRESH_TOKEN_AUTH" in flows
+
+    def test_no_pool_found_yields_empty_dict(self):
+        from unittest.mock import MagicMock
+
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        idp = MagicMock()
+        idp.list_user_pools.return_value = {"UserPools": []}
+        session = MagicMock()
+        session.client.return_value = idp
+
+        result = DebugFetcher(session).cognito_user_pool_config("nonexistent-pool")
+
+        assert result == {}
+
+
+class TestAppsyncApiConfigFetcher:
+    """appsync-graphql's resolver_misconfigured incident is a response
+    mapping template bug that returns a wrong-but-valid value (silent data
+    corruption, not an error) — AppSync produces zero log signal for this
+    unless field-level logging is explicitly enabled. The agent's only way
+    to find it is reading the actual mapping template text via this
+    fetcher; before this, cloudctl had zero AppSync support."""
+
+    def _make_session(self, response_mapping_template=None, auth_type="API_KEY",
+                       additional_auth=None):
+        from unittest.mock import MagicMock
+
+        appsync = MagicMock()
+        appsync.list_graphql_apis.return_value = {"graphqlApis": [
+            {"apiId": "abc123", "name": "appsync-graphql-api", "authenticationType": auth_type,
+             "additionalAuthenticationProviders": additional_auth or []},
+        ]}
+        appsync.list_data_sources.return_value = {"dataSources": [
+            {"name": "ItemsDataSource", "type": "AMAZON_DYNAMODB",
+             "serviceRoleArn": "arn:aws:iam::123:role/appsync-ds-role",
+             "dynamodbConfig": {"tableName": "appsync-graphql-items"}},
+        ]}
+
+        def _list_resolvers(apiId, typeName):  # noqa: N803
+            if typeName == "Query":
+                return {"resolvers": [{
+                    "fieldName": "getItem", "dataSourceName": "ItemsDataSource",
+                    "kind": "UNIT", "requestMappingTemplate": "## req",
+                    "responseMappingTemplate": response_mapping_template or "$util.toJson($ctx.result)",
+                }]}
+            return {"resolvers": []}
+
+        appsync.list_resolvers.side_effect = _list_resolvers
+        appsync.list_api_keys.return_value = {"apiKeys": [{"id": "key123", "expires": 1735000000}]}
+
+        session = MagicMock()
+        session.client.return_value = appsync
+        return session
+
+    def test_surfaces_resolver_response_mapping_template(self):
+        from cloudctl.debug.fetcher import DebugFetcher
+        session = self._make_session(response_mapping_template="$util.toJson($ctx.result.wrongField)")
+
+        result = DebugFetcher(session).appsync_api_config("appsync-graphql-api")
+
+        query_resolvers = [r for r in result["resolvers"] if r["type_name"] == "Query"]
+        assert query_resolvers[0]["response_mapping_template"] == "$util.toJson($ctx.result.wrongField)"
+
+    def test_surfaces_auth_mode_and_additional_providers(self):
+        from cloudctl.debug.fetcher import DebugFetcher
+        session = self._make_session(auth_type="AMAZON_COGNITO_USER_POOLS",
+                                       additional_auth=[{"authenticationType": "API_KEY"}])
+
+        result = DebugFetcher(session).appsync_api_config("appsync-graphql-api")
+
+        assert result["authentication_type"] == "AMAZON_COGNITO_USER_POOLS"
+        types = [p["type"] for p in result["additional_authentication_providers"]]
+        assert "API_KEY" in types
+
+    def test_no_api_found_yields_empty_dict(self):
+        from unittest.mock import MagicMock
+
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        appsync = MagicMock()
+        appsync.list_graphql_apis.return_value = {"graphqlApis": []}
+        session = MagicMock()
+        session.client.return_value = appsync
+
+        result = DebugFetcher(session).appsync_api_config("nonexistent-api")
+
+        assert result == {}
+
+
+class TestEfsFilesystemConfigFetcher:
+    def test_efs_filesystem_config(self):
+        from unittest.mock import MagicMock
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        efs = MagicMock()
+        efs.describe_file_systems.return_value = {"FileSystems": [
+            {"FileSystemId": "fs-12345678", "Name": "efs-shared-storage", "LifeCycleState": "available",
+             "PerformanceMode": "generalPurpose", "ThroughputMode": "bursting", "Encrypted": True, "NumberOfMountTargets": 1}
+        ]}
+        efs.describe_mount_targets.return_value = {"MountTargets": [
+            {"MountTargetId": "fsmt-12345", "SubnetId": "subnet-abc", "AvailabilityZoneName": "us-east-1a",
+             "LifeCycleState": "available", "IpAddress": "10.0.0.5"}
+        ]}
+        efs.describe_mount_target_security_groups.return_value = {"SecurityGroups": ["sg-123"]}
+        efs.describe_access_points.return_value = {"AccessPoints": []}
+
+        ec2 = MagicMock()
+        ec2.describe_security_groups.return_value = {"SecurityGroups": [
+            {"GroupId": "sg-123", "GroupName": "efs-sg", "IpPermissions": []}
+        ]}
+
+        session = MagicMock()
+        session.client.side_effect = lambda svc, **kw: {"efs": efs, "ec2": ec2}.get(svc)
+
+        result = DebugFetcher(session).efs_filesystem_config("efs-shared-storage")
+        assert result["filesystem_id"] == "fs-12345678"
+        assert result["name"] == "efs-shared-storage"
+        assert len(result["mount_targets"]) == 1
+        assert result["mount_targets"][0]["security_groups"] == ["sg-123"]
+
+
+class TestBatchConfigFetcher:
+    def test_batch_config(self):
+        from unittest.mock import MagicMock
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        batch = MagicMock()
+        batch.describe_compute_environments.return_value = {"computeEnvironments": [
+            {"computeEnvironmentName": "batch-compute-env", "computeEnvironmentArn": "arn:aws:batch:us-east-1:123:compute-environment/batch-compute-env",
+             "type": "MANAGED", "state": "ENABLED", "status": "VALID", "computeResources": {"subnets": ["subnet-1"]}}
+        ]}
+        batch.describe_job_queues.return_value = {"jobQueues": [
+            {"jobQueueName": "batch-job-queue", "jobQueueArn": "arn:aws:batch:us-east-1:123:job-queue/batch-job-queue",
+             "state": "ENABLED", "status": "VALID", "priority": 1, "computeEnvironmentOrder": []}
+        ]}
+        batch.describe_job_definitions.return_value = {"jobDefinitions": [
+            {"jobDefinitionName": "batch-job-def", "jobDefinitionArn": "arn:aws:batch:us-east-1:123:job-definition/batch-job-def:1",
+             "revision": 1, "status": "ACTIVE", "type": "container", "containerProperties": {"image": "busybox"}}
+        ]}
+        batch.list_jobs.return_value = {"jobSummaryList": []}
+
+        session = MagicMock()
+        session.client.return_value = batch
+
+        result = DebugFetcher(session).batch_config("batch")
+        assert len(result["compute_environments"]) == 1
+        assert result["compute_environments"][0]["name"] == "batch-compute-env"
+        assert len(result["job_queues"]) == 1
+        assert result["job_queues"][0]["name"] == "batch-job-queue"
+        assert len(result["job_definitions"]) == 1
+        assert result["job_definitions"][0]["name"] == "batch-job-def"
+
+
+class TestEfsAndBatchListers:
+    def test_list_efs(self):
+        from unittest.mock import MagicMock
+        from cloudctl.mcp.tools.debug import _list_efs
+
+        efs = MagicMock()
+        efs.describe_file_systems.return_value = {"FileSystems": [{"FileSystemId": "fs-1234"}]}
+        session = MagicMock()
+        session.client.return_value = efs
+
+        assert _list_efs(session) == ["fs-1234"]
+
+    def test_list_batch(self):
+        from unittest.mock import MagicMock
+        from cloudctl.mcp.tools.debug import _list_batch
+
+        batch = MagicMock()
+        batch.describe_compute_environments.return_value = {"computeEnvironments": [{"computeEnvironmentName": "env-1"}]}
+        batch.describe_job_queues.return_value = {"jobQueues": [{"jobQueueName": "queue-1"}]}
+        batch.describe_job_definitions.return_value = {"jobDefinitions": [{"jobDefinitionName": "def-1"}]}
+        session = MagicMock()
+        session.client.return_value = batch
+
+        assert _list_batch(session) == ["env-1", "queue-1", "def-1"]
+
+
+class TestGenericResourceFetcher:
+    def test_generic_fallback_tagging_and_cloudcontrol(self):
+        from unittest.mock import MagicMock
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        # Mock tagging client
+        tagging = MagicMock()
+        tagging.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {
+                    "ResourceARN": "arn:aws:mq:us-east-1:123456789012:broker:my-broker",
+                    "Tags": [{"Key": "Name", "Value": "my-broker"}, {"Key": "Env", "Value": "Prod"}]
+                }
+            ]
+        }
+
+        # Mock cloudcontrol client
+        cc = MagicMock()
+        cc.get_resource.return_value = {
+            "ResourceDescription": {
+                "Properties": '{"BrokerName": "my-broker", "EngineType": "ActiveMQ"}'
+            }
+        }
+
+        session = MagicMock()
+        def get_client(service, **kwargs):
+            if service == "resourcegroupstaggingapi":
+                return tagging
+            if service == "cloudcontrol":
+                return cc
+            return MagicMock()
+
+        session.client.side_effect = get_client
+
+        fetcher = DebugFetcher(session)
+        res = fetcher.generic_resource_config("mq", "my-broker")
+        assert res["BrokerName"] == "my-broker"
+        assert res["EngineType"] == "ActiveMQ"
+        assert res["tags"] == {"Name": "my-broker", "Env": "Prod"}
+        assert res["_fetch_method"] == "cloudcontrol"
+
+    def test_generic_fallback_boto3_reflection(self):
+        from unittest.mock import MagicMock
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        # Mock tagging client
+        tagging = MagicMock()
+        tagging.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {
+                    "ResourceARN": "arn:aws:mq:us-east-1:123456789012:broker:my-broker",
+                    "Tags": [{"Key": "Name", "Value": "my-broker"}]
+                }
+            ]
+        }
+
+        # Cloudcontrol client returns error
+        cc = MagicMock()
+        cc.get_resource.side_effect = Exception("Not supported")
+
+        # Mock mq client for reflection
+        mq = MagicMock()
+        mq.meta.service_model.operation_names = ["DescribeBroker"]
+        op_model = MagicMock()
+        op_model.py_name = "describe_broker"
+        input_shape = MagicMock()
+        input_shape.members = ["BrokerId"]
+        op_model.input_shape = input_shape
+        mq.meta.service_model.operation_model.return_value = op_model
+
+        mq.describe_broker.return_value = {
+            "BrokerName": "my-broker",
+            "BrokerId": "my-broker",
+            "EngineType": "RabbitMQ"
+        }
+
+        session = MagicMock()
+        def get_client(service, **kwargs):
+            if service == "resourcegroupstaggingapi":
+                return tagging
+            if service == "cloudcontrol":
+                return cc
+            if service == "mq":
+                return mq
+            return MagicMock()
+
+        session.client.side_effect = get_client
+
+        fetcher = DebugFetcher(session)
+        res = fetcher.generic_resource_config("mq", "my-broker")
+        assert res["BrokerName"] == "my-broker"
+        assert res["EngineType"] == "RabbitMQ"
+        assert res["_fetch_method"] == "boto3_reflection"
+
+    def test_generic_fallback_dependency_enrichment(self):
+        from unittest.mock import MagicMock
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        # Mock tagging client
+        tagging = MagicMock()
+        tagging.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {
+                    "ResourceARN": "arn:aws:mq:us-east-1:123456789012:broker:my-broker",
+                    "Tags": []
+                }
+            ]
+        }
+
+        # Mock cloudcontrol returning dependency strings
+        cc = MagicMock()
+        cc.get_resource.return_value = {
+            "ResourceDescription": {
+                "Properties": (
+                    '{"SecurityGroups": ["sg-abc1234"], "RoleArn": "arn:aws:iam::123456789012:role/app-role", '
+                    '"SubnetId": "subnet-abc987f", "VpcId": "vpc-111222", '
+                    '"KmsKeyId": "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"}'
+                )
+            }
+        }
+
+        # Mock all the enrichment clients
+        ec2 = MagicMock()
+        ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [{
+                "GroupId": "sg-abc1234", "GroupName": "app-sg", "VpcId": "vpc-111222",
+                "IpPermissions": [{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+                "IpPermissionsEgress": []
+            }]
+        }
+        ec2.describe_subnets.return_value = {
+            "Subnets": [{"SubnetId": "subnet-abc987f", "VpcId": "vpc-111222", "CidrBlock": "10.0.1.0/24"}]
+        }
+        ec2.describe_vpcs.return_value = {
+            "Vpcs": [{"VpcId": "vpc-111222", "CidrBlock": "10.0.0.0/16"}]
+        }
+        ec2.describe_route_tables.return_value = {"RouteTables": []}
+
+        iam = MagicMock()
+        iam.get_role.return_value = {
+            "Role": {"RoleName": "app-role", "AssumeRolePolicyDocument": {}}
+        }
+        iam.list_role_policies.return_value = {"PolicyNames": ["inline-1"]}
+        iam.get_role_policy.return_value = {"PolicyDocument": {"Statement": []}}
+        iam.list_attached_role_policies.return_value = {"AttachedPolicies": []}
+
+        kms = MagicMock()
+        kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyId": "12345678-1234-1234-1234-123456789012", "Arn": "arn:aws:kms:...", "Enabled": True}
+        }
+        kms.get_key_rotation_status.return_value = {"KeyRotationEnabled": True}
+        kms.get_key_policy.return_value = {"Policy": "{}"}
+
+        session = MagicMock()
+        def get_client(service, **kwargs):
+            if service == "resourcegroupstaggingapi":
+                return tagging
+            if service == "cloudcontrol":
+                return cc
+            if service == "ec2":
+                return ec2
+            if service == "iam":
+                return iam
+            if service == "kms":
+                return kms
+            return MagicMock()
+
+        session.client.side_effect = get_client
+
+        fetcher = DebugFetcher(session)
+        res = fetcher.generic_resource_config("mq", "my-broker")
+        assert "_resolved_security_groups" in res
+        assert "_resolved_iam_roles" in res
+        assert "_resolved_kms_keys" in res
+        assert "_resolved_network_resources" in res
+
+        assert res["_resolved_security_groups"]["sg-abc1234"]["group_name"] == "app-sg"
+        assert res["_resolved_iam_roles"]["arn:aws:iam::123456789012:role/app-role"]["role_name"] == "app-role"
+        assert res["_resolved_network_resources"]["subnet-abc987f"]["cidr_block"] == "10.0.1.0/24"
+        assert res["_resolved_network_resources"]["vpc-111222"]["cidr_block"] == "10.0.0.0/16"
+        assert res["_resolved_kms_keys"]["arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"]["rotation_enabled"] is True
+
+    def test_generic_fallback_last_resort(self):
+        from unittest.mock import MagicMock
+        from cloudctl.debug.fetcher import DebugFetcher
+
+        tagging = MagicMock()
+        tagging.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {
+                    "ResourceARN": "arn:aws:mq:us-east-1:123456789012:broker:my-broker",
+                    "Tags": [{"Key": "foo", "Value": "bar"}]
+                }
+            ]
+        }
+
+        # CC and Boto3 reflect fail
+        cc = MagicMock()
+        cc.get_resource.side_effect = Exception("unsupported")
+
+        session = MagicMock()
+        def get_client(service, **kwargs):
+            if service == "resourcegroupstaggingapi":
+                return tagging
+            if service == "cloudcontrol":
+                return cc
+            return MagicMock()
+
+        session.client.side_effect = get_client
+
+        fetcher = DebugFetcher(session)
+        res = fetcher.generic_resource_config("mq", "my-broker")
+        assert res["resource_arn"] == "arn:aws:mq:us-east-1:123456789012:broker:my-broker"
+        assert res["tags"] == {"foo": "bar"}
+        assert res["_fetch_method"] == "tagging_api"
+
+
+class TestDebugToolsFallback:
+    def test_get_service_config_unregistered_fallback(self):
+        from unittest.mock import MagicMock, patch
+        import json
+        from cloudctl.mcp.tools.debug import get_service_config
+
+        session = MagicMock()
+        with patch("cloudctl.mcp.tools.debug._make_session", return_value=session):
+            with patch("cloudctl.debug.fetcher.DebugFetcher.generic_resource_config") as mock_generic:
+                mock_generic.return_value = {"BrokerName": "my-broker"}
+                
+                res_str = get_service_config(
+                    service_type="mq",
+                    resource_hint="my-broker",
+                    profile=None,
+                    region="us-east-1"
+                )
+                res = json.loads(res_str)
+                assert res["found"] is True
+                assert res["service_type"] == "mq"
+                assert res["config"]["BrokerName"] == "my-broker"
+                mock_generic.assert_called_once_with(service_type="mq", resource_name="my-broker")
+
+    def test_list_resources_unregistered_fallback(self):
+        from unittest.mock import MagicMock, patch
+        import json
+        from cloudctl.mcp.tools.debug import list_resources
+
+        tagger = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"ResourceTagMappingList": [{"ResourceARN": "arn:aws:mq:us-east-1:123:broker:my-broker"}]}
+        ]
+        tagger.get_paginator.return_value = paginator
+
+        session = MagicMock()
+        session.client.return_value = tagger
+
+        with patch("cloudctl.mcp.tools.debug._make_session", return_value=session):
+            res_str = list_resources(
+                service_type="mq",
+                profile=None,
+                region="us-east-1"
+            )
+            res = json.loads(res_str)
+            assert res["service_type"] == "mq"
+            assert res["count"] == 1
+            assert res["resources"] == ["arn:aws:mq:us-east-1:123:broker:my-broker"]

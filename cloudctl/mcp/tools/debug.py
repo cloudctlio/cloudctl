@@ -50,10 +50,10 @@ _SERVICE_FETCHERS: dict[str, tuple[str, str]] = {
     "route53":         ("route53_zone_config",       "zone_hint"),
     "codepipeline":    ("codepipeline_config",       "pipeline_hint"),
     # ── AI / ML ───────────────────────────────────────────────────────────────
-    "sagemaker":       ("sagemaker_endpoint_config", "endpoint_hint"),
-    "bedrock_agent":   ("bedrock_agent_config",      "agent_hint"),
-    "bedrock_kb":      ("bedrock_kb_config",         "kb_hint"),
-    "agentcore":       ("agentcore_config",          "store_hint"),
+    "sagemaker":       ("sagemaker_endpoint_config", "resource_name"),
+    "bedrock_agent":   ("bedrock_agent_config",      "resource_name"),
+    "bedrock_kb":      ("bedrock_kb_config",         "resource_name"),
+    "agentcore":       ("agentcore_config",          "resource_name"),
 }
 
 
@@ -754,6 +754,35 @@ def get_event_timeline(
         "inflection_point": inflection,
         "sources_fetched":  list(fetcher.availability.keys()),
         "timeline":         tl_dicts[-50:],
+    }, indent=2)
+
+
+def search_cloudtrail(
+    resource_name: str,
+    profile:       str | None,
+    region:        str,
+    event_names:   list[str] | None = None,
+    minutes:       int = 1440,
+) -> str:
+    """Search CloudTrail for all events touching a specific resource.
+
+    Returns events newest-first with: time, event_name, actor, error_code,
+    and request parameters. Use this to find what changed (deletion, policy
+    detachment, config modification) before failures started.
+    """
+    from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+    session = _make_session(profile, region)
+    fetcher = DebugFetcher(session)
+    events  = fetcher.search_cloudtrail_events(
+        resource_name=resource_name,
+        event_names=event_names,
+        minutes=minutes,
+    )
+    return json.dumps({
+        "resource_name": resource_name,
+        "minutes":       minutes,
+        "event_count":   len(events),
+        "events":        _serialise(events),
     }, indent=2)
 
 

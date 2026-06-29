@@ -152,7 +152,7 @@ _RESOLUTION_TOOLS = [
 
 
 _RESOLUTION_SYSTEM = """\
-You are an IaC engineer applying a production fix based on a confirmed incident diagnosis.
+You are an expert IaC engineer applying a precise production fix in a Git repository based on a confirmed cloud incident diagnosis.
 
 You receive a JSON object with:
   root_cause         — confirmed diagnosis sentence
@@ -171,13 +171,16 @@ MANDATORY SEQUENCE:
   5. git_commit_push     — stage only the changed files, not everything
   6. create_pull_request — PR body cites root_cause and evidence items
 
-RULES:
-  - Only change what is needed. No refactoring, no formatting, no extras.
-  - Always read before writing. Never guess file content.
-  - If validate_change fails, read the error, fix it, re-validate.
-  - If deployment_source is 'unknown' or 'manual':
-      Do NOT call write_iac_change, git_commit_push, or create_pull_request.
-      Instead respond immediately with JSON using status = "manual_required".
+CRITICAL CODE REVIEW & TRACING RULES (To achieve 95%+ success):
+  - **Codebase Searching**: Use `iac_file_hint` to find the target resource definition. If the file is not at the exact path, inspect common files in the workspace (e.g. `main.tf`, `variables.tf`, `locals.tf`, `lib/*.ts`, `bin/*.ts`) to trace the resource name.
+  - **Trace Variable Definitions**: If the resource attribute you need to fix references a variable, local value, or environment configuration (e.g. `var.my_param`, `local.db_port`, or `process.env.TIMEOUT`), do NOT hardcode the fix directly in the resource file. Instead, call `read_iac_file` on the variables/locals files (e.g. `variables.tf`, `locals.tf`, `terraform.tfvars`, or CDK config files), find where the value is defined, and apply your fix there.
+  - **Iterative Compile/Validation Check**: After using `write_iac_change`, always run `validate_change`. If the validation fails:
+      1. Carefully read and parse the compiler/validation error messages returned by the tool.
+      2. Identify the line, file, and syntax/logical error.
+      3. Call `write_iac_change` again to fix the error (e.g., matching brackets, declaring missing variables, correcting types).
+      4. Re-run `validate_change` until it returns success=true.
+  - **Targeted Changes**: Keep changes minimal. Never reformat unrelated lines or change unrelated parameters. Ensure the `old_content` string in `write_iac_change` matches the existing file contents verbatim, including indentation and spacing.
+  - **No Manual-Source Hacks**: If deployment_source is 'unknown' or 'manual', do NOT write any files or create PRs. Instead, immediately respond with status = "manual_required" and list detailed `manual_steps`.
 
 When done, respond ONLY with a JSON object:
 {
@@ -216,12 +219,14 @@ def run(
         git_create_branch, git_commit_push, create_pull_request,
     )
 
+    from botocore.config import Config as BotoConfig  # noqa: PLC0415
     if profile:
         session = boto3.Session(profile_name=profile, region_name=region)
     else:
         session = boto3.Session(region_name=region)
 
-    bedrock = session.client("bedrock-runtime", region_name=region)
+    config = BotoConfig(connect_timeout=10, read_timeout=120)
+    bedrock = session.client("bedrock-runtime", region_name=region, config=config)
 
     user_content = json.dumps({
         "root_cause":         diagnosis.get("root_cause", ""),

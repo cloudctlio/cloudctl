@@ -19,7 +19,8 @@ venv/
 # OS
 .DS_Store
 
-# E2E tests and evaluation harness — internal only, never commit
+# Evaluation harness — internal only, never commit
+# E2E test apps live in C:\Users\haris\AWS-CDK (separate repo)
 tests/e2e/
 tests/harness/
 

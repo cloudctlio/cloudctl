@@ -188,6 +188,7 @@ class DebugEngine:
         "secret", "password", "passwd", "token", "api_key", "apikey",
         "auth", "credential", "private_key", "access_key", "signing_key",
         "encryption_key", "client_secret", "db_pass", "database_pass",
+        "incident_mode",
     )
 
     @classmethod

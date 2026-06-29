@@ -1705,7 +1705,7 @@ class AWSProvider(CloudProvider):
 
         # ── Lambda function config ─────────────────────────────────────────────
         for hint in all_hints[:3]:
-            fn_cfg = fetcher.lambda_function_config(function_name=hint)
+            fn_cfg = fetcher.lambda_function_config(resource_name=hint)
             if fn_cfg:
                 context["lambda_function_config"] = fn_cfg
                 break
@@ -1740,91 +1740,91 @@ class AWSProvider(CloudProvider):
 
         # ── RDS instance config ───────────────────────────────────────────────
         for hint in all_hints[:3]:
-            rds_cfg = fetcher.rds_instance_config(db_hint=hint)
+            rds_cfg = fetcher.rds_instance_config(resource_name=hint)
             if rds_cfg:
                 context["rds_instance_config"] = rds_cfg
                 break
 
         # ── Aurora cluster config ─────────────────────────────────────────────
         for hint in all_hints[:3]:
-            aurora_cfg = fetcher.aurora_cluster_config(cluster_hint=hint)
+            aurora_cfg = fetcher.aurora_cluster_config(resource_name=hint)
             if aurora_cfg:
                 context["aurora_cluster_config"] = aurora_cfg
                 break
 
         # ── Redshift cluster config ───────────────────────────────────────────
         for hint in all_hints[:3]:
-            rs_cfg = fetcher.redshift_cluster_config(cluster_hint=hint)
+            rs_cfg = fetcher.redshift_cluster_config(resource_name=hint)
             if rs_cfg:
                 context["redshift_cluster_config"] = rs_cfg
                 break
 
         # ── Glue job config ───────────────────────────────────────────────────
         for hint in all_hints[:3]:
-            glue_cfg = fetcher.glue_job_config(job_hint=hint)
+            glue_cfg = fetcher.glue_job_config(resource_name=hint)
             if glue_cfg:
                 context["glue_job_config"] = glue_cfg
                 break
 
         # ── API Gateway config ────────────────────────────────────────────────
         for hint in all_hints[:3]:
-            apigw_cfg = fetcher.api_gateway_config(api_hint=hint)
+            apigw_cfg = fetcher.api_gateway_config(resource_name=hint)
             if apigw_cfg:
                 context["api_gateway_config"] = apigw_cfg
                 break
 
         # ── DynamoDB table config ─────────────────────────────────────────────
         for hint in all_hints[:3]:
-            ddb_cfg = fetcher.dynamodb_table_config(table_hint=hint)
+            ddb_cfg = fetcher.dynamodb_table_config(resource_name=hint)
             if ddb_cfg:
                 context["dynamodb_table_config"] = ddb_cfg
                 break
 
         # ── S3 bucket config ──────────────────────────────────────────────────
         for hint in all_hints[:3]:
-            s3_cfg = fetcher.s3_bucket_config(bucket_hint=hint)
+            s3_cfg = fetcher.s3_bucket_config(resource_name=hint)
             if s3_cfg:
                 context["s3_bucket_config"] = s3_cfg
                 break
 
         # ── Secrets Manager config ────────────────────────────────────────────
         for hint in all_hints[:3]:
-            sm_cfg = fetcher.secrets_manager_config(secret_hint=hint)
+            sm_cfg = fetcher.secrets_manager_config(resource_name=hint)
             if sm_cfg:
                 context["secrets_manager_config"] = sm_cfg
                 break
 
         # ── SNS topic config ──────────────────────────────────────────────────
         for hint in all_hints[:3]:
-            sns_cfg = fetcher.sns_topic_config(topic_hint=hint)
+            sns_cfg = fetcher.sns_topic_config(resource_name=hint)
             if sns_cfg:
                 context["sns_topic_config"] = sns_cfg
                 break
 
         # ── SQS queue config ──────────────────────────────────────────────────
         for hint in all_hints[:3]:
-            sqs_cfg = fetcher.sqs_queue_config(queue_hint=hint)
+            sqs_cfg = fetcher.sqs_queue_config(resource_name=hint)
             if sqs_cfg:
                 context["sqs_queue_config"] = sqs_cfg
                 break
 
         # ── ElastiCache config ────────────────────────────────────────────────
         for hint in all_hints[:3]:
-            ec_cfg = fetcher.elasticache_config(cluster_hint=hint)
+            ec_cfg = fetcher.elasticache_config(resource_name=hint)
             if ec_cfg:
                 context["elasticache_config"] = ec_cfg
                 break
 
         # ── Kinesis stream config ─────────────────────────────────────────────
         for hint in all_hints[:3]:
-            kin_cfg = fetcher.kinesis_stream_config(stream_hint=hint)
+            kin_cfg = fetcher.kinesis_stream_config(resource_name=hint)
             if kin_cfg:
                 context["kinesis_stream_config"] = kin_cfg
                 break
 
         # ── EKS cluster config ────────────────────────────────────────────────
         for hint in all_hints[:3]:
-            eks_cfg = fetcher.eks_cluster_config(cluster_hint=hint)
+            eks_cfg = fetcher.eks_cluster_config(resource_name=hint)
             if eks_cfg:
                 context["eks_cluster_config"] = eks_cfg
                 break
