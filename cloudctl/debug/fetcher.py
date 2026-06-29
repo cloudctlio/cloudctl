@@ -1845,6 +1845,38 @@ class DebugFetcher:
                                 pass
                 except Exception:
                     pass
+                # Fetch authorizer config — TOKEN/COGNITO authorizers store their
+                # validation logic (Lambda env vars or Cognito pool) here; mismatched
+                # client IDs or wrong pool ARNs produce 401s with zero other signal.
+                authorizers = []
+                try:
+                    lmb = self._session.client("lambda")
+                    for auth in apiv1.get_authorizers(restApiId=api_id).get("items", []):
+                        auth_entry: dict = {
+                            "id":             auth.get("id"),
+                            "name":           auth.get("name"),
+                            "type":           auth.get("type"),
+                            "provider_arns":  auth.get("providerARNs", []),
+                            "identity_source": auth.get("identitySource"),
+                            "ttl_seconds":    auth.get("authorizerResultTtlInSeconds"),
+                        }
+                        # For Lambda TOKEN authorizers, fetch the function's env vars —
+                        # expected client IDs, allowed audiences, etc. are often stored there.
+                        uri = auth.get("authorizerUri", "")
+                        if auth.get("type") == "TOKEN" and "/functions/" in uri:
+                            try:
+                                lambda_arn = uri.split("/functions/")[1].split("/invocations")[0]
+                                fn_cfg = lmb.get_function_configuration(FunctionName=lambda_arn)
+                                auth_entry["lambda_env_vars"] = {
+                                    k: self._redact(k, v)
+                                    for k, v in fn_cfg.get("Environment", {}).get("Variables", {}).items()
+                                }
+                                auth_entry["lambda_function_name"] = fn_cfg.get("FunctionName")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        authorizers.append(auth_entry)
+                except Exception:  # noqa: BLE001
+                    pass
                 return {
                     "type":        "REST_API_V1",
                     "api_id":      api_id,
@@ -1863,6 +1895,7 @@ class DebugFetcher:
                         for s in stages[:5]
                     ],
                     "integrations": integrations,
+                    "authorizers":  authorizers,
                 }
             return {}
         except Exception:  # noqa: BLE001
@@ -2852,7 +2885,12 @@ class DebugFetcher:
     # ─────────────────────────────────────────────────────────────────────────
 
     def bedrock_kb_config(self, resource_name: str) -> dict:
-        """Fetch Bedrock Knowledge Base config and data source sync status."""
+        """Fetch Bedrock Knowledge Base config, data source sync status, and
+        vector store IAM permissions. S3 Vectors uses a separate s3vectors:*
+        permission namespace — missing s3vectors:QueryVectors is a common
+        silent failure that looks identical to a missing s3:GetObject at the
+        symptom level but requires a completely different IAM fix.
+        """
         if not self._session:
             return {}
         try:
@@ -2863,17 +2901,77 @@ class DebugFetcher:
                 return {}
             kb_id = matched[0]["knowledgeBaseId"]
             desc = ba.get_knowledge_base(knowledgeBaseId=kb_id).get("knowledgeBase", {})
+            storage_cfg = desc.get("storageConfiguration", {})
+            storage_type = storage_cfg.get("type", "")
             result: dict = {
                 "kb_id":             kb_id,
                 "name":              desc.get("name"),
                 "status":            desc.get("status"),
                 "role_arn":          desc.get("roleArn"),
-                "storage_type":      desc.get("storageConfiguration", {}).get("type", ""),
+                "storage_type":      storage_type,
                 "embedding_model":   desc.get("knowledgeBaseConfiguration", {}).get(
                                         "vectorKnowledgeBaseConfiguration", {}).get("embeddingModelArn", ""),
                 "created":           str(desc.get("createdAt", "")),
                 "updated":           str(desc.get("updatedAt", "")),
             }
+            # For S3 Vectors storage, surface the vector bucket ARN and check whether
+            # the KB execution role has s3vectors:* permissions. Missing s3vectors actions
+            # are invisible to the agent unless explicitly surfaced here — the error
+            # "AccessDeniedException on s3vectors:QueryVectors" looks like a generic S3
+            # permission error but requires s3vectors:* grants, NOT s3:GetObject.
+            if storage_type == "S3_VECTORS":
+                s3v_cfg = storage_cfg.get("s3VectorsConfiguration", {})
+                vector_bucket_arn = s3v_cfg.get("vectorBucketArn", "")
+                result["s3vectors_bucket_arn"] = vector_bucket_arn
+                result["s3vectors_note"] = (
+                    "S3 Vectors uses the s3vectors:* permission namespace, NOT s3:*. "
+                    "Required actions: s3vectors:QueryVectors, s3vectors:GetVectors, "
+                    "s3vectors:PutVectors, s3vectors:GetIndex, s3vectors:ListVectors."
+                )
+                # Check the KB execution role's policies for s3vectors grants
+                role_arn = desc.get("roleArn", "")
+                if role_arn:
+                    try:
+                        iam = self._session.client("iam")
+                        role_name = role_arn.split("/")[-1]
+                        s3vectors_actions_found: list[str] = []
+                        has_s3vectors_policy = False
+                        # Check inline policies
+                        for pol_name in iam.list_role_policies(RoleName=role_name).get("PolicyNames", []):
+                            pol = iam.get_role_policy(RoleName=role_name, PolicyName=pol_name)
+                            doc = pol.get("PolicyDocument", {})
+                            for stmt in doc.get("Statement", []):
+                                actions = stmt.get("Action", [])
+                                if isinstance(actions, str):
+                                    actions = [actions]
+                                s3v = [a for a in actions if "s3vectors" in a.lower()]
+                                if s3v:
+                                    has_s3vectors_policy = True
+                                    s3vectors_actions_found.extend(s3v)
+                        # Check attached managed policies
+                        for pol in iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", []):
+                            pv = iam.get_policy_version(
+                                PolicyArn=pol["PolicyArn"],
+                                VersionId=iam.get_policy(PolicyArn=pol["PolicyArn"])["Policy"]["DefaultVersionId"],
+                            )
+                            doc = pv.get("PolicyVersion", {}).get("Document", {})
+                            for stmt in doc.get("Statement", []):
+                                actions = stmt.get("Action", [])
+                                if isinstance(actions, str):
+                                    actions = [actions]
+                                s3v = [a for a in actions if "s3vectors" in a.lower()]
+                                if s3v:
+                                    has_s3vectors_policy = True
+                                    s3vectors_actions_found.extend(s3v)
+                        result["s3vectors_iam_granted"] = has_s3vectors_policy
+                        result["s3vectors_actions_found"] = s3vectors_actions_found
+                        if not has_s3vectors_policy:
+                            result["s3vectors_iam_missing"] = (
+                                "KB execution role has NO s3vectors:* permissions. "
+                                "This will cause AccessDeniedException on all vector store operations."
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
             try:
                 sources = ba.list_data_sources(knowledgeBaseId=kb_id).get("dataSourceSummaries", [])
                 result["data_sources"] = [
@@ -3093,13 +3191,26 @@ class DebugFetcher:
                     detail = idp.describe_user_pool_client(
                         UserPoolId=pool_id, ClientId=c["ClientId"],
                     ).get("UserPoolClient", {})
-                    client_details.append({
+                    flows = detail.get("ExplicitAuthFlows", [])
+                    entry: dict = {
                         "client_id":            detail.get("ClientId"),
                         "client_name":          detail.get("ClientName"),
-                        "explicit_auth_flows":  detail.get("ExplicitAuthFlows", []),
+                        "explicit_auth_flows":  flows,
                         "access_token_validity": detail.get("AccessTokenValidity"),
                         "id_token_validity":     detail.get("IdTokenValidity"),
-                    })
+                    }
+                    # Explicit diagnostic flags: missing auth flows are a silent failure
+                    # — the user gets NotAuthorizedException but the pool logs show
+                    # nothing wrong with passwords or credentials.
+                    if "ALLOW_USER_PASSWORD_AUTH" not in flows:
+                        entry["missing_user_password_auth"] = (
+                            "ALLOW_USER_PASSWORD_AUTH is absent from explicit_auth_flows. "
+                            "Direct username+password sign-in will fail with NotAuthorizedException "
+                            "even with correct credentials."
+                        )
+                    if "ALLOW_USER_SRP_AUTH" not in flows and "ALLOW_USER_PASSWORD_AUTH" not in flows:
+                        entry["missing_srp_and_password_auth"] = True
+                    client_details.append(entry)
                 except Exception:  # noqa: BLE001
                     pass
 
