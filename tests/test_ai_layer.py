@@ -546,74 +546,46 @@ class TestVerifyToolCoverage:
         from cloudctl.ai.guardrails import verify_tool_coverage
         result = verify_tool_coverage(
             "order status lookups are failing",
-            {"list_resources", "get_service_config", "tail_logs"},
+            {"list_resources", "get_service_config", "tail_logs", "query_metrics"},
         )
         assert result.satisfied is True
         assert result.missing_tools == []
 
-    def test_error_signal_requires_tail_logs(self):
+    def test_all_four_tools_always_required_regardless_of_symptom(self):
         from cloudctl.ai.guardrails import verify_tool_coverage
-        result = verify_tool_coverage(
-            "order status lookups are failing with AccessDenied errors",
-            {"list_resources", "get_service_config"},
-        )
-        assert result.satisfied is False
-        assert "tail_logs" in result.missing_tools
-
-    def test_latency_signal_requires_query_metrics(self):
-        from cloudctl.ai.guardrails import verify_tool_coverage
-        result = verify_tool_coverage(
-            "invoker p99 latency spikes to 8-10s after idle periods",
-            {"list_resources", "get_service_config"},
-        )
-        assert result.satisfied is False
-        assert "query_metrics" in result.missing_tools
-
-    def test_always_tools_required_even_without_signal_words(self):
-        from cloudctl.ai.guardrails import verify_tool_coverage
+        # All four tools required for any symptom — no keyword classification
         result = verify_tool_coverage("something is wrong", set())
         assert result.satisfied is False
-        assert set(result.missing_tools) == {"list_resources", "get_service_config"}
+        assert set(result.missing_tools) == {
+            "list_resources", "get_service_config", "tail_logs", "query_metrics"
+        }
 
-    def test_no_false_positive_when_no_signal_and_tools_present(self):
+    def test_tail_logs_and_query_metrics_required_even_without_signal_words(self):
         from cloudctl.ai.guardrails import verify_tool_coverage
+        # Calling only the "always" pair is no longer sufficient
         result = verify_tool_coverage(
             "something is wrong",
             {"list_resources", "get_service_config"},
         )
-        assert result.satisfied is True
-
-    def test_throttle_signal_requires_metrics_and_config_cross_reference(self):
-        """Regression test: api-gateway-perimeter's throttling_misconfigured
-        incident — the agent called query_metrics against IntegrationLatency
-        only and never cross-referenced the resource's configured throttle
-        limits, concluding 'backend is slow' instead of the real throttle
-        misconfiguration.
-
-        A first attempt at fixing this required a metric *name* containing
-        "throttl" — but that metric doesn't exist for every service
-        (confirmed: AWS/ApiGateway has none at all; its throttling shows up
-        as 4XXError). That requirement actively made things worse — it sent
-        the agent searching for a metric it could never find instead of
-        concluding with what it already had (max_turns reached on a
-        previously-answered incident). The fix instead requires
-        get_service_config (to see the configured limits) alongside
-        query_metrics — the cross-reference, not a specific metric name."""
-        from cloudctl.ai.guardrails import verify_tool_coverage
-        result = verify_tool_coverage(
-            "clients are getting 429 rate-limited almost immediately",
-            {"list_resources", "query_metrics"},
-            metrics_queried={"AWS/ApiGateway/IntegrationLatency"},
-        )
         assert result.satisfied is False
-        assert "get_service_config" in result.missing_tools
+        assert "tail_logs" in result.missing_tools
+        assert "query_metrics" in result.missing_tools
 
-    def test_throttle_signal_satisfied_with_metrics_and_config_called(self):
+    def test_satisfied_requires_all_four_tools(self):
         from cloudctl.ai.guardrails import verify_tool_coverage
+        # Three of four is still not satisfied
         result = verify_tool_coverage(
             "clients are getting 429 rate-limited almost immediately",
             {"list_resources", "get_service_config", "query_metrics"},
-            metrics_queried={"AWS/ApiGateway/IntegrationLatency"},
+        )
+        assert result.satisfied is False
+        assert "tail_logs" in result.missing_tools
+
+    def test_all_four_tools_satisfies_any_symptom(self):
+        from cloudctl.ai.guardrails import verify_tool_coverage
+        result = verify_tool_coverage(
+            "clients are getting 429 rate-limited almost immediately",
+            {"list_resources", "get_service_config", "tail_logs", "query_metrics"},
         )
         assert result.satisfied is True
 
@@ -874,4 +846,167 @@ class TestVerifyAlternativesConsidered:
         parsed = json.loads(raw)
         assert parsed["confidence"] == "LOW"
         assert parsed.get("confidence_override_reason")
+
+
+class TestVerifyAlternativesAcceptsReasonField:
+    """verify_alternatives_considered must accept 'reason' (synthesize schema)
+    as well as 'ruled_out_because' (test fixture schema)."""
+
+    def test_satisfied_with_reason_field(self):
+        from cloudctl.ai.guardrails import verify_alternatives_considered
+        output = {
+            "alternatives_considered": [
+                {"hypothesis": "ECS task role missing permission", "reason": "tail_logs showed no AccessDenied"},
+                {"hypothesis": "SQS queue wrong region", "reason": "queue URL confirmed same region"},
+            ]
+        }
+        res = verify_alternatives_considered(output)
+        assert res.satisfied is True
+
+    def test_satisfied_with_mixed_fields(self):
+        from cloudctl.ai.guardrails import verify_alternatives_considered
+        output = {
+            "alternatives_considered": [
+                {"hypothesis": "ECS task role missing permission", "ruled_out_because": "no deny in CloudTrail"},
+                {"hypothesis": "SQS queue wrong region", "reason": "queue URL confirmed same region"},
+            ]
+        }
+        res = verify_alternatives_considered(output)
+        assert res.satisfied is True
+
+    def test_fails_when_neither_field_present(self):
+        from cloudctl.ai.guardrails import verify_alternatives_considered
+        output = {
+            "alternatives_considered": [
+                {"hypothesis": "ECS task role missing permission", "verdict": "ruled_out"},
+                {"hypothesis": "SQS queue wrong region", "verdict": "ruled_out"},
+            ]
+        }
+        res = verify_alternatives_considered(output)
+        assert res.satisfied is False
+
+
+class TestCheckEvidenceGrounding:
+    """Feature 3: evidence-conclusion grounding check."""
+
+    def test_grounded_when_identifiers_in_evidence(self):
+        from cloudctl.ai.guardrails import check_evidence_grounding
+        result = check_evidence_grounding(
+            conclusion="The platform-orders ECS task role is missing kms:Decrypt permission",
+            evidence=["platform-orders task role has no kms:Decrypt in its policy"],
+            fetched_data={},
+        )
+        assert result.grounded is True
+
+    def test_grounded_when_identifiers_in_fetched_data(self):
+        from cloudctl.ai.guardrails import check_evidence_grounding
+        result = check_evidence_grounding(
+            conclusion="The platform-inventory service cannot read from platform-stock-updates",
+            evidence=["NumberOfMessagesReceived = 0"],
+            fetched_data={"queue": {"name": "platform-stock-updates", "depth": 30}},
+        )
+        assert result.grounded is True
+
+    def test_ungrounded_when_conclusion_names_absent_resource(self):
+        from cloudctl.ai.guardrails import check_evidence_grounding
+        result = check_evidence_grounding(
+            conclusion="The platform-mystery-service IAM role is missing s3:GetObject",
+            evidence=["CloudWatch metrics show latency spike"],
+            fetched_data={"ecs": {"services": ["platform-orders"]}},
+        )
+        # platform-mystery-service appears in conclusion but not in evidence or fetched data
+        assert result.grounded is False
+        assert len(result.ungrounded_claims) > 0
+
+    def test_empty_conclusion_is_grounded(self):
+        from cloudctl.ai.guardrails import check_evidence_grounding
+        result = check_evidence_grounding("", [], {})
+        assert result.grounded is True
+
+    def test_conclusion_with_no_structured_identifiers_is_grounded(self):
+        from cloudctl.ai.guardrails import check_evidence_grounding
+        result = check_evidence_grounding(
+            conclusion="The IAM role is missing a required permission",
+            evidence=["AccessDenied returned from API call"],
+            fetched_data={},
+        )
+        assert result.grounded is True
+
+
+class TestSensitiveKeyDropped:
+    """_redact_recursive must drop the entire key-value pair for sensitive keys,
+    not just redact the value — the key name itself is the hint."""
+
+    def test_incident_mode_key_dropped_entirely(self):
+        from cloudctl.ai.guardrails import sanitise_fetched_data
+        data = {"env_vars": {"INCIDENT_MODE": "bad_task", "LOG_LEVEL": "INFO"}}
+        result = sanitise_fetched_data(data)
+        assert "INCIDENT_MODE" not in result["env_vars"]
+        assert "LOG_LEVEL" in result["env_vars"]
+
+    def test_scenario_key_dropped_entirely(self):
+        from cloudctl.ai.guardrails import sanitise_fetched_data
+        data = {"tags": {"scenario": "kms_denied", "Name": "platform-vpc", "project": "shopcore"}}
+        result = sanitise_fetched_data(data)
+        assert "scenario" not in result["tags"]
+        assert "Name" in result["tags"]
+
+    def test_password_key_dropped(self):
+        from cloudctl.ai.guardrails import sanitise_fetched_data
+        data = {"db_password": "supersecret", "host": "db.example.com"}
+        result = sanitise_fetched_data(data)
+        assert "db_password" not in result
+        assert "host" in result
+
+    def test_non_sensitive_keys_preserved(self):
+        from cloudctl.ai.guardrails import sanitise_fetched_data
+        data = {"name": "platform-orders", "status": "ACTIVE", "region": "us-east-1"}
+        result = sanitise_fetched_data(data)
+        assert result["name"] == "platform-orders"
+        assert result["status"] == "ACTIVE"
+
+
+class TestDetectContradiction:
+    """Feature 4: branch disagreement detection in graph_agent."""
+
+    def test_no_contradiction_when_fewer_than_two_confirmed(self):
+        from cloudctl.ai.graph_agent import _detect_contradiction
+        branches = [
+            {"confirmed": True, "evidence": ["fact1"], "hypothesis": {"service": "ecs"}},
+            {"confirmed": False, "evidence": ["fact2"], "hypothesis": {"service": "iam"}},
+        ]
+        has_contradiction, _ = _detect_contradiction(branches)
+        assert has_contradiction is False
+
+    def test_no_contradiction_when_same_service_confirmed(self):
+        from cloudctl.ai.graph_agent import _detect_contradiction
+        branches = [
+            {"confirmed": True, "evidence": ["fact1"], "hypothesis": {"service": "ecs"}},
+            {"confirmed": True, "evidence": ["fact2"], "hypothesis": {"service": "ecs"}},
+        ]
+        has_contradiction, _ = _detect_contradiction(branches)
+        assert has_contradiction is False
+
+    def test_contradiction_when_different_services_both_confirmed(self):
+        from cloudctl.ai.graph_agent import _detect_contradiction
+        branches = [
+            {"confirmed": True, "evidence": ["iam deny found"], "hypothesis": {"service": "iam"}},
+            {"confirmed": True, "evidence": ["kms error found"], "hypothesis": {"service": "kms"}},
+            {"confirmed": False, "evidence": [], "hypothesis": {"service": "vpc"}},
+        ]
+        has_contradiction, contradicting = _detect_contradiction(branches)
+        assert has_contradiction is True
+        assert len(contradicting) == 2
+        services = {br["hypothesis"]["service"] for br in contradicting}
+        assert services == {"iam", "kms"}
+
+    def test_no_contradiction_when_confirmed_but_no_evidence(self):
+        from cloudctl.ai.graph_agent import _detect_contradiction
+        branches = [
+            {"confirmed": True, "evidence": [], "hypothesis": {"service": "ecs"}},
+            {"confirmed": True, "evidence": ["fact"], "hypothesis": {"service": "iam"}},
+        ]
+        # empty evidence branch excluded from contradiction detection
+        has_contradiction, contradicting = _detect_contradiction(branches)
+        assert has_contradiction is False
 

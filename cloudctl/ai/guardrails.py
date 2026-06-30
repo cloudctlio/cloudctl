@@ -246,6 +246,7 @@ _SECRET_PATTERNS: list[tuple[str, str]] = [
 _SENSITIVE_KEY_WORDS = {
     "password", "passwd", "secret", "token", "key",
     "credential", "auth", "api_key", "private", "incident_mode",
+    "scenario",  # test-harness tag — key name itself is a hint
 }
 
 
@@ -255,12 +256,22 @@ def _redact_value(value: str) -> str:
     return value
 
 
+def _is_sensitive_key(key: str) -> bool:
+    k = str(key).lower()
+    return any(s in k for s in _SENSITIVE_KEY_WORDS)
+
+
 def _redact_recursive(obj) -> None:
+    """Recursively redact sensitive data. Drops the entire key-value pair for
+    sensitive keys — keeping the key name with a '[REDACTED]' value still leaks
+    the key name itself (e.g. 'incident_mode' or 'scenario'), which is enough
+    for the agent to infer test-harness context."""
     if isinstance(obj, dict):
-        for key, value in obj.items():
-            if any(s in str(key).lower() for s in _SENSITIVE_KEY_WORDS):
-                obj[key] = "[REDACTED]"
-            elif isinstance(value, str):
+        keys_to_drop = [k for k in obj if _is_sensitive_key(k)]
+        for k in keys_to_drop:
+            del obj[k]
+        for key, value in list(obj.items()):
+            if isinstance(value, str):
                 obj[key] = _redact_value(value)
             else:
                 _redact_recursive(value)
@@ -908,60 +919,22 @@ class ToolCoverageResult:
     reason:         str
 
 
-_ERROR_SIGNAL_WORDS = {
-    "error", "errors", "fail", "fails", "failing", "failed", "denied",
-    "exception", "crash", "crashing", "502", "503", "504", "500", "403",
-    "401", "timeout", "timing out", "unavailable", "broken", "down",
-}
-_LATENCY_SIGNAL_WORDS = {
-    "slow", "slower", "latency", "delay", "delayed", "lag", "lagging",
-    "p99", "p95", "p90", "spike", "spiking",
-}
-# Found in production (api-gateway-perimeter, throttling_misconfigured,
-# 2026-06-24): the agent investigated a "429 rate-limited" symptom by
-# checking IntegrationLatency/4XXError and never checked the resource's
-# configured throttle limits, landing on a wrong "backend is slow"
-# diagnosis instead of the real throttle-limit misconfiguration. A first
-# attempt at fixing this required a metric *name* containing "throttl" —
-# but that metric doesn't exist for every service (confirmed: AWS/ApiGateway
-# has no such metric at all; throttling there shows up as 4XXError). A
-# metric-name requirement that's wrong for a given service actively makes
-# things worse — it sends the agent searching for something that can't be
-# found instead of concluding with what it already has. Tool coverage
-# (query_metrics + get_service_config, to cross-reference observed errors
-# against configured limits) is the part that generalizes; the specific
-# metric name does not, so it isn't gated here — see harness.py's
-# anti-pattern hint instead.
-_THROTTLE_SIGNAL_WORDS = {
-    "429", "throttl", "rate limit", "rate-limit", "rate limited",
-}
-
-# Tool every investigation must run, regardless of symptom wording, plus the
-# symptom-class-specific tools that close the exact gap found above.
+# Every investigation must cover both operational planes regardless of how the
+# symptom is worded. Keyword-based classification ("if symptom contains 'error'
+# → force tail_logs") is pre-coded reasoning that the agent should derive itself
+# — it also makes coverage dependent on symptom phrasing rather than
+# investigation completeness. Simpler and more correct: always require the same
+# four tools. The prompt instructs the agent to use them; this guardrail verifies
+# compliance and forces a retry if not satisfied.
 _MANDATORY_TOOLS: dict[str, tuple[str, ...]] = {
-    "always":          ("list_resources", "get_service_config"),
-    "error_signal":    ("tail_logs",),
-    "latency_signal":  ("query_metrics",),
-    "throttle_signal": ("query_metrics", "get_service_config"),
+    "always": ("list_resources", "get_service_config", "tail_logs", "query_metrics"),
 }
 
-# Symptom class -> substring (case-insensitive) that must appear in at least
-# one *queried metric name*, not just a tool call — calling query_metrics
-# at all isn't enough if it's pointed at the wrong metric. Empty on purpose
-# for throttle_signal — see comment above.
 _MANDATORY_METRIC_PATTERNS: dict[str, tuple[str, ...]] = {}
 
 
-def _classify_symptom(symptom: str) -> set[str]:
-    s = symptom.lower()
-    classes = {"always"}
-    if any(w in s for w in _ERROR_SIGNAL_WORDS):
-        classes.add("error_signal")
-    if any(w in s for w in _LATENCY_SIGNAL_WORDS):
-        classes.add("latency_signal")
-    if any(w in s for w in _THROTTLE_SIGNAL_WORDS):
-        classes.add("throttle_signal")
-    return classes
+def _classify_symptom(symptom: str) -> set[str]:  # noqa: ARG001
+    return {"always"}
 
 
 def verify_tool_coverage(
@@ -1025,9 +998,10 @@ def verify_alternatives_considered(
         )
     valid_count = 0
     for alt in alternatives:
-        if isinstance(alt, dict) and alt.get("hypothesis") and alt.get("ruled_out_because"):
+        if isinstance(alt, dict) and alt.get("hypothesis"):
             h = str(alt.get("hypothesis")).strip()
-            r = str(alt.get("ruled_out_because")).strip()
+            # Accept both "ruled_out_because" (test schema) and "reason" (synthesize schema)
+            r = str(alt.get("ruled_out_because") or alt.get("reason") or "").strip()
             if h and r:
                 valid_count += 1
     if valid_count < 2:
@@ -1036,4 +1010,79 @@ def verify_alternatives_considered(
             reason=f"only {valid_count} alternative hypotheses evaluated in alternatives_considered, but at least 2 are required for MEDIUM/HIGH confidence"
         )
     return AlternativesCoverageResult(satisfied=True, reason="")
+
+
+# ── Guardrail 9 — Evidence-Conclusion Grounding (Feature 3) ──────────────────
+
+@dataclass
+class GroundingResult:
+    grounded: bool
+    ungrounded_claims: list[str]
+    reason: str
+
+
+def check_evidence_grounding(
+    conclusion: str,
+    evidence: list[str],
+    fetched_data: dict,
+) -> GroundingResult:
+    """
+    Deterministic check: specific AWS identifiers named in the conclusion
+    (resource names, error codes, service-specific terms) must appear in at
+    least one evidence item or in the fetched data corpus. Catches conclusions
+    that assert a specific resource caused the incident without any supporting
+    evidence item actually naming that resource.
+
+    Only patterns with structural separators are checked (hyphenated names like
+    "platform-orders", colon-separated like "kms:Decrypt", ARN fragments) to
+    avoid flagging common English words or AWS service names that appear
+    universally.
+    """
+    if not conclusion or not evidence:
+        return GroundingResult(grounded=True, ungrounded_claims=[], reason="")
+
+    evidence_corpus = " ".join(evidence).lower()
+    fetched_corpus = json.dumps(fetched_data, default=str).lower()
+    combined = evidence_corpus + " " + fetched_corpus
+
+    # Extract structured identifiers: hyphenated resource names, ARN-style colon
+    # paths, and camelCase compound names — these are specific enough to check.
+    candidates = re.findall(
+        r'\b[a-zA-Z][a-zA-Z0-9]*(?:[-:][a-zA-Z0-9]+){1,}\b',
+        conclusion,
+    )
+
+    _SKIP = {
+        "root-cause", "access-denied", "root_cause", "step-by-step",
+        "well-supported", "well-evidenced", "non-primary", "read-write",
+    }
+
+    ungrounded = []
+    for claim in candidates:
+        if claim.lower() in _SKIP:
+            continue
+        if len(claim) < 6:
+            continue
+        if claim.lower() in combined:
+            continue
+        # Also accept if any segment of the identifier appears (e.g. "platform"
+        # from "platform-orders" — avoids false positives on minor formatting diff)
+        parts = re.split(r'[-:]', claim)
+        if any(len(p) >= 5 and p.lower() in combined for p in parts):
+            continue
+        ungrounded.append(claim)
+
+    if not ungrounded:
+        return GroundingResult(grounded=True, ungrounded_claims=[], reason="")
+
+    rate = len(ungrounded) / max(len(candidates), 1)
+    if rate > 0.25:
+        sample = ", ".join(ungrounded[:3])
+        return GroundingResult(
+            grounded=False,
+            ungrounded_claims=ungrounded,
+            reason=f"{len(ungrounded)} identifier(s) in conclusion absent from evidence: {sample}",
+        )
+
+    return GroundingResult(grounded=True, ungrounded_claims=ungrounded, reason="")
 

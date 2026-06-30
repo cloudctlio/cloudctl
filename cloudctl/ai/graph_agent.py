@@ -1,12 +1,22 @@
 """
 graph_agent.py — LangGraph-based parallel hypothesis agent for incident investigation.
 
-Three-node graph:
-  START → triage → investigate (3 parallel branches) → synthesize → END
+Graph topology:
+  START → triage → investigate → synthesize → critique
+  critique → [needs_reinvestigation AND round<1] → reinvestigate → synthesize → critique → END
+  critique → [confirmed | revised | round≥1] → END
 
-Replaces the single sequential ReAct loop with three phases to eliminate
-anchoring bias — the agent now evaluates competing hypotheses independently
-before committing to one conclusion.
+Four accuracy features:
+  1. Critique → re-investigate feedback loop: when critique flags insufficient evidence
+     it sets investigation_focus; reinvestigate_node runs a targeted branch and feeds
+     the result back into a second synthesize → critique pass (capped at 1 retry).
+  2. Mandatory alternative hypothesis testing: synthesize_node re-runs if the output
+     doesn't enumerate ≥2 alternatives with explicit ruling-out reasoning.
+  3. Evidence-conclusion grounding check: applied post-synthesis in debug_incident_graph;
+     downgrades confidence when the conclusion names resources absent from evidence.
+  4. Branch disagreement escalation: if ≥2 branches confirm contradicting root causes,
+     synthesize_node spawns a 4th arbitration branch that re-investigates with all
+     contradicting findings in context before the final synthesis.
 """
 from __future__ import annotations
 
@@ -76,6 +86,8 @@ class GraphState(TypedDict):
     branch_results: list[dict]
     final_report: dict
     all_fetched: dict
+    critique_round: int    # Feature 1: how many reinvestigation cycles have run
+    critique_feedback: str # Feature 1: investigation_focus from critique node
 
 
 # ── Shared Bedrock client factory ──────────────────────────────────────────────
@@ -99,14 +111,12 @@ def _make_bedrock(profile: str | None, region: str):
 
 def _extract_json(text: str, key: str) -> dict | list | None:
     """Find and parse the first JSON object/array containing `key` in text."""
-    pattern = rf'\{{[^{{}}]*"{key}"[^{{}}]*\}}' if key else r'\{.*?\}'
     m = re.search(rf'\{{.*?"{re.escape(key)}".*?\}}', text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(0))
         except Exception:
             pass
-    # Try full array
     m2 = re.search(r'\[.*\]', text, re.DOTALL)
     if m2:
         try:
@@ -152,7 +162,6 @@ def triage_node(state: GraphState) -> dict:
         messages=[{"role": "user", "content": [{"text": f"Incident: {state['symptom']}"}]}],
     )
     text = resp["output"]["message"]["content"][0]["text"].strip()
-    # Strip markdown fences if present
     if "```" in text:
         parts = text.split("```")
         for p in parts:
@@ -188,12 +197,18 @@ Phase 1 rules — configuration check ONLY:
   1. Call list_resources to find the resource, then get_service_config to read its config.
   2. Look for: disabled flags, missing bindings, absent ARNs, wrong endpoints,
      unconfigured schedules, empty rule sets.
-  3. If the config shows a clear, self-evident issue that directly explains
-     the symptom, conclude immediately with confirmed=true.
-  4. If config looks correct and complete, conclude with confirmed=false and
+  3. When the config shows that this resource depends on other named resources
+     (a role ARN, a model name, a function name, a secret, a target, a certificate),
+     call get_service_config on the most suspicious dependency before concluding.
+  4. Only set confirmed=true if you have found a STRUCTURAL absence: the resource
+     does not exist, the feature is explicitly disabled, or the required binding
+     is entirely missing. For any other anomaly — unusual values, unexpected config,
+     mismatched settings — set confirmed=false and phase2_needed=true so operational
+     evidence can confirm or rule out the hypothesis.
+  5. If config looks correct and complete, conclude with confirmed=false and
      phase2_needed=true — do NOT investigate further here.
 
-Maximum 2 tool calls. Conclude with ONLY this JSON:
+Maximum 3 tool calls. Conclude with ONLY this JSON:
 {{
   "conclusion": "one sentence — what the config shows",
   "evidence": ["specific config value observed"],
@@ -235,6 +250,46 @@ Maximum 8 tool calls. Conclude with ONLY this JSON:
   "phase2_needed": false
 }}
 """
+
+# Feature 4: arbitration branch prompt
+_ARBITRATION_SYSTEM = """\
+You are a senior AWS incident investigator. Two or more parallel investigation branches
+have each found confirmed evidence pointing to DIFFERENT root causes for the same incident.
+Your task: re-investigate the disputed resources using tool calls to determine which is
+the actual primary cause — or whether both are genuinely contributing.
+
+Original symptom: {symptom}
+
+Contradicting branch findings:
+{findings}
+
+Steps:
+1. Call get_service_config on the resource from whichever branch seems less directly
+   connected to the observed symptom.
+2. Call tail_logs to check for the most recent error pattern.
+3. Use search_cloudtrail to find what changed closest to symptom onset.
+4. Determine: which cause most directly explains the symptom? Are both real? Is one
+   causing the other?
+
+Conclude with ONLY this JSON:
+{{
+  "primary_cause": "the single most direct cause of the symptom",
+  "secondary_causes": ["any real but non-primary issues"],
+  "resolution": "one paragraph: why this cause is primary over the alternative(s)",
+  "evidence": ["specific fact that resolves the contradiction"],
+  "confirmed": true,
+  "confidence": "LOW | MEDIUM | HIGH"
+}}
+"""
+
+
+def _detect_contradiction(branch_results: list[dict]) -> tuple[bool, list[dict]]:
+    """Feature 4: identify when ≥2 branches independently confirmed different services."""
+    confirmed = [br for br in branch_results if br.get("confirmed") and br.get("evidence")]
+    if len(confirmed) < 2:
+        return False, []
+    services = {br["hypothesis"]["service"] for br in confirmed}
+    return len(services) > 1, confirmed
 
 
 def _run_branch(
@@ -373,14 +428,18 @@ def _run_branch(
         f"Symptom: {symptom}\n\nInvestigate: {h.reason}\nStart with: {h.focus}"
     )}]}]
 
-    # Phase 1: config-state check only (max 4 turns: ~2 tool calls + conclude)
+    # Phase 1: config-state check (max 6 turns: up to 3 tool calls + conclude)
     p1 = _loop(
         _PHASE1_SYSTEM.format(reason=h.reason, service=h.service, focus=h.focus),
-        init_msg, max_turns=4,
+        init_msg, max_turns=6,
     )
 
-    # If config phase found a definitive issue, stop — no need to inspect operational state
-    if p1.get("confirmed") or not p1.get("phase2_needed", True):
+    # Only exit early for structural absence AND only if all mandatory tools have
+    # been called. If Phase 1 found a structural absence but never called tail_logs
+    # or query_metrics, proceed to Phase 2 so the mandatory tools run first.
+    from cloudctl.ai.guardrails import verify_tool_coverage
+    p1_cov = verify_tool_coverage(symptom, set(tools_called))
+    if (p1.get("confirmed") or not p1.get("phase2_needed", True)) and p1_cov.satisfied:
         return BranchResult(
             hypothesis=h,
             evidence=p1.get("evidence", []),
@@ -391,7 +450,7 @@ def _run_branch(
             all_fetched=branch_fetched,
         )
 
-    # Phase 2: operational investigation (max 10 turns — config looked correct)
+    # Phase 2: operational investigation (max 10 turns)
     p2 = _loop(
         _PHASE2_SYSTEM.format(
             reason=h.reason, service=h.service,
@@ -403,6 +462,34 @@ def _run_branch(
         )}]}],
         max_turns=10,
     )
+
+    # Enforce mandatory tool coverage — if required tools weren't called, force a
+    # short pass before concluding.
+    cov = verify_tool_coverage(symptom, set(tools_called))
+    if not cov.satisfied:
+        p3 = _loop(
+            _PHASE2_SYSTEM.format(
+                reason=h.reason, service=h.service,
+                phase1_conclusion=p2.get("conclusion") or p1.get("conclusion", "see prior phases"),
+            ),
+            [{"role": "user", "content": [{"text": (
+                f"Symptom: {symptom}\n\n"
+                f"MANDATORY COVERAGE: Before finalizing you must call "
+                f"{', '.join(cov.missing_tools)}. You have not called "
+                f"{'them' if len(cov.missing_tools) > 1 else 'it'} yet. "
+                f"Call {'them' if len(cov.missing_tools) > 1 else 'it'} now, "
+                f"then output your final JSON conclusion."
+            )}]}],
+            max_turns=4,
+        )
+        if p3.get("evidence"):
+            p2 = {
+                **p2,
+                "evidence": (p2.get("evidence") or []) + p3.get("evidence", []),
+                "conclusion": p3.get("conclusion") or p2.get("conclusion"),
+                "confidence": p3.get("confidence") or p2.get("confidence"),
+                "confirmed": p3.get("confirmed") or p2.get("confirmed"),
+            }
 
     return BranchResult(
         hypothesis=h,
@@ -446,6 +533,11 @@ Select the hypothesis with the strongest direct evidence from real AWS data.
 If multiple branches found real issues, list them all in evidence.
 Treat unconfirmed or low-confidence branches as ruled-out alternatives.
 
+REQUIRED: You MUST populate alternatives_considered with every hypothesis that was
+investigated but ruled out. Each entry MUST have both a "hypothesis" and "reason" field
+explaining why it was not the primary cause. At least 2 alternatives are required for
+MEDIUM or HIGH confidence.
+
 Respond ONLY with this JSON object (no markdown, no extra text):
 {{
   "root_cause": "specific — what is wrong and why it causes the observed symptom",
@@ -455,19 +547,77 @@ Respond ONLY with this JSON object (no markdown, no extra text):
   "confidence": "LOW | MEDIUM | HIGH",
   "resources_investigated": ["resource-name-1", "resource-name-2", ...],
   "alternatives_considered": [
-    {{"hypothesis": "...", "verdict": "ruled_out | partial | confirmed", "reason": "..."}}
+    {{"hypothesis": "...", "reason": "why this was ruled out", "verdict": "ruled_out | partial"}}
   ]
 }}
 """
 
 
 def synthesize_node(state: GraphState) -> dict:
+    meaningful = [br for br in state["branch_results"] if br.get("evidence")]
+    if not meaningful:
+        return {"final_report": {
+            "root_cause": "Investigation failed: all branches returned empty evidence. "
+                          "Check agent logs for tool errors and retry.",
+            "evidence": [],
+            "remediation_steps": ["Retry the investigation", "Check CloudWatch agent logs for errors"],
+            "severity": "UNKNOWN",
+            "confidence": "LOW",
+            "resources_investigated": [],
+        }}
+
     bedrock = _make_bedrock(state["profile"], state["region"])
-    branches_text = json.dumps(state["branch_results"], indent=2)
-    system = _SYNTHESIZE_PROMPT.format(n=len(state["branch_results"]))
+    all_branch_results = list(state["branch_results"])
+    all_fetched_merged = dict(state.get("all_fetched") or {})
+    arbitration_note = ""
+
+    # Feature 4: Branch disagreement escalation
+    # If ≥2 branches independently confirmed contradicting root causes, spawn a
+    # targeted 4th arbitration branch that re-investigates with all findings in
+    # context before the final synthesis.
+    has_contradiction, contradicting = _detect_contradiction(state["branch_results"])
+    if has_contradiction:
+        findings = json.dumps([
+            {
+                "service": br["hypothesis"]["service"],
+                "conclusion": br["conclusion"],
+                "evidence": br["evidence"],
+            }
+            for br in contradicting
+        ], indent=2)
+        arb_hypothesis = {
+            "service": contradicting[0]["hypothesis"]["service"],
+            "reason": (
+                f"Contradiction: multiple branches confirmed different causes. "
+                f"Re-investigate to determine primary: "
+                + " vs ".join(br["hypothesis"]["service"] for br in contradicting[:2])
+            ),
+            "focus": f"Resolve which of these findings directly causes the symptom: {findings[:300]}",
+        }
+        try:
+            arb_result = _run_branch(
+                arb_hypothesis,
+                state["symptom"],
+                state["profile"],
+                state["region"],
+                state["minutes"],
+                state["session_id"],
+            )
+            all_branch_results.append(arb_result.model_dump())
+            all_fetched_merged.update(arb_result.all_fetched)
+            arbitration_note = (
+                f"\n\nARBITRATION: A 4th branch re-investigated the contradiction. "
+                f"It found: {arb_result.conclusion[:300]}"
+            )
+        except Exception:
+            pass
+
+    system = _SYNTHESIZE_PROMPT.format(n=len(all_branch_results))
+    branches_text = json.dumps(all_branch_results, indent=2)
     user_content = (
         f"Symptom: {state['symptom']}\n\n"
         f"Branch investigation results:\n{branches_text}"
+        f"{arbitration_note}"
     )
 
     resp = bedrock.converse(
@@ -476,7 +626,6 @@ def synthesize_node(state: GraphState) -> dict:
         messages=[{"role": "user", "content": [{"text": user_content}]}],
     )
     text = resp["output"]["message"]["content"][0]["text"].strip()
-
     result = _extract_json(text, "root_cause")
     if not result or not isinstance(result, dict):
         return {"final_report": {
@@ -488,18 +637,51 @@ def synthesize_node(state: GraphState) -> dict:
             "resources_investigated": [],
         }}
 
-    # Calibrate confidence using branch confirmations as a signal amplifier,
-    # not an override. The synthesize model's own assessment reflects evidence
-    # quality; branch confirmed=True is additional corroboration.
-    confirmed_count = sum(1 for br in state["branch_results"] if br.get("confirmed"))
+    # Feature 2: Mandatory alternative hypothesis testing
+    # Re-run synthesize if alternatives_considered doesn't enumerate ≥2 ruled-out
+    # hypotheses with explicit reasoning. Catches the case where the agent concludes
+    # without explaining what it ruled out and why.
+    from cloudctl.ai.guardrails import verify_alternatives_considered
+    alt_check = verify_alternatives_considered(result)
+    if not alt_check.satisfied:
+        retry_msg = (
+            f"Your response is missing alternatives_considered with at least 2 entries. "
+            f"Re-submit the SAME conclusion JSON but ensure 'alternatives_considered' "
+            f"lists every hypothesis branch that was investigated and not chosen as the "
+            f"primary cause, with a 'hypothesis' string and 'reason' string for each. "
+            f"Do not change the root_cause or evidence — only fill in alternatives_considered."
+        )
+        resp2 = bedrock.converse(
+            modelId=_MODEL,
+            system=[{"text": system}],
+            messages=[
+                {"role": "user", "content": [{"text": user_content}]},
+                {"role": "assistant", "content": [{"text": text}]},
+                {"role": "user", "content": [{"text": retry_msg}]},
+            ],
+        )
+        text2 = resp2["output"]["message"]["content"][0]["text"].strip()
+        result2 = _extract_json(text2, "root_cause")
+        if result2 and isinstance(result2, dict):
+            result = result2
+
+    # Calibrate confidence using branch confirmations as a signal amplifier.
+    confirmed_count = sum(1 for br in all_branch_results if br.get("confirmed"))
     agent_conf = result.get("confidence", "LOW")
     if confirmed_count >= 2:
-        # Multiple branches independently agreed — trust model's assessment fully
         result["confidence"] = agent_conf
     else:
-        # 0 or 1 branch confirmed — trust model but cap HIGH at MEDIUM
-        # (HIGH requires multiple independent confirmations)
         result["confidence"] = "MEDIUM" if agent_conf == "HIGH" else agent_conf
+
+    # Propagate arbitration fetched data back into state
+    if all_fetched_merged != state.get("all_fetched"):
+        try:
+            return {"final_report": IncidentReport(**result).model_dump(),
+                    "all_fetched": all_fetched_merged,
+                    "branch_results": all_branch_results}
+        except Exception:
+            return {"final_report": result, "all_fetched": all_fetched_merged,
+                    "branch_results": all_branch_results}
 
     try:
         return {"final_report": IncidentReport(**result).model_dump()}
@@ -525,9 +707,19 @@ Challenge the conclusion with these questions:
 If the conclusion is well-supported: respond with this JSON exactly:
 {"verdict": "confirmed", "notes": "one sentence why it holds up"}
 
-If a stronger conclusion exists: respond with this JSON exactly:
+If a stronger conclusion exists in the branch data: respond with this JSON exactly:
 {"verdict": "revised", "root_cause": "...", "evidence": ["...", "..."],
  "confidence": "LOW | MEDIUM | HIGH", "notes": "one sentence why this is stronger"}
+
+If the evidence is genuinely insufficient to reach any conclusion — every evidence item
+says "not found", "no data", "no logs returned", or is pure inference with no direct
+AWS fact — and you can identify a specific investigation that would resolve the ambiguity:
+{"verdict": "needs_reinvestigation",
+ "investigation_focus": "call [specific tool] on [specific resource] to find [what] — be precise",
+ "notes": "one sentence: why current evidence cannot support any conclusion"}
+
+Use needs_reinvestigation sparingly — only when evidence is empty or entirely negative.
+Not for disagreement with the conclusion ranking.
 
 Respond ONLY with the JSON. No markdown, no extra text.
 """
@@ -542,7 +734,7 @@ def critique_node(state: GraphState) -> dict:
             "confirmed": br["confirmed"],
             "confidence": br["confidence"],
             "conclusion": br["conclusion"],
-            "evidence": br["evidence"][:3],
+            "evidence": br["evidence"],
         }
         for br in state["branch_results"]
     ], indent=2)
@@ -561,7 +753,7 @@ def critique_node(state: GraphState) -> dict:
     critique = _extract_json(text, "verdict")
 
     if not critique or critique.get("verdict") == "confirmed":
-        return {"final_report": report}
+        return {"final_report": report, "critique_feedback": ""}
 
     if critique.get("verdict") == "revised":
         revised = dict(report)
@@ -569,12 +761,74 @@ def critique_node(state: GraphState) -> dict:
         revised["evidence"] = critique.get("evidence", report["evidence"])
         revised["confidence"] = critique.get("confidence", report["confidence"])
         revised["_critique_notes"] = critique.get("notes", "")
-        return {"final_report": revised}
+        return {"final_report": revised, "critique_feedback": ""}
 
-    return {"final_report": report}
+    # Feature 1: needs_reinvestigation — set critique_feedback to trigger
+    # reinvestigate_node via conditional routing (only if round 0).
+    if critique.get("verdict") == "needs_reinvestigation":
+        focus = critique.get("investigation_focus", "")
+        if focus and state.get("critique_round", 0) < 1:
+            return {
+                "final_report": report,
+                "critique_feedback": focus,
+            }
+
+    return {"final_report": report, "critique_feedback": ""}
+
+
+# ── Node 5: reinvestigate (Feature 1 — critique feedback loop) ────────────────
+
+def reinvestigate_node(state: GraphState) -> dict:
+    """
+    Feature 1: Targeted re-investigation when critique flags insufficient evidence.
+    Runs a single branch with the critique's investigation_focus as the hypothesis,
+    appends the result to branch_results, then routes back to synthesize → critique
+    for one final pass (critique_round incremented to prevent infinite looping).
+    """
+    focus = state.get("critique_feedback", "")
+    if not focus:
+        return {
+            "critique_round": state.get("critique_round", 0) + 1,
+            "critique_feedback": "",
+        }
+
+    try:
+        result = _run_branch(
+            hypothesis={
+                "service": "aws",
+                "reason": focus,
+                "focus": focus,
+            },
+            symptom=state["symptom"],
+            profile=state["profile"],
+            region=state["region"],
+            minutes=state["minutes"],
+            session_id=state["session_id"],
+        )
+        new_branches = list(state["branch_results"]) + [result.model_dump()]
+        new_fetched = {**state.get("all_fetched", {}), **result.all_fetched}
+    except Exception:
+        new_branches = list(state["branch_results"])
+        new_fetched = dict(state.get("all_fetched", {}))
+
+    return {
+        "branch_results": new_branches,
+        "all_fetched": new_fetched,
+        "critique_round": state.get("critique_round", 0) + 1,
+        "critique_feedback": "",
+    }
 
 
 # ── Graph construction ─────────────────────────────────────────────────────────
+
+def _after_critique(state: GraphState) -> str:
+    """Route after critique: reinvestigate once if critique flagged insufficient evidence."""
+    if state.get("critique_round", 0) >= 1:
+        return END
+    if state.get("critique_feedback", ""):
+        return "reinvestigate"
+    return END
+
 
 def _build_graph():
     workflow = StateGraph(GraphState)
@@ -582,11 +836,16 @@ def _build_graph():
     workflow.add_node("investigate", investigate_node)
     workflow.add_node("synthesize", synthesize_node)
     workflow.add_node("critique", critique_node)
+    workflow.add_node("reinvestigate", reinvestigate_node)
     workflow.add_edge(START, "triage")
     workflow.add_edge("triage", "investigate")
     workflow.add_edge("investigate", "synthesize")
     workflow.add_edge("synthesize", "critique")
-    workflow.add_edge("critique", END)
+    workflow.add_conditional_edges(
+        "critique", _after_critique,
+        {"reinvestigate": "reinvestigate", END: END},
+    )
+    workflow.add_edge("reinvestigate", "synthesize")
     return workflow.compile()
 
 
@@ -607,7 +866,7 @@ def debug_incident_graph(
     profile: str | None,
     region: str = "us-east-1",
     minutes: int = 10,
-    max_turns: int = 24,  # kept for interface compatibility, controls branch depth implicitly
+    max_turns: int = 24,  # kept for interface compatibility
 ) -> tuple[str, dict]:
     """
     LangGraph parallel hypothesis agent.
@@ -619,6 +878,7 @@ def debug_incident_graph(
         detect_hallucinations, enforce_confidence,
         verify_cited_values, redact_output,
         audit_log_agent_call, new_session_id,
+        check_evidence_grounding,
     )
 
     rate_check = check_rate_limit()
@@ -650,27 +910,44 @@ def debug_incident_graph(
         "branch_results": [],
         "final_report": {},
         "all_fetched": {},
+        "critique_round": 0,
+        "critique_feedback": "",
     })
 
     parsed = final_state["final_report"]
     all_fetched = final_state.get("all_fetched", {})
 
-    # Post-synthesis guardrails
-    # Note: verify_cited_values is skipped here — graph evidence is derived prose
-    # summarising branch conclusions, not direct quotes from tool output, so string-match
-    # citation verification fires on every correct answer. Hallucination + confidence
-    # enforcement still apply. Critique node provides the semantic cross-check.
     hal_report = detect_hallucinations(parsed, all_fetched)
     parsed = enforce_confidence(parsed, all_fetched, hal_report)
+
+    # Feature 3: Evidence-conclusion grounding check
+    # Downgrades confidence when the conclusion names specific resources or
+    # identifiers that don't appear in any evidence item — catches conclusions
+    # that are plausible but not supported by what the agent actually found.
+    grounding = check_evidence_grounding(
+        parsed.get("root_cause", ""),
+        parsed.get("evidence", []),
+        all_fetched,
+    )
+    if not grounding.grounded and parsed.get("confidence") in ("HIGH", "MEDIUM"):
+        parsed["confidence"] = "LOW"
+        parsed["confidence_override_reason"] = (
+            f"Confidence downgraded: conclusion references identifiers not found "
+            f"in evidence — {grounding.reason}"
+        )
+
     parsed = redact_output(parsed)
 
+    reinvestigated = final_state.get("critique_round", 0) > 0
     parsed["_guardrails"] = {
         "agent_version": "graph_v2",
         "hypotheses_explored": len(final_state.get("hypotheses", [])),
         "branches_completed": len(final_state.get("branch_results", [])),
         "branches_confirmed": sum(1 for br in final_state.get("branch_results", []) if br.get("confirmed")),
         "critique_applied": "_critique_notes" in parsed,
+        "reinvestigated": reinvestigated,
         "hallucination_rate": hal_report.hallucination_rate,
+        "grounding_issues": grounding.ungrounded_claims if not grounding.grounded else [],
         "account_id": account_id,
     }
 

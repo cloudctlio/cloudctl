@@ -1272,10 +1272,20 @@ class DebugFetcher:
         "encryption_key", "client_secret", "db_pass", "database_pass",
         "incident_mode",
     )
+    # Tag keys whose names would reveal test harness state to the agent.
+    # Both the key name AND value are dropped — seeing "scenario" as a key
+    # is itself a hint that a fault-injection scenario is active.
+    _SENSITIVE_TAG_KEYS = {"scenario", "incident_mode", "incident"}
+
+    def _is_sensitive(self, key: str) -> bool:
+        k = key.lower()
+        return any(p in k for p in self._SENSITIVE_ENV)
+
+    def _filter_tags(self, tags: dict) -> dict:
+        return {k: v for k, v in tags.items() if k.lower() not in self._SENSITIVE_TAG_KEYS}
 
     def _redact(self, key: str, value: str) -> str:
-        k = key.lower()
-        return "***REDACTED***" if any(p in k for p in self._SENSITIVE_ENV) else value
+        return "***REDACTED***" if self._is_sensitive(key) else value
 
     def ecs_service_details(self, cluster_hint: str, service_hint: str) -> dict:
         """Fetch ECS service describe + active task definition + container config.
@@ -1367,8 +1377,9 @@ class DebugFetcher:
                     result["containers"] = []
                     for c in td.get("containerDefinitions", []):
                         env_vars = {
-                            e["name"]: self._redact(e["name"], e.get("value", ""))
+                            e["name"]: e.get("value", "")
                             for e in c.get("environment", [])
+                            if not self._is_sensitive(e["name"])
                         }
                         result["containers"].append({
                             "name":          c.get("name"),
@@ -1444,8 +1455,9 @@ class DebugFetcher:
             cfg = lmb.get_function_configuration(FunctionName=fn_name)
 
             env_vars = {
-                k: self._redact(k, v)
+                k: v
                 for k, v in cfg.get("Environment", {}).get("Variables", {}).items()
+                if not self._is_sensitive(k)
             }
 
             vpc = cfg.get("VpcConfig", {})
@@ -1563,7 +1575,7 @@ class DebugFetcher:
                 "iam_db_auth_enabled":    inst.get("IAMDatabaseAuthenticationEnabled", False),
                 "backup_retention_days":  inst.get("BackupRetentionPeriod", 0),
                 "cloudwatch_log_exports": inst.get("EnabledCloudwatchLogsExports", []),
-                "tags": {t["Key"]: t["Value"] for t in inst.get("TagList", [])},
+                "tags": self._filter_tags({t["Key"]: t["Value"] for t in inst.get("TagList", [])}),
             }
             pending = inst.get("PendingModifiedValues", {})
             if pending:
@@ -1648,7 +1660,7 @@ class DebugFetcher:
                 "members":               members,
                 "scaling_config":        cl.get("ScalingConfigurationInfo", {}),
                 "serverless_v2_config":  cl.get("ServerlessV2ScalingConfiguration", {}),
-                "tags": {t["Key"]: t["Value"] for t in cl.get("TagList", [])},
+                "tags": self._filter_tags({t["Key"]: t["Value"] for t in cl.get("TagList", [])}),
             }
         except Exception:  # noqa: BLE001
             return {}
@@ -1697,7 +1709,7 @@ class DebugFetcher:
                 "allow_version_upgrade": cl.get("AllowVersionUpgrade", True),
                 "cluster_version":       cl.get("ClusterVersion", ""),
                 "availability_zone":     cl.get("AvailabilityZone", ""),
-                "tags": {t["Key"]: t["Value"] for t in cl.get("Tags", [])},
+                "tags": self._filter_tags({t["Key"]: t["Value"] for t in cl.get("Tags", [])}),
             }
             pmv = cl.get("PendingModifiedValues", {})
             if pmv:
@@ -1868,8 +1880,9 @@ class DebugFetcher:
                                 lambda_arn = uri.split("/functions/")[1].split("/invocations")[0]
                                 fn_cfg = lmb.get_function_configuration(FunctionName=lambda_arn)
                                 auth_entry["lambda_env_vars"] = {
-                                    k: self._redact(k, v)
+                                    k: v
                                     for k, v in fn_cfg.get("Environment", {}).get("Variables", {}).items()
+                                    if not self._is_sensitive(k)
                                 }
                                 auth_entry["lambda_function_name"] = fn_cfg.get("FunctionName")
                             except Exception:  # noqa: BLE001
@@ -2061,7 +2074,7 @@ class DebugFetcher:
                 "last_accessed_date":  str(secret.get("LastAccessedDate", "")),
                 "last_changed_date":   str(secret.get("LastChangedDate", "")),
                 "deleted_date":        str(secret.get("DeletedDate", "")),
-                "tags": {t["Key"]: t["Value"] for t in secret.get("Tags", [])},
+                "tags": self._filter_tags({t["Key"]: t["Value"] for t in secret.get("Tags", [])}),
             }
             try:
                 versions = sm.list_secret_version_ids(
@@ -3056,7 +3069,7 @@ class DebugFetcher:
                     {"resources": e.get("resources", []), "kms_key": e.get("provider", {}).get("keyArn", "")}
                     for e in desc.get("encryptionConfig", [])
                 ],
-                "tags": desc.get("tags", {}),
+                "tags": self._filter_tags(desc.get("tags", {})),
             }
             try:
                 addons = eks.list_addons(clusterName=cluster_name).get("addons", [])
@@ -3399,6 +3412,7 @@ class DebugFetcher:
                     "environment": [
                         {"name": e.get("name"), "value": e.get("value")}
                         for e in container.get("environment", [])
+                        if not self._is_sensitive(e.get("name", ""))
                     ],
                     "log_configuration":      container.get("logConfiguration", {}),
                     "network_configuration":  container.get("networkConfiguration", {}),
@@ -3765,7 +3779,7 @@ class DebugFetcher:
             config_data = {
                 "resource_arn": arn,
                 "cfn_type": cfn_type,
-                "tags": tags_dict,
+                "tags": self._filter_tags(tags_dict),
                 "note": "Configuration properties could not be described directly; showing metadata and tags.",
             }
             fetch_method = "tagging_api"
