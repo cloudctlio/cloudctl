@@ -43,6 +43,8 @@ No log-grepping. No tab-switching. One command.
 
 ## Install
 
+Requires **Python 3.13+**.
+
 ```bash
 # Core CLI — all three clouds, no AI
 pip install cctl
