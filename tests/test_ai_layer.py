@@ -933,37 +933,45 @@ class TestCheckEvidenceGrounding:
         assert result.grounded is True
 
 
-class TestSensitiveKeyDropped:
-    """_redact_recursive must drop the entire key-value pair for sensitive keys,
-    not just redact the value — the key name itself is the hint."""
+class TestValueShapeRedaction:
+    """Redaction is by VALUE SHAPE only — keys are never dropped. Key-name
+    filtering deleted diagnostic evidence twice (ExplicitAuthFlows via 'auth',
+    KeySchema/KmsKeyId via 'key'); scenario hiding is the test harness's job
+    (behavior knobs), not production code's."""
 
-    def test_incident_mode_key_dropped_entirely(self):
+    def test_diagnostic_keys_always_survive(self):
         from cloudctl.ai.guardrails import sanitise_fetched_data
-        data = {"env_vars": {"INCIDENT_MODE": "bad_task", "LOG_LEVEL": "INFO"}}
+        data = {
+            "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+            "authorizerUri": "arn:aws:apigateway:us-east-1:lambda:path/x",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "KmsMasterKeyId": "alias/my-key",
+            "PrivateIpAddress": "10.0.1.5",
+        }
         result = sanitise_fetched_data(data)
-        assert "INCIDENT_MODE" not in result["env_vars"]
-        assert "LOG_LEVEL" in result["env_vars"]
+        assert set(result.keys()) == set(data.keys())
+        assert result["ExplicitAuthFlows"] == ["ALLOW_REFRESH_TOKEN_AUTH"]
 
-    def test_scenario_key_dropped_entirely(self):
+    def test_secret_material_values_redacted_by_shape(self):
         from cloudctl.ai.guardrails import sanitise_fetched_data
-        data = {"tags": {"scenario": "kms_denied", "Name": "platform-vpc", "project": "shopcore"}}
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        data = {
+            "SessionToken": jwt,
+            "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "host": "db.example.com",
+        }
         result = sanitise_fetched_data(data)
-        assert "scenario" not in result["tags"]
-        assert "Name" in result["tags"]
+        assert "SessionToken" in result                     # key survives
+        assert result["SessionToken"] == "[REDACTED:JWT]"   # material masked
+        assert "[REDACTED:AWS_ACCESS_KEY]" in result["AccessKeyId"]
+        assert result["host"] == "db.example.com"
 
-    def test_password_key_dropped(self):
+    def test_plain_config_values_untouched(self):
         from cloudctl.ai.guardrails import sanitise_fetched_data
-        data = {"db_password": "supersecret", "host": "db.example.com"}
+        data = {"name": "billing-orders", "status": "ACTIVE", "region": "us-east-1",
+                "env_vars": {"LOG_LEVEL": "INFO", "CACHE_TTL": "300"}}
         result = sanitise_fetched_data(data)
-        assert "db_password" not in result
-        assert "host" in result
-
-    def test_non_sensitive_keys_preserved(self):
-        from cloudctl.ai.guardrails import sanitise_fetched_data
-        data = {"name": "platform-orders", "status": "ACTIVE", "region": "us-east-1"}
-        result = sanitise_fetched_data(data)
-        assert result["name"] == "platform-orders"
-        assert result["status"] == "ACTIVE"
+        assert result == data
 
 
 class TestDetectContradiction:

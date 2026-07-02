@@ -200,6 +200,7 @@ def run(
     profile:     Optional[str],
     region:      str,
     max_turns:   int = 14,
+    approve=None,
 ) -> dict:
     """
     Drive the resolution agent.
@@ -212,6 +213,12 @@ def run(
     base_branch: git branch to base the fix branch on (e.g. "develop").
     profile:     AWS profile for Bedrock auth.
     region:      AWS region where Bedrock is called from.
+    approve:     Optional callback (stage: str, detail: str) -> bool. Two
+                 gates: "plan" before the FIRST file write (what will change,
+                 where) and "push" before commit/push/PR (actual git diff +
+                 fresh validation result). Returning False blocks that gate;
+                 the agent is told to stop and emit manual steps instead.
+                 None = no gates (library/test use).
     """
     import boto3
     from cloudctl.mcp.tools.resolve import (
@@ -240,11 +247,54 @@ def run(
 
     messages: list[dict] = [{"role": "user", "content": [{"text": user_content}]}]
 
+    _DECLINED = json.dumps({
+        "error": "The operator declined this step. Do NOT retry it. Stop and "
+                 "respond with status='manual_required', listing the intended "
+                 "fix as detailed manual_steps for the operator to apply."
+    })
+    gates = {"plan": approve is None, "push": approve is None}   # True = passed
+
+    def _gate_plan(tool_input: dict) -> bool:
+        if gates["plan"]:
+            return True
+        detail = (
+            f"PLANNED CHANGE\n"
+            f"  file: {tool_input.get('path', '?')}\n"
+            f"--- replace ---\n{tool_input.get('old_content', '')}\n"
+            f"--- with ---\n{tool_input.get('new_content', '')}"
+        )
+        gates["plan"] = bool(approve("plan", detail))
+        return gates["plan"]
+
+    def _gate_push(directory: str) -> bool:
+        if gates["push"]:
+            return True
+        import subprocess
+        try:
+            diff = subprocess.run(
+                ["git", "diff"], cwd=directory,
+                capture_output=True, text=True, timeout=30,
+            ).stdout
+        except Exception:  # noqa: BLE001
+            diff = "(git diff unavailable)"
+        validation = validate_change(directory, "terraform")
+        detail = (
+            f"READY TO COMMIT / PUSH / PR\n"
+            f"--- git diff ---\n{diff[:4000]}\n"
+            f"--- validation ---\n{validation[:1000]}"
+        )
+        if '"success": true' not in validation.lower():
+            return False   # never push an invalid change, regardless of answer
+        gates["push"] = bool(approve("push", detail))
+        return gates["push"]
+
     def _dispatch(tool_name: str, tool_input: dict) -> str:
         directory = tool_input.get("directory") or iac_root
         if tool_name == "read_iac_file":
             return read_iac_file(tool_input["path"])
         if tool_name == "write_iac_change":
+            if not _gate_plan(tool_input):
+                return _DECLINED
             return write_iac_change(
                 tool_input["path"],
                 tool_input["old_content"],
@@ -259,12 +309,16 @@ def run(
                 directory,
             )
         if tool_name == "git_commit_push":
+            if not _gate_push(directory):
+                return _DECLINED
             return git_commit_push(
                 tool_input["message"],
                 tool_input.get("paths", []),
                 directory,
             )
         if tool_name == "create_pull_request":
+            if not gates["push"]:
+                return _DECLINED
             return create_pull_request(
                 tool_input["title"],
                 tool_input["body"],

@@ -92,9 +92,8 @@ Phase 4 — Evaluate Alternatives (2-3 turns): state and test alternative causes
   any one of which can deny even when the others allow:
     1. Identity policy  — IAM role/user policy attached to the CALLER
     2. Resource policy  — policy attached to the TARGET resource itself
-       (S3 bucket policy, SQS policy, SNS policy, KMS key policy,
-        Secrets Manager resource policy, Lambda resource policy,
-        ECR repository policy, API Gateway resource policy, etc.)
+       (most AWS resource types support one; it is evaluated independently
+        of the caller's identity policy)
     3. Permission boundary / SCP — org-level or boundary restricting the caller
   When diagnosing access denied, you MUST check all three layers.
   Call get_service_config on the target resource — its resource policy is
@@ -110,7 +109,7 @@ Phase 5 — Conclude: structured answer with evidence
     in this session — never from training or assumption.
     When you compute a derived value, say so explicitly.
   verification_steps: 2-3 specific checks to confirm the fix worked
-    (e.g. "invoke the Lambda and verify no AccessDenied in CloudWatch Logs")
+    (e.g. "exercise the failing operation and verify the error is gone from logs")
   confidence: HIGH only if 3+ sources corroborate AND every cited value
     is traceable to fetched data AND at least 2 alternatives were evaluated."""
 
@@ -139,8 +138,7 @@ Do NOT blame the most recent deployment automatically.
   If errors predate the deploy -> deployment is not the cause.
 
 Do NOT stop at the first anomaly.
-  High RDS CPU is a symptom. What queries are slow? Which service caused it?
-  Lambda timeouts are a symptom. What is the Lambda waiting for?
+  An anomalous reading is a symptom of something upstream of it.
   Follow the chain until you reach the root, not the first signal.
 
 Do NOT guess resource names.
@@ -156,61 +154,13 @@ Do NOT ignore the time window the user gave you.
 
 Do NOT claim a specific metric value you didn't fetch.
   If you didn't call get_service_config or tail_logs, you don't know the value.
-  "RDS connections were likely exhausted" is a guess. Fetch and confirm.
+  Any sentence of the form "X was likely Y" is a guess. Fetch and confirm.
 
-Do NOT confuse error rate and latency — they have different root causes.
-  Failures (5xx, errors)  = the request could NOT complete. Connection refused, exception thrown.
-  Slowness (high latency) = the request DID complete, just took a long time.
-  A cause that produces failures does NOT also produce slowness-without-failures.
-  Read the actual error message from logs before naming a cause.
-
-Do NOT diagnose infrastructure config as the cause when application logs show exceptions.
-  Application-level exceptions (ValueError, KeyError, AuthError) prove the code ran.
-  If code ran, the runtime environment (network, VPC, DNS) was reachable.
-  Config problems (no NAT, missing SG rule) produce timeouts or connection refused — not exceptions.
-  Exception in logs = fix the code or data. Timeout in logs = fix the infrastructure.
-
-When latency is high but CPU is LOW, the bottleneck is I/O, not compute.
-  Do NOT stop at "external dependency is slow" — that just moves the question.
-  Check the logging subsystem: use query_metrics with namespace=AWS/Logs,
-  metric_name=IncomingLogEvents (dimension LogGroupName=<log group>) to detect
-  log volume spikes. A service emitting thousands of log lines per request will
-  block its logging driver (awslogs), stalling request threads without raising CPU.
-  Also check: outbound network call timeouts, disk I/O, thread pool exhaustion.
-
-When a fixed fraction of requests are slow (e.g. ~30%) and the rest are fast,
-  this is a per-instance pattern, NOT global resource exhaustion.
-  Global problems (DynamoDB throttle, RDS overload) affect ALL requests uniformly.
-  Fixed-fraction slowness = one of N instances is unhealthy or misconfigured.
-  Check: tail_logs across different task instances to spot which one is slow.
-  Check: ALB target group health to see if specific IPs have high response times.
-  Do NOT blame shared infrastructure until you have ruled out per-task divergence.
-
-When a symptom is "downstream target never gets invoked even though the
-  upstream call succeeds" (EventBridge target, SNS subscriber, SQS consumer),
-  the publish/produce side succeeding tells you nothing about why the
-  consumer side is silent — there is no error anywhere to find by accident.
-  Check the SPECIFIC matching/delivery metric for the middle component
-  (e.g. AWS/Events Invocations for the EventBridge rule, by RuleName
-  dimension) against the publish-side success count over the same window.
-  If publish succeeded but the rule's own Invocations is 0, the rule's
-  event_pattern (get_service_config) does not match the real payload shape —
-  compare its source/detail-type fields against what the producer actually
-  sends. Do NOT conclude the target Lambda/permission is broken if the
-  target was never invoked at the EventBridge layer at all.
-
-When a symptom mentions 429s / rate limiting / throttling, do NOT assume a
-  dedicated "throttle" metric exists for the service in question — it
-  doesn't for every service (e.g. API Gateway has no such metric; its
-  throttling shows up as 4XXError). Instead cross-reference: (1) the
-  observed error/status-code metric (4XXError, Throttles, ThrottledRequests
-  — whichever the service actually exposes) against (2) the resource's
-  CONFIGURED limit from get_service_config (throttling_rate/burst, reserved
-  concurrency, read/write capacity). A spike in (1) plus an unusually low
-  value in (2) is the throttle misconfiguration — you don't need a metric
-  literally named "throttle" to prove this.
-
-When investigating connection timeouts or invocation hangs, do NOT rule out an IAM / authorization denial hypothesis solely because the failure manifests as a timeout rather than an explicit AccessDenied/Unauthorized exception. Some AWS authorization handshakes (notably MSK IAM/SASL) fail by hanging or silently failing to establish the handshake when access is denied, causing the client to time out. Before ruling out auth-deny on these grounds, explicitly inspect the resource's associated IAM policies and permissions rather than relying solely on the error type in logs.
+Do NOT let a prior explanation stand in for evidence.
+  You already know how distributed systems fail — use that knowledge to
+  generate hypotheses and predictions, never to skip testing them. Whatever
+  failure mode you suspect, state what MUST be observable if it is real,
+  fetch that data, and let the data decide.
 
 """
 

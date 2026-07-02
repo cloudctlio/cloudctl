@@ -253,6 +253,12 @@ def debug_issue(
         None, "--iac-root",
         help="Local path to IaC root directory (Terraform / CDK). Required when --resolve is set.",
     ),
+    resolve_yes: bool = typer.Option(
+        False, "--yes",
+        help="With --resolve: skip the two approval gates (fix plan, and "
+             "diff+validation before push). Without this flag the agent stops "
+             "at each gate for confirmation; non-interactive runs stop safely.",
+    ),
     json_out: Optional[str] = typer.Option(
         None, "--json-out",
         help="With --agent: also write the raw agent JSON (root_cause, evidence, "
@@ -361,15 +367,38 @@ def debug_issue(
                     except (EOFError, KeyboardInterrupt):
                         pass
 
+                    import sys as _sys  # noqa: PLC0415
+
+                    def _approve(stage: str, detail: str) -> bool:
+                        """Two-gate operator approval: 'plan' before any file
+                        write, 'push' before commit/push/PR."""
+                        console.print(f"\n[bold yellow]— approval gate: {stage} —[/bold yellow]")
+                        console.print(detail)
+                        if resolve_yes:
+                            console.print("[dim]--yes given: auto-approved[/dim]")
+                            return True
+                        if not _sys.stdin.isatty():
+                            warn("Non-interactive run without --yes: stopping at "
+                                 f"the '{stage}' gate. Re-run with --yes to proceed.")
+                            return False
+                        try:
+                            ans = console.input(f"Approve {stage}? [y/N]: ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            return False
+                        return ans in ("y", "yes")
+
+                    # No status spinner here: the approval gates prompt for
+                    # input mid-run, which conflicts with a live status display.
                     console.print(f"\n[bold]Resolution agent starting (base: {base})...[/bold]")
-                    with console.status("[dim]Claude is drafting the fix...[/dim]"):
-                        result = _resolve_run(
-                            diagnosis=d,
-                            iac_root=root,
-                            base_branch=base,
-                            profile=account,
-                            region=region or "us-east-1",
-                        )
+                    console.print("[dim]Claude is drafting the fix (approval gates active)...[/dim]")
+                    result = _resolve_run(
+                        diagnosis=d,
+                        iac_root=root,
+                        base_branch=base,
+                        profile=account,
+                        region=region or "us-east-1",
+                        approve=_approve,
+                    )
 
                     status = result.get("status", "error")
                     if status == "success":

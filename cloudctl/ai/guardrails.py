@@ -243,33 +243,37 @@ _SECRET_PATTERNS: list[tuple[str, str]] = [
     (r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b',           "[REDACTED:IPv6_ADDRESS]"),
 ]
 
-_SENSITIVE_KEY_WORDS = {
-    "password", "passwd", "secret", "token", "key",
-    "credential", "auth", "api_key", "private", "incident_mode",
-    "scenario",  # test-harness tag — key name itself is a hint
-}
+# Redaction is by VALUE SHAPE, never by key name. Key-name matching was tried
+# twice and both times deleted diagnostic evidence (substring "auth" removed
+# ExplicitAuthFlows/authorizerUri; "key" removed KeySchema/KmsKeyId) — a
+# sanitiser that deletes evidence is indistinguishable from a broken tool.
+# Secret MATERIAL has recognizable shapes: known provider formats
+# (_SECRET_PATTERNS), JWTs, PEM blocks, long contiguous base64/hex runs.
+# Key names are configuration vocabulary and always survive.
+
+_MATERIAL_PATTERNS: list[tuple[str, str]] = [
+    (r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+     "[REDACTED:JWT]"),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+     "[REDACTED:PEM_PRIVATE_KEY]"),
+    (r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{56,}={0,2}(?![A-Za-z0-9+/=])",
+     "[REDACTED:BASE64_MATERIAL]"),
+]
 
 
 def _redact_value(value: str) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
         value = re.sub(pattern, replacement, value)
+    for pattern, replacement in _MATERIAL_PATTERNS:
+        value = re.sub(pattern, replacement, value)
     return value
 
 
-def _is_sensitive_key(key: str) -> bool:
-    k = str(key).lower()
-    return any(s in k for s in _SENSITIVE_KEY_WORDS)
-
-
 def _redact_recursive(obj) -> None:
-    """Recursively redact sensitive data. Drops the entire key-value pair for
-    sensitive keys — keeping the key name with a '[REDACTED]' value still leaks
-    the key name itself (e.g. 'incident_mode' or 'scenario'), which is enough
-    for the agent to infer test-harness context."""
+    """Recursively redact secret MATERIAL from string values by shape.
+    Keys are never dropped — key names are configuration vocabulary, and
+    deleting them destroys evidence (see note above _MATERIAL_PATTERNS)."""
     if isinstance(obj, dict):
-        keys_to_drop = [k for k in obj if _is_sensitive_key(k)]
-        for k in keys_to_drop:
-            del obj[k]
         for key, value in list(obj.items()):
             if isinstance(value, str):
                 obj[key] = _redact_value(value)
@@ -348,6 +352,10 @@ _ALLOWED_TOOLS = {
     "get_event_timeline",
     "query_metrics",
     "get_deployment_info",
+    "search_cloudtrail",
+    "probe_permission",
+    "get_dependency_graph",
+    "aws_read",
 }
 
 
@@ -1034,7 +1042,7 @@ def check_evidence_grounding(
     evidence item actually naming that resource.
 
     Only patterns with structural separators are checked (hyphenated names like
-    "platform-orders", colon-separated like "kms:Decrypt", ARN fragments) to
+    "billing-service", colon-separated like "kms:Decrypt", ARN fragments) to
     avoid flagging common English words or AWS service names that appear
     universally.
     """
@@ -1065,8 +1073,8 @@ def check_evidence_grounding(
             continue
         if claim.lower() in combined:
             continue
-        # Also accept if any segment of the identifier appears (e.g. "platform"
-        # from "platform-orders" — avoids false positives on minor formatting diff)
+        # Also accept if any segment of the identifier appears (e.g. "billing"
+        # from "billing-service" — avoids false positives on minor formatting diff)
         parts = re.split(r'[-:]', claim)
         if any(len(p) >= 5 and p.lower() in combined for p in parts):
             continue

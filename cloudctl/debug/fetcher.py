@@ -81,7 +81,7 @@ class DebugFetcher:
     def cloudwatch_logs(
         self,
         log_group: str,
-        filter_pattern: str = "ERROR",
+        filter_pattern: str = "",
         minutes: int = 60,
     ) -> list[dict]:
         if not self._session:
@@ -91,20 +91,22 @@ class DebugFetcher:
             logs  = self._session.client("logs")
             end   = int(datetime.now(timezone.utc).timestamp() * 1000)
             start = end - minutes * 60 * 1000
-            resp  = logs.filter_log_events(
+            kwargs: dict = dict(
                 logGroupName=log_group,
                 startTime=start,
                 endTime=end,
-                filterPattern=filter_pattern,
                 limit=100,
             )
+            if filter_pattern:
+                kwargs["filterPattern"] = filter_pattern
+            resp  = logs.filter_log_events(**kwargs)
             events = [
                 {
                     "time":   datetime.fromtimestamp(
                         e["timestamp"] / 1000, tz=timezone.utc
                     ).strftime(_TS_FMT),
                     "source": f"CloudWatch/Logs/{log_group}",
-                    "event":  e.get("message", "").strip()[:200],
+                    "event":  e.get("message", "").strip()[:500],
                 }
                 for e in resp.get("events", [])
             ]
@@ -324,18 +326,38 @@ class DebugFetcher:
             return []
         try:
             from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+            from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
             logs      = self._session.client("logs")
             cutoff_ms = int(
                 (datetime.now(timezone.utc) - timedelta(minutes=minutes)).timestamp() * 1000
             )
             paginator = logs.get_paginator("describe_log_groups")
-            active: list[tuple[int, str]] = []
+            names: list[str] = []
             # Scan up to 5 pages (= 250 log groups) — enough to find recent ones
             for page in paginator.paginate(PaginationConfig={"MaxItems": 250, "PageSize": 50}):
-                for lg in page.get("logGroups", []):
-                    last_event = lg.get("lastEventTimestamp") or lg.get("creationTime", 0)
-                    if last_event >= cutoff_ms:
-                        active.append((last_event, lg["logGroupName"]))
+                names.extend(lg["logGroupName"] for lg in page.get("logGroups", []))
+
+            # describe_log_groups does NOT return lastEventTimestamp — that
+            # field only exists on log streams. Check each group's most recent
+            # stream for true recency, in parallel to keep this fast.
+            def _last_event(group: str) -> tuple[int, str]:
+                try:
+                    streams = logs.describe_log_streams(
+                        logGroupName=group,
+                        orderBy="LastEventTime",
+                        descending=True,
+                        limit=1,
+                    ).get("logStreams", [])
+                    if streams:
+                        return streams[0].get("lastEventTimestamp", 0), group
+                except Exception:  # noqa: BLE001
+                    pass
+                return 0, group
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                results = list(pool.map(_last_event, names[:100]))
+
+            active = [(ts, name) for ts, name in results if ts >= cutoff_ms]
             # Sort most-recent first, return names only
             active.sort(reverse=True)
             return [name for _, name in active[:limit]]
@@ -374,7 +396,7 @@ class DebugFetcher:
                         e["timestamp"] / 1000, tz=timezone.utc
                     ).strftime(_TS_FMT),
                     "source": f"CloudWatch/Logs/{log_group}",
-                    "event":  e.get("message", "").strip()[:200],
+                    "event":  e.get("message", "").strip()[:500],
                 }
                 for e in resp.get("events", [])
             ]
@@ -1266,26 +1288,23 @@ class DebugFetcher:
 
     # ── ECS service + task definition details ────────────────────────────────
 
-    _SENSITIVE_ENV = (
-        "secret", "password", "passwd", "token", "api_key", "apikey",
-        "auth", "credential", "private_key", "access_key", "signing_key",
-        "encryption_key", "client_secret", "db_pass", "database_pass",
-        "incident_mode",
-    )
-    # Tag keys whose names would reveal test harness state to the agent.
-    # Both the key name AND value are dropped — seeing "scenario" as a key
-    # is itself a hint that a fault-injection scenario is active.
-    _SENSITIVE_TAG_KEYS = {"scenario", "incident_mode", "incident"}
+    # Env/tag values are redacted by SHAPE (known secret formats, JWTs, PEM,
+    # long base64 runs) via the guardrails value redactor. Key names always
+    # survive: key-name filtering was tried and deleted diagnostic evidence
+    # (substring "auth" hid ExplicitAuthFlows/authorizerUri, "token"/"key"
+    # hid pagination and KMS/schema fields). Values that merely LOOK like
+    # config stay visible; values that look like secret material are masked.
 
-    def _is_sensitive(self, key: str) -> bool:
-        k = key.lower()
-        return any(p in k for p in self._SENSITIVE_ENV)
+    def _redact_env_value(self, value: str) -> str:
+        try:
+            from cloudctl.ai.guardrails import _redact_value  # noqa: PLC0415
+            return _redact_value(str(value))
+        except Exception:  # noqa: BLE001
+            return str(value)
 
     def _filter_tags(self, tags: dict) -> dict:
-        return {k: v for k, v in tags.items() if k.lower() not in self._SENSITIVE_TAG_KEYS}
-
-    def _redact(self, key: str, value: str) -> str:
-        return "***REDACTED***" if self._is_sensitive(key) else value
+        """Tags pass through with values redacted by shape — no key filtering."""
+        return {k: self._redact_env_value(v) for k, v in (tags or {}).items()}
 
     def ecs_service_details(self, cluster_hint: str, service_hint: str) -> dict:
         """Fetch ECS service describe + active task definition + container config.
@@ -1377,9 +1396,8 @@ class DebugFetcher:
                     result["containers"] = []
                     for c in td.get("containerDefinitions", []):
                         env_vars = {
-                            e["name"]: e.get("value", "")
+                            e["name"]: self._redact_env_value(e.get("value", ""))
                             for e in c.get("environment", [])
-                            if not self._is_sensitive(e["name"])
                         }
                         result["containers"].append({
                             "name":          c.get("name"),
@@ -1455,9 +1473,8 @@ class DebugFetcher:
             cfg = lmb.get_function_configuration(FunctionName=fn_name)
 
             env_vars = {
-                k: v
+                k: self._redact_env_value(v)
                 for k, v in cfg.get("Environment", {}).get("Variables", {}).items()
-                if not self._is_sensitive(k)
             }
 
             vpc = cfg.get("VpcConfig", {})
@@ -1880,9 +1897,8 @@ class DebugFetcher:
                                 lambda_arn = uri.split("/functions/")[1].split("/invocations")[0]
                                 fn_cfg = lmb.get_function_configuration(FunctionName=lambda_arn)
                                 auth_entry["lambda_env_vars"] = {
-                                    k: v
+                                    k: self._redact_env_value(v)
                                     for k, v in fn_cfg.get("Environment", {}).get("Variables", {}).items()
-                                    if not self._is_sensitive(k)
                                 }
                                 auth_entry["lambda_function_name"] = fn_cfg.get("FunctionName")
                             except Exception:  # noqa: BLE001
@@ -3204,25 +3220,16 @@ class DebugFetcher:
                     detail = idp.describe_user_pool_client(
                         UserPoolId=pool_id, ClientId=c["ClientId"],
                     ).get("UserPoolClient", {})
-                    flows = detail.get("ExplicitAuthFlows", [])
+                    # Report raw facts only — explicit_auth_flows shows exactly
+                    # which flows are enabled; interpreting what an absent flow
+                    # means is the model's job, not the tool's.
                     entry: dict = {
                         "client_id":            detail.get("ClientId"),
                         "client_name":          detail.get("ClientName"),
-                        "explicit_auth_flows":  flows,
+                        "explicit_auth_flows":  detail.get("ExplicitAuthFlows", []),
                         "access_token_validity": detail.get("AccessTokenValidity"),
                         "id_token_validity":     detail.get("IdTokenValidity"),
                     }
-                    # Explicit diagnostic flags: missing auth flows are a silent failure
-                    # — the user gets NotAuthorizedException but the pool logs show
-                    # nothing wrong with passwords or credentials.
-                    if "ALLOW_USER_PASSWORD_AUTH" not in flows:
-                        entry["missing_user_password_auth"] = (
-                            "ALLOW_USER_PASSWORD_AUTH is absent from explicit_auth_flows. "
-                            "Direct username+password sign-in will fail with NotAuthorizedException "
-                            "even with correct credentials."
-                        )
-                    if "ALLOW_USER_SRP_AUTH" not in flows and "ALLOW_USER_PASSWORD_AUTH" not in flows:
-                        entry["missing_srp_and_password_auth"] = True
                     client_details.append(entry)
                 except Exception:  # noqa: BLE001
                     pass
@@ -3410,9 +3417,8 @@ class DebugFetcher:
                     "job_role_arn":           container.get("jobRoleArn", ""),
                     "resource_requirements":  container.get("resourceRequirements", []),
                     "environment": [
-                        {"name": e.get("name"), "value": e.get("value")}
+                        {"name": e.get("name"), "value": self._redact_env_value(e.get("value", ""))}
                         for e in container.get("environment", [])
-                        if not self._is_sensitive(e.get("name", ""))
                     ],
                     "log_configuration":      container.get("logConfiguration", {}),
                     "network_configuration":  container.get("networkConfiguration", {}),

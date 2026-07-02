@@ -49,6 +49,15 @@ _SERVICE_FETCHERS: dict[str, tuple[str, str]] = {
     "ecr":             ("ecr_repository_config",     "resource_name"),
     "route53":         ("route53_zone_config",       "resource_name"),
     "codepipeline":    ("codepipeline_config",       "resource_name"),
+    "efs":             ("efs_filesystem_config",     "resource_name"),
+    "batch":           ("batch_config",              "resource_name"),
+    "cognito":         ("cognito_user_pool_config",  "resource_name"),
+    "iam":             ("iam_role_config",           "resource_name"),
+    "waf":             ("waf_web_acl_config",        "resource_name"),
+    "appsync":         ("appsync_api_config",        "resource_name"),
+    "athena":          ("athena_workgroup_config",   "resource_name"),
+    "firehose":        ("firehose_delivery_config",  "resource_name"),
+    "dms":             ("dms_replication_config",    "resource_name"),
     # ── AI / ML ───────────────────────────────────────────────────────────────
     "sagemaker":       ("sagemaker_endpoint_config", "resource_name"),
     "bedrock_agent":   ("bedrock_agent_config",      "resource_name"),
@@ -61,6 +70,9 @@ _VALID_PROFILE_RE = re.compile(r'^[a-zA-Z0-9._\-]+$')
 _VALID_REGION_RE  = re.compile(
     r'^(us|eu|ap|sa|ca|me|af|il|mx|ap)-(?:gov-)?[a-z]+-\d+$|^cn-[a-z]+-\d+$'
 )
+
+
+from cloudctl.mcp.tools.recorder import recordable, recorded  # noqa: E402
 
 
 def _make_session(profile: str | None, region: str):
@@ -291,6 +303,7 @@ def debug_incident(
     }), indent=2)
 
 
+@recordable("query_metrics")
 def query_metrics(
     namespace:   str,
     metric_name: str,
@@ -299,10 +312,15 @@ def query_metrics(
     region:      str,
     minutes:     int = 30,
     stat:        str = "Average",
+    baseline_offset_hours: int = 0,
 ) -> str:
     """Generic CloudWatch metric query. The agent supplies namespace/metric/dims;
     we never pre-choose for it. Returns time-aligned datapoints summarised as
-    first/last/delta/min/max/avg over the window."""
+    first/last/delta/min/max/avg over the window.
+
+    baseline_offset_hours > 0 additionally fetches the SAME window shifted that
+    many hours earlier and reports both, so "is this value anomalous?" becomes
+    arithmetic against the system's own history instead of a guess."""
     import datetime as _dt
     minutes = max(1, min(int(minutes or 30), 360))
 
@@ -315,24 +333,45 @@ def query_metrics(
     try:
         session = _make_session(profile, region)
         cw = session.client("cloudwatch")
-        end   = _dt.datetime.now(_dt.timezone.utc)
-        start = end - _dt.timedelta(minutes=minutes)
-        kwargs = {
-            "Namespace":  namespace,
-            "MetricName": metric_name,
-            "Dimensions": [{"Name": k, "Value": str(v)} for k, v in (dimensions or {}).items()],
-            "StartTime":  start,
-            "EndTime":    end,
-            "Period":     300 if minutes >= 30 else 60,
-        }
-        if extended:
-            kwargs["ExtendedStatistics"] = [extended]
-        else:
-            kwargs["Statistics"] = [stat_param or "Average"]
 
-        r = cw.get_metric_statistics(**kwargs)
-        pts = sorted(r.get("Datapoints", []), key=lambda p: p["Timestamp"])
-        if not pts:
+        def _v(p):
+            if extended:
+                return p.get("ExtendedStatistics", {}).get(extended, 0)
+            return p.get(stat_param or "Average", 0)
+
+        def _window(end: "_dt.datetime") -> dict | None:
+            start = end - _dt.timedelta(minutes=minutes)
+            kwargs = {
+                "Namespace":  namespace,
+                "MetricName": metric_name,
+                "Dimensions": [{"Name": k, "Value": str(v)} for k, v in (dimensions or {}).items()],
+                "StartTime":  start,
+                "EndTime":    end,
+                "Period":     300 if minutes >= 30 else 60,
+            }
+            if extended:
+                kwargs["ExtendedStatistics"] = [extended]
+            else:
+                kwargs["Statistics"] = [stat_param or "Average"]
+            r = cw.get_metric_statistics(**kwargs)
+            pts = sorted(r.get("Datapoints", []), key=lambda p: p["Timestamp"])
+            if not pts:
+                return None
+            values = [_v(p) for p in pts]
+            return {
+                "unit":       pts[0].get("Unit", ""),
+                "datapoints": len(pts),
+                "first":      values[0],
+                "last":       values[-1],
+                "delta":      values[-1] - values[0],
+                "min":        min(values),
+                "max":        max(values),
+                "avg":        sum(values) / len(values),
+            }
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        current = _window(now)
+        if current is None:
             return json.dumps({
                 "namespace": namespace, "metric_name": metric_name,
                 "dimensions": dimensions, "minutes": minutes, "stat": stat,
@@ -340,31 +379,30 @@ def query_metrics(
                 "note": "No data in the requested window — metric or dimensions may be wrong, or the resource has no recent traffic.",
             }, indent=2)
 
-        def _v(p):
-            if extended:
-                return p.get("ExtendedStatistics", {}).get(extended, 0)
-            return p.get(stat_param or "Average", 0)
-
-        values = [_v(p) for p in pts]
-        return json.dumps({
+        out = {
             "namespace":   namespace,
             "metric_name": metric_name,
             "dimensions":  dimensions,
             "minutes":     minutes,
             "stat":        stat,
-            "unit":        r.get("Datapoints", [{}])[0].get("Unit", ""),
-            "datapoints":  len(pts),
-            "first":       values[0],
-            "last":        values[-1],
-            "delta":       values[-1] - values[0],
-            "min":         min(values),
-            "max":         max(values),
-            "avg":         sum(values) / len(values),
-        }, indent=2)
+            **current,
+        }
+        offset = max(0, min(int(baseline_offset_hours or 0), 24 * 14))
+        if offset:
+            baseline = _window(now - _dt.timedelta(hours=offset))
+            out["baseline_offset_hours"] = offset
+            if baseline is None:
+                out["baseline"] = "no data in baseline window"
+            else:
+                out["baseline"] = baseline
+                if isinstance(baseline.get("avg"), (int, float)):
+                    out["avg_vs_baseline_delta"] = current["avg"] - baseline["avg"]
+        return json.dumps(out, indent=2)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"query_metrics failed: {type(exc).__name__}"})
 
 
+@recordable("get_service_config")
 def get_service_config(
     service_type: str,
     resource_hint: str,
@@ -373,12 +411,28 @@ def get_service_config(
 ) -> str:
     from cloudctl.debug.fetcher import DebugFetcher
 
-    if service_type not in _SERVICE_FETCHERS:
-        return json.dumps({"error": f"Unknown service_type '{service_type}'. "
-                                    f"Valid: {sorted(_SERVICE_FETCHERS)}"})
-
     session     = _make_session(profile, region)
     fetcher     = DebugFetcher(session)
+
+    if service_type not in _SERVICE_FETCHERS:
+        try:
+            cfg = fetcher.generic_resource_config(service_type=service_type, resource_name=resource_hint)
+        except Exception as exc:  # noqa: BLE001
+            cfg = {}
+            log.warning("get_service_config (generic) %s: %s", service_type, type(exc).__name__)
+        if not cfg:
+            return json.dumps({
+                "found":       False,
+                "service_type": service_type,
+                "hint":        resource_hint,
+                "tip":         f"No {service_type} resource matched '{resource_hint}' via generic fetcher, "
+                               f"and it is not in the list of recognized optimized services. "
+                               f"Use cloudctl_list_resources to see available names.",
+                "available":   [],
+            }, indent=2)
+        return json.dumps({"found": True, "service_type": service_type,
+                           "config": _serialise(cfg)}, indent=2)
+
     method_name, hint_key = _SERVICE_FETCHERS[service_type]
     method      = getattr(fetcher, method_name)
 
@@ -546,6 +600,18 @@ def _list_codepipeline(s) -> list[str]:
     return [p["name"] for p in cp.list_pipelines().get("pipelines", [])]
 
 
+def _list_efs(s) -> list[str]:
+    efs = s.client("efs")
+    return [fs["FileSystemId"] for fs in efs.describe_file_systems().get("FileSystems", [])]
+
+def _list_batch(s) -> list[str]:
+    batch = s.client("batch")
+    envs = [e["computeEnvironmentName"] for e in batch.describe_compute_environments().get("computeEnvironments", [])]
+    queues = [q["jobQueueName"] for q in batch.describe_job_queues().get("jobQueues", [])]
+    jds = [j["jobDefinitionName"] for j in batch.describe_job_definitions(status="ACTIVE").get("jobDefinitions", [])]
+    return envs + queues + jds
+
+
 _SERVICE_LISTERS: dict[str, object] = {
     # ── Classic infrastructure ────────────────────────────────────────────────
     "ecs":             _list_ecs,
@@ -574,6 +640,8 @@ _SERVICE_LISTERS: dict[str, object] = {
     "ecr":             _list_ecr,
     "route53":         _list_route53,
     "codepipeline":    _list_codepipeline,
+    "efs":             _list_efs,
+    "batch":           _list_batch,
     # ── AI / ML ───────────────────────────────────────────────────────────────
     "sagemaker":       _list_sagemaker,
     "bedrock_agent":   _list_bedrock_agent,
@@ -585,7 +653,35 @@ _SERVICE_LISTERS: dict[str, object] = {
 def _list_resources_for_type(fetcher, service_type: str) -> list[str]:
     """Return a flat list of resource names for a service type."""
     fn = _SERVICE_LISTERS.get(service_type)
-    if not fn or not fetcher._session:
+    if not fn:
+        if not fetcher._session:
+            return []
+        try:
+            tagger = fetcher._session.client("resourcegroupstaggingapi")
+            _ARN_NAMESPACE: dict[str, str] = {
+                "msk":            "kafka",
+                "opensearch":     "es",
+                "efs":            "elasticfilesystem",
+                "stepfunctions":  "states",
+                "step-functions": "states",
+                "alb":            "elasticloadbalancing",
+                "elb":            "elasticloadbalancing",
+                "waf":            "wafv2",
+                "cognito":        "cognito-idp",
+            }
+            tag_filter = _ARN_NAMESPACE.get(service_type, service_type)
+            resources = []
+            paginator = tagger.get_paginator("get_resources")
+            for page in paginator.paginate(ResourceTypeFilters=[tag_filter]):
+                for item in page.get("ResourceTagMappingList", []):
+                    arn = item.get("ResourceARN")
+                    if arn:
+                        resources.append(arn)
+            return resources
+        except Exception as exc:  # noqa: BLE001
+            log.warning("list_resources tagging fallback for %s: %s", service_type, type(exc).__name__)
+            return []
+    if not fetcher._session:
         return []
     try:
         return fn(fetcher._session)
@@ -593,6 +689,7 @@ def _list_resources_for_type(fetcher, service_type: str) -> list[str]:
         return []
 
 
+@recordable("list_resources")
 def list_resources(
     service_type: str,
     profile: str | None,
@@ -611,6 +708,65 @@ def list_resources(
     }, indent=2)
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# hex-looking ids ≥6 chars: require at least one letter so plain words and
+# numbers are untouched but short trace ids / shas ("deadbeef", "0000000a")
+# still normalize into the same template
+_HEX_RE  = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{6,}\b")
+_NUM_RE  = re.compile(r"\b\d+(?:\.\d+)?\b")
+
+
+def _mine_log_templates(events: list[dict], top: int = 12) -> list[dict]:
+    """Cluster log lines into structural templates and count occurrences.
+
+    Purely mechanical: variable parts (uuids, hex ids, numbers) are replaced
+    with placeholders so identical line SHAPES group together. Frequency is
+    the signal — one template appearing thousands of times while others appear
+    a handful is a fact the raw line sample can miss entirely. No thresholds,
+    no interpretation: counts only, the model does the reasoning.
+    """
+    from collections import Counter
+    counts: Counter = Counter()
+    example: dict[str, str] = {}
+    for evt in events:
+        msg = str(evt.get("event", ""))[:400]
+        t = _UUID_RE.sub("<v>", msg)
+        t = _HEX_RE.sub("<v>", t)
+        t = _NUM_RE.sub("<v>", t)
+        t = t[:200]
+        counts[t] += 1
+        example.setdefault(t, msg[:200])
+    return [
+        {"template": t, "count": c, "example": example[t]}
+        for t, c in counts.most_common(top)
+    ]
+
+
+def _parse_log_events(events: list[dict]) -> dict:
+    """Extract structured fields from log events for the AI log intelligence node.
+
+    Parses JSON and key=value log messages into dicts. Returns counts and a
+    sample of parsed rows so the log_intelligence_node can analyze them.
+    No heuristics, no thresholds — pure extraction. The AI does the reasoning.
+    """
+    _KV_RE = re.compile(r'(\w+)=(\S+)')
+    parsed: list[dict] = []
+    for evt in events:
+        msg = evt.get("event", "")
+        try:
+            data = json.loads(msg)
+            if isinstance(data, dict):
+                parsed.append(data)
+                continue
+        except (json.JSONDecodeError, ValueError):
+            pass
+        kv = dict(_KV_RE.findall(msg))
+        if kv:
+            parsed.append(kv)
+    return {"parsed_count": len(parsed), "sample": parsed[:10]} if parsed else {}
+
+
+@recordable("tail_logs")
 def tail_logs(
     resource_hint: str,
     minutes: int,
@@ -625,6 +781,7 @@ def tail_logs(
 
     # Discover which log groups match
     discovered: list[str] = []
+    # Fetch more events than we'll show so analytics has better signal
     logs: list[dict] = []
 
     # Try common log group patterns first
@@ -668,11 +825,16 @@ def tail_logs(
         "resource_hint":    resource_hint,
         "minutes":          minutes,
         "event_count":      len(logs[:max_events]),
+        "total_fetched":    len(logs),
         "log_groups_found": discovered,
+        # Frequency view over ALL fetched lines (not just the shown sample) —
+        # a template's count is a fact the line sample can miss.
+        "log_templates":    _mine_log_templates(logs),
         "events":           _serialise(logs[:max_events]),
     }, indent=2)
 
 
+@recordable("get_event_timeline")
 def get_event_timeline(
     symptom: str,
     profile: str | None,
@@ -757,6 +919,7 @@ def get_event_timeline(
     }, indent=2)
 
 
+@recordable("search_cloudtrail")
 def search_cloudtrail(
     resource_name: str,
     profile:       str | None,
@@ -786,6 +949,7 @@ def search_cloudtrail(
     }, indent=2)
 
 
+@recordable("get_deployment_info")
 def get_deployment_info(
     resource_name: str,
     service_type:  str,
@@ -947,6 +1111,215 @@ def get_deployment_info(
 
 # ── Agent mode ────────────────────────────────────────────────────────────────
 
+@recordable("probe_permission")
+def probe_permission(
+    role:         str,
+    action:       str,
+    resource_arn: str,
+    profile:      str | None,
+    region:       str,
+) -> str:
+    """Deterministically test whether an IAM role can perform an action.
+
+    Uses the IAM policy simulator — no traffic, no logs needed. Turns a
+    permission hypothesis from an inference into a measurement.
+    """
+    session = _make_session(profile, region)
+    iam = session.client("iam")
+    try:
+        role_arn = role
+        if not role.startswith("arn:"):
+            role_arn = iam.get_role(RoleName=role.split("/")[-1])["Role"]["Arn"]
+        kwargs: dict = {"PolicySourceArn": role_arn, "ActionNames": [action]}
+        if resource_arn:
+            kwargs["ResourceArns"] = [resource_arn]
+        results = iam.simulate_principal_policy(**kwargs).get("EvaluationResults", [])
+        evaluated = [
+            {
+                "action":   r.get("EvalActionName"),
+                "resource": r.get("EvalResourceName"),
+                "decision": r.get("EvalDecision"),   # allowed | explicitDeny | implicitDeny
+                "matched_statements": [
+                    {
+                        "policy": m.get("SourcePolicyId"),
+                        "type":   m.get("SourcePolicyType"),
+                    }
+                    for m in r.get("MatchedStatements", [])
+                ],
+            }
+            for r in results
+        ]
+        return json.dumps({
+            "role_arn":  role_arn,
+            "results":   evaluated,
+            "note": "decision is authoritative for identity-based policies; "
+                    "resource-based policies and SCPs are NOT simulated here — "
+                    "an 'allowed' result can still be denied by those layers.",
+        }, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"[:400]})
+
+
+_ARN_RE = re.compile(r"arn:aws[a-z0-9-]*:([a-z0-9-]+):[^:]*:[^:]*:([^\s\"',]+)")
+
+
+# ── Universal read plane ──────────────────────────────────────────────────────
+# The model knows every AWS service's APIs; hand-written fetchers will never
+# keep up and their selection inevitably mirrors whatever we test. aws_read
+# lets the model compose its own deep, service-specific analysis for ANY
+# service — safety enforced deterministically in code, not by prompt.
+
+_READ_VERBS = re.compile(
+    r"^(describe_|get_|list_|search_|lookup_|head_|batch_get_|simulate_|preview_|scan$)"
+)
+_MUTATION_HINTS = (
+    "delete", "create", "update", "put_", "modify", "terminate", "stop_",
+    "start_", "reboot", "invoke", "send_", "publish", "execute", "run_",
+    "cancel", "attach", "detach", "associate", "disassociate", "tag_",
+    "untag", "import_", "restore", "reset_", "enable_", "disable_",
+    "grant", "revoke", "assume", "register", "deregister", "purge",
+    "accept", "reject", "release", "allocate", "copy_", "move_",
+)
+_SAFE_NAME_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+@recordable("aws_read")
+def aws_read(
+    service:   str,
+    operation: str,
+    params:    dict,
+    profile:   str | None,
+    region:    str,
+) -> str:
+    """Call any read-only AWS API operation. The model plans the calls; this
+    layer only enforces that they cannot mutate anything."""
+    from botocore import xform_name
+    from cloudctl.ai.guardrails import sanitise_fetched_data
+
+    if not _SAFE_NAME_RE.match(service or ""):
+        return json.dumps({"error": f"invalid service name: {service!r}"})
+    op_snake = operation if "_" in operation else xform_name(operation)
+    op_snake = op_snake.lower()
+    if not _READ_VERBS.match(op_snake) or any(h in op_snake for h in _MUTATION_HINTS):
+        return json.dumps({
+            "error": f"operation '{operation}' is not allowed — aws_read permits "
+                     f"read-only verbs only (describe/get/list/search/lookup/"
+                     f"head/batch_get/simulate/preview)."
+        })
+
+    session = _make_session(profile, region)
+    try:
+        client = session.client(service, region_name=region)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"unknown service '{service}': "
+                                    f"{type(exc).__name__}: {exc}"[:300]})
+
+    if not hasattr(client, op_snake):
+        available = sorted(
+            o for o in dir(client)
+            if _READ_VERBS.match(o) and not o.startswith("_")
+        )[:40]
+        return json.dumps({
+            "error": f"'{operation}' does not exist on '{service}'",
+            "read_operations_available": available,
+        })
+
+    try:
+        resp = getattr(client, op_snake)(**(params or {}))
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"[:500]})
+
+    if isinstance(resp, dict):
+        resp.pop("ResponseMetadata", None)
+    try:
+        data = json.loads(json.dumps(resp, default=str))
+        if isinstance(data, dict):
+            data = sanitise_fetched_data(data)
+    except Exception:  # noqa: BLE001
+        data = str(resp)[:4000]
+
+    return json.dumps({
+        "service":   service,
+        "operation": op_snake,
+        "data":      data,
+    }, indent=2, default=str)
+
+
+@recordable("get_dependency_graph")
+def get_dependency_graph(profile: str | None, region: str) -> str:
+    """Build the real dependency graph of the deployed app from configuration.
+
+    Fully service-agnostic by construction:
+      1. Nodes come from the Resource Groups Tagging API — every taggable
+         resource in the region, no curated service list.
+      2. Edges come from ONE uniform rule: fetch each resource's configuration
+         via the generic Cloud Control / reflection fetcher (keyed by the raw
+         ARN namespace — no name translation anywhere), and scan the
+         serialized config for references (ARNs or exact names) to any other
+         enumerated resource. If X's config mentions Y, X depends on Y.
+    No per-service edge logic and no namespace tables — a service AWS ships
+    tomorrow is covered the day it appears in an ARN.
+    """
+    session = _make_session(profile, region)
+
+    # 1. Enumerate everything, generically. Node labels use the raw ARN
+    #    namespace — AWS's own vocabulary, which the model already knows.
+    resources: list[dict] = []
+    try:
+        tagging = session.client("resourcegroupstaggingapi")
+        paginator = tagging.get_paginator("get_resources")
+        for page in paginator.paginate(PaginationConfig={"MaxItems": 300}):
+            for r in page.get("ResourceTagMappingList", []):
+                arn = r.get("ResourceARN", "")
+                parts = arn.split(":", 5)
+                if len(parts) < 6:
+                    continue
+                ns, rest = parts[2], parts[5]
+                name = rest.split("/")[-1] if "/" in rest else rest.split(":")[-1]
+                resources.append({"arn": arn, "service": ns, "name": name})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"resource enumeration failed: "
+                                    f"{type(exc).__name__}: {exc}"[:300]})
+
+    nodes = {f"{r['service']}:{r['name']}" for r in resources}
+    edges: list[dict] = []
+
+    # 2. One uniform edge rule: whose config mentions whom.
+    from cloudctl.debug.fetcher import DebugFetcher
+    fetcher = DebugFetcher(session)
+    for res in resources[:60]:
+        try:
+            cfg = fetcher.generic_resource_config(res["service"], res["name"])
+        except Exception:  # noqa: BLE001
+            continue
+        if not cfg:
+            continue
+        blob = json.dumps(cfg, default=str)
+        src_node = f"{res['service']}:{res['name']}"
+        for other in resources:
+            if other is res:
+                continue
+            dst_node = f"{other['service']}:{other['name']}"
+            if dst_node == src_node:
+                continue
+            if other["arn"] in blob or (
+                len(other["name"]) >= 4 and other["name"] in blob
+            ):
+                e = {"from": src_node, "to": dst_node, "via": "config_ref"}
+                if e not in edges:
+                    edges.append(e)
+
+    return json.dumps({
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "nodes": sorted(nodes),
+        "edges": edges,
+        "note": "edges derived by one generic rule: a resource whose live "
+                "configuration references another resource's ARN or name "
+                "depends on it",
+    }, indent=2)
+
+
 _AGENT_TOOLS = [
     {
         "toolSpec": {
@@ -1008,7 +1381,7 @@ _AGENT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "resource_hint":   {"type": "string",
-                                       "description": "Function name, ECS service, or log group prefix"},
+                                       "description": "Resource name or log group prefix"},
                     "filter_pattern":  {"type": "string",
                                        "description": "CloudWatch Logs filter: ERROR, Exception, FATAL, or a literal string"},
                 },
@@ -1038,8 +1411,10 @@ _AGENT_TOOLS = [
             "description": (
                 "Read CloudWatch metric data for any AWS service. Use this whenever a "
                 "config snapshot is not enough and you need to see TRENDS, RATES, or "
-                "current VALUES against limits (e.g. DatabaseConnections, "
-                "TargetResponseTime p99, ApproximateNumberOfMessagesVisible). "
+                "current VALUES against limits. "
+                "Set baseline_offset_hours to also fetch the same window N hours "
+                "earlier and compare against the system's own history instead of "
+                "guessing what is normal. "
                 "Returns first/last/min/max/avg over the window so growth and spikes are visible. "
                 "The model picks the namespace, metric name, and dimensions — they are not pre-chosen."
             ),
@@ -1047,15 +1422,17 @@ _AGENT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "namespace":   {"type": "string",
-                                    "description": "CloudWatch namespace, e.g. AWS/RDS, AWS/ECS, AWS/SQS, AWS/ApplicationELB"},
+                                    "description": "CloudWatch namespace in AWS/<Service> format â use the namespace the service under investigation publishes to"},
                     "metric_name": {"type": "string",
-                                    "description": "Metric name, e.g. DatabaseConnections, CPUUtilization, TargetResponseTime"},
+                                    "description": "Metric name as published by that service"},
                     "dimensions":  {"type": "object",
-                                    "description": "Dimension name/value pairs, e.g. {\"DBInstanceIdentifier\": \"shopcore-orders-db\"}"},
+                                    "description": "Dimension name/value pairs identifying the resource"},
                     "minutes":     {"type": "integer",
                                     "description": "Lookback window in minutes (default 30, max 360)"},
                     "stat":        {"type": "string",
                                     "description": "Statistic: Average, Sum, Maximum, Minimum, p99, p95, p90 (default Average)"},
+                    "baseline_offset_hours": {"type": "integer",
+                                    "description": "If >0, also fetch the same window this many hours earlier and report the comparison (max 336)"},
                 },
                 "required": ["namespace", "metric_name", "dimensions"],
             }},
@@ -1076,11 +1453,101 @@ _AGENT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "resource_name": {"type": "string",
-                                     "description": "Exact resource name (e.g. ECS service name, Lambda function name)"},
+                                     "description": "Exact resource name as returned by list_resources"},
                     "service_type":  {"type": "string",
                                      "description": "AWS service type — same values as list_resources service_type"},
                 },
                 "required": ["resource_name", "service_type"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "search_cloudtrail",
+            "description": (
+                "Search CloudTrail management events touching a resource. "
+                "Returns who did what, when — use to find configuration changes "
+                "near symptom onset. Compare event timestamps against the "
+                "measured onset before treating any change as causal."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "resource_name": {"type": "string",
+                                      "description": "Resource name or ARN fragment to search for"},
+                    "event_names":   {"type": "array", "items": {"type": "string"},
+                                      "description": "Optional specific event names to filter"},
+                    "minutes":       {"type": "integer",
+                                      "description": "Lookback window in minutes (default 1440)"},
+                },
+                "required": ["resource_name"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "probe_permission",
+            "description": (
+                "Deterministically test whether an IAM role is allowed to perform "
+                "an action on a resource, using the IAM policy simulator. No "
+                "traffic or logs needed — use this to CONFIRM or REFUTE a "
+                "permission hypothesis directly. Note: simulates identity-based "
+                "policies only; resource policies and SCPs are separate layers."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "role":         {"type": "string",
+                                     "description": "IAM role name or ARN of the caller"},
+                    "action":       {"type": "string",
+                                     "description": "IAM action to test, in service:Operation format"},
+                    "resource_arn": {"type": "string",
+                                     "description": "Target resource ARN (optional; * if omitted)"},
+                },
+                "required": ["role", "action"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "aws_read",
+            "description": (
+                "Call ANY read-only AWS API operation on ANY service — you plan "
+                "the calls using your own knowledge of the service's APIs. Use "
+                "this when the dedicated tools don't go deep enough for the "
+                "service you are investigating: quotas, versioned configs, "
+                "policies, statuses, per-feature settings. Mutating operations "
+                "are blocked in code. service = boto3 client name; operation = "
+                "API operation (CamelCase or snake_case); params = operation "
+                "parameters."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "service":   {"type": "string",
+                                  "description": "boto3 service/client name"},
+                    "operation": {"type": "string",
+                                  "description": "read-only API operation to call"},
+                    "params":    {"type": "object",
+                                  "description": "operation parameters (optional)"},
+                },
+                "required": ["service", "operation"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "get_dependency_graph",
+            "description": (
+                "Build the REAL dependency graph of the deployed application: "
+                "every resource in the region, with an edge wherever one "
+                "resource's live configuration references another. Use it to "
+                "see exactly what an operation depends on before hypothesizing — "
+                "hypothesis coverage should follow these edges, not guesses."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {},
             }},
         }
     },
@@ -1113,8 +1580,8 @@ When done, respond ONLY with a JSON object (no markdown fences, no extra text):
 
 # ── Context management ────────────────────────────────────────────────────────
 
-_MAX_LOG_LINES_IN_CONTEXT     = 50
-_MAX_TOOL_OUTPUT_CHARS        = 8000   # ~2000 tokens
+_MAX_LOG_LINES_IN_CONTEXT     = 35     # was 50 — enough for pattern detection
+_MAX_TOOL_OUTPUT_CHARS        = 4500   # was 8000 — ~1100 tokens per tool result
 
 
 def _truncate_tool_output(result: str, tool_name: str) -> str:
