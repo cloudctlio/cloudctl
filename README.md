@@ -29,7 +29,7 @@ pip install "cctl[ai]"
 
 Most cloud CLIs are thin wrappers around vendor APIs. cloudctl is different in one key way: **`cloudctl debug`** runs a real investigation.
 
-Instead of returning raw API data and leaving diagnosis to you, it measures the symptom first, spawns three parallel hypothesis branches — each carrying **falsifiable predictions** it must test against real data — then discriminates, synthesizes, and critiques the findings before surfacing a single answer with IaC-aware fix steps. A hypothesis whose prediction is refuted is eliminated in code, not by prompt: no evidence, no diagnosis.
+Instead of returning raw API data and leaving diagnosis to you, it measures the symptom, investigates several competing explanations in parallel against your real logs, metrics, config, and audit trail, and cross-examines the findings before surfacing a single answer with calibrated confidence and IaC-aware fix steps. A hypothesis that isn't supported by evidence doesn't ship — when nothing is proven, it says so instead of guessing.
 
 With `--resolve` it goes one step further: it writes the minimal IaC fix on a branch, validates it, and opens a PR — pausing for your approval before any file is touched and again before anything is pushed.
 
@@ -89,30 +89,14 @@ The flagship command. Give it a symptom — it fetches real data, runs parallel 
 symptom
   │
   ▼
-observe ──── measures the symptom in real data first: is it observable
-  │          right now? when did it start (onset)? what exactly is affected?
+measure ──── quantifies the symptom in real data: when did it start,
+  │          what exactly is affected, what is demonstrably fine
   ▼
-triage ───── generates 3 competing hypotheses, each with FALSIFIABLE
-  │          PREDICTIONS: what MUST be observable if this hypothesis is true
+investigate ─ several competing explanations pursued in parallel against
+  │           live logs, metrics, configuration, and audit trail
   ▼
-investigate (parallel)                        log intelligence (parallel)
-  ├── branch 1: config check → operational      surveys every recently active
-  ├── branch 2: config check → operational      log group; clusters lines into
-  └── branch 3: config check → operational      templates and counts them
-  │       each branch must TEST its predictions:
-  │       CONFIRMED quotes are verified against fetched
-  │       data in code — a fabricated test result is voided
-  ▼
-discriminate ─ causal rules: a refuted prediction ELIMINATES its hypothesis;
-  │            a defect equally present while the system worked cannot be
-  │            the cause; deployment noise before onset is discarded
-  ▼
-synthesize ─── confidence is calibrated from prediction outcomes in code:
-  │            zero verified confirmations = LOW, no matter how confident
-  │            the narrative sounds
-  ▼
-critique ───── devil's advocate: symptom-shape match, deployment noise,
-  │            dependency coverage, permanence, untested claims
+cross-examine ─ findings are challenged before anything is concluded;
+  │             unsupported explanations are discarded
   ▼
 root cause + calibrated confidence + IaC-aware fix steps
   │
@@ -121,22 +105,16 @@ verdict prompt — was this correct? (feeds the live learning loop)
   │
   ▼ (--resolve)
 resolution agent — writes the minimal IaC fix on a branch, validates,
-                   opens a PR — gated by TWO operator approvals:
+                   opens a PR — gated by two operator approvals:
                    ① the fix plan (what changes, where) before any write
                    ② the real diff + passing validation before any push
 ```
 
-Each branch checks **configuration state first** (enabled flags, bound ARNs, rule counts — the same order a human SRE would), then operational state. The core discipline is scientific: no hypothesis ships as the root cause unless a discriminating prediction was tested and confirmed against fetched data — and none refuted. When nothing survives testing, the honest answer is "not proven," at LOW confidence, instead of a plausible-sounding story.
+The agent checks **configuration state first** (the same order a human SRE would), then operational state. Confidence is earned, not asserted: an answer only ships with high confidence when the evidence directly supports it, and when nothing is proven the agent says "not proven" instead of telling a plausible-sounding story.
 
 ### Deep service analysis, any service
 
-The agent isn't limited to pre-built integrations. Alongside dedicated tools (logs, metrics, CloudTrail, config, deployment detection) it has:
-
-- **`aws_read`** — call any read-only AWS API on any service; mutating operations are blocked in code, not by prompt. The agent plans its own deep-dive for services it has never seen.
-- **`probe_permission`** — deterministic IAM policy simulation: a permission hypothesis becomes a measurement, no traffic or logs needed.
-- **`get_dependency_graph`** — the real topology of your deployment, derived from one generic rule: a resource whose live configuration references another depends on it.
-- **Log template mining** — every log fetch includes a frequency table of line *shapes*, so a flood of 5,000 near-identical lines is a counted fact, not something a 50-line sample might miss.
-- **Metric baselines** — any metric can be compared against the same window hours or days earlier: "is this anomalous?" becomes arithmetic, not judgment.
+The agent isn't limited to pre-built integrations. Alongside dedicated tools (logs, metrics, CloudTrail, config, deployment detection) it can safely explore any AWS service's read-only APIs — writes are blocked — so it can go deep on services it has never seen, test IAM permissions deterministically via the policy simulator, and map your deployment's real dependency topology from live configuration.
 
 ### Deployment detection
 
@@ -236,9 +214,8 @@ Once connected, your AI client can query your cloud directly:
 - **Multi-cloud** — `--cloud all` queries AWS + Azure + GCP in parallel
 - **AI is optional** — all CLI commands work without `cctl[ai]`; only `debug` and `ask` need it
 - **Read-only by default** — the agent's tools cannot mutate anything; the only write path is `--resolve`, which is gated behind operator approvals
-- **Secrets stay out of context** — tool output is scrubbed by value shape (key formats, JWTs, PEM blocks) before the model or your terminal sees it
-- **Crash-safe investigations** — progress checkpoints to SQLite; a run killed mid-flight (expired SSO token, Ctrl-C) resumes from its last completed step via `CLOUDCTL_RESUME_THREAD=<thread id from the report>`
-- **Record & replay** — set `CLOUDCTL_RECORD=file.jsonl` to capture every tool call of an investigation; `CLOUDCTL_REPLAY=file.jsonl` re-runs the reasoning against that frozen evidence — an audit trail and a regression harness in one
+- **Secrets stay out of context** — secret material is scrubbed from tool output before the model or your terminal sees it
+- **Crash-safe investigations** — an investigation killed mid-flight (expired credentials, Ctrl-C) resumes from its last completed step instead of starting over
 
 ---
 
