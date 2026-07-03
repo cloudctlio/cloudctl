@@ -102,11 +102,48 @@ class GraphState(TypedDict):
 
 _MODEL = "us.anthropic.claude-sonnet-4-6"
 
+# Prompt caching. A cachePoint marks a prefix boundary Bedrock may reuse across
+# calls; it does NOT change the tokens the model sees, so at temperature 0 the
+# generated output is byte-identical with or without it. We cache only content
+# that repeats verbatim across many calls: the tool schema (sent on every
+# tool-use turn, identical everywhere) and static system prompts.
+_CACHE_POINT = {"cachePoint": {"type": "default"}}
+
+
+def _sys(text: str) -> list[dict]:
+    """System block with a trailing cache point (for STATIC prompts only)."""
+    return [{"text": text}, _CACHE_POINT]
+
+
+def _cached_tools(tools: list[dict]) -> dict:
+    """toolConfig whose (large, invariant) tool schema is cached."""
+    return {"tools": list(tools) + [_CACHE_POINT]}
+
+
+def _conv(msgs: list[dict]) -> list[dict]:
+    """Return a shallow copy of the conversation with a rolling cache point at
+    the end of the latest message. Within a multi-turn tool loop the transcript
+    grows and is otherwise re-sent in full every turn; marking the tail lets
+    turn K reuse turn K-1's cached prefix and pay only for new tokens. The
+    marker is applied to a copy (never persisted into the stored history), so
+    exactly one conversation breakpoint exists per call. Behavior-neutral: the
+    model conditions on the identical token sequence."""
+    if not msgs:
+        return msgs
+    out = list(msgs)
+    last = dict(out[-1])
+    content = list(last.get("content", []))
+    if content and content[-1] != _CACHE_POINT:
+        last["content"] = content + [_CACHE_POINT]
+        out[-1] = last
+    return out
+
 
 def _make_bedrock(profile: str | None, region: str):
     from cloudctl.mcp.tools.debug import _make_session
+    from cloudctl.mcp.tools.recorder import RecordingBedrock
     session = _make_session(profile, region)
-    return session.client(
+    client = session.client(
         "bedrock-runtime",
         region_name=region,
         config=_BotoConfig(
@@ -115,6 +152,10 @@ def _make_bedrock(profile: str | None, region: str):
             read_timeout=120,
         ),
     )
+    # Dual-plane recording/replay: records model requests+responses alongside
+    # tool I/O; serves them back in exact/pinned replay modes. Live behavior
+    # is unchanged when the recorder env vars are unset.
+    return RecordingBedrock(client)
 
 
 def _extract_json(text: str, key: str) -> dict | list | None:
@@ -261,9 +302,9 @@ def observe_node(state: GraphState) -> dict:
         try:
             resp = bedrock.converse(
                 modelId=_MODEL,
-                system=[{"text": _OBSERVE_SYSTEM}],
-                messages=msgs,
-                toolConfig={"tools": tools},
+                system=_sys(_OBSERVE_SYSTEM),
+                messages=_conv(msgs),
+                toolConfig=_cached_tools(tools),
                 inferenceConfig={"maxTokens": 700, "temperature": 0},
             )
         except Exception as exc:
@@ -409,10 +450,10 @@ def triage_node(state: GraphState) -> dict:
     for _ in range(6):
         resp = bedrock.converse(
             modelId=_MODEL,
-            system=[{"text": _TRIAGE_SYSTEM}],
-            messages=msgs,
-            toolConfig={"tools": [t for t in _AGENT_TOOLS
-                                  if t["toolSpec"]["name"] in ("list_resources", "get_dependency_graph")]},
+            system=_sys(_TRIAGE_SYSTEM),
+            messages=_conv(msgs),
+            toolConfig=_cached_tools([t for t in _AGENT_TOOLS
+                                  if t["toolSpec"]["name"] in ("list_resources", "get_dependency_graph")]),
             inferenceConfig={"maxTokens": 1000, "temperature": 0},
         )
         stop_reason = resp["stopReason"]
@@ -713,9 +754,9 @@ def _run_branch(
             try:
                 resp = bedrock.converse(
                     modelId=_MODEL,
-                    system=[{"text": system_text}],
-                    messages=msgs,
-                    toolConfig={"tools": _AGENT_TOOLS},
+                    system=_sys(system_text),
+                    messages=_conv(msgs),
+                    toolConfig=_cached_tools(_AGENT_TOOLS),
                 )
             except Exception as exc:
                 return {"conclusion": f"error: {exc}", "confidence": "LOW",
@@ -1013,7 +1054,7 @@ def log_intelligence_node(state: GraphState) -> dict:
     try:
         resp = bedrock.converse(
             modelId="us.anthropic.claude-haiku-4-5-20251001",
-            system=[{"text": _LOG_INTEL_SYSTEM}],
+            system=_sys(_LOG_INTEL_SYSTEM),
             messages=[{"role": "user", "content": [{"text": (
                 f"INCIDENT SYMPTOM: {state['symptom']}\n\n"
                 f"LINE-SHAPE FREQUENCIES (count per structural template, all "
@@ -1146,7 +1187,7 @@ def discriminate_node(state: GraphState) -> dict:
         # Sonnet: discriminate needs full reasoning power — wrong category = wrong diagnosis
         resp = bedrock.converse(
             modelId=_MODEL,
-            system=[{"text": _DISCRIMINATE_SYSTEM}],
+            system=_sys(_DISCRIMINATE_SYSTEM),
             messages=[{"role": "user", "content": [{"text": (
                 f"SYMPTOM: {state['symptom']}\n\n"
                 f"MEASURED OBSERVATION:\n"
@@ -1354,7 +1395,7 @@ def synthesize_node(state: GraphState) -> dict:
 
     resp = bedrock.converse(
         modelId=_MODEL,
-        system=[{"text": system}],
+        system=_sys(system),
         messages=[{"role": "user", "content": [{"text": user_content}]}],
         inferenceConfig={"maxTokens": 2500, "temperature": 0},
     )
@@ -1386,7 +1427,7 @@ def synthesize_node(state: GraphState) -> dict:
         )
         resp2 = bedrock.converse(
             modelId=_MODEL,
-            system=[{"text": system}],
+            system=_sys(system),
             messages=[
                 {"role": "user", "content": [{"text": user_content}]},
                 {"role": "assistant", "content": [{"text": text}]},
@@ -1540,14 +1581,14 @@ def critique_node(state: GraphState) -> dict:
     )
     resp = bedrock.converse(
         modelId=_MODEL,
-        system=[{"text": _CRITIQUE_SYSTEM}],
+        system=_sys(_CRITIQUE_SYSTEM),
         messages=[{"role": "user", "content": [{"text": user_content}]}],
         inferenceConfig={"maxTokens": 600, "temperature": 0},
     )
     text = resp["output"]["message"]["content"][0]["text"].strip()
     critique = _extract_json(text, "verdict")
 
-    if not critique or critique.get("verdict") == "confirmed":
+    if not isinstance(critique, dict) or critique.get("verdict") == "confirmed":
         return {"final_report": report, "critique_feedback": ""}
 
     if critique.get("verdict") == "revised":

@@ -24,9 +24,17 @@ import threading
 import time
 from datetime import datetime, timezone
 
-_LOCK = threading.Lock()
+# RLock: _model_queues() holds the lock while calling _load_replay(), which
+# locks again — a plain Lock deadlocks on that reentry.
+_LOCK = threading.RLock()
 _REPLAY_CACHE: dict[str, list[dict]] = {}
 _REPLAY_PATH_LOADED: str | None = None
+
+# Replay fidelity accounting: exact prefix hits vs fuzzy matches vs misses.
+# A replayed verdict is only comparable to the recorded one when fidelity is
+# high — a run full of misses reasoned from thinner evidence than the
+# original, and its divergence says nothing about the change under test.
+REPLAY_STATS = {"exact": 0, "fuzzy": 0, "fallback": 0, "miss": 0}
 
 # Session cache: parallel investigation branches routinely repeat identical
 # read calls (same list/describe on the same resources). Within one
@@ -104,27 +112,170 @@ def _lookup(tool: str, canonical: dict) -> str:
     canon_str = json.dumps(canonical, sort_keys=True, default=str)
     for rec in recs:
         if json.dumps(rec.get("input", {}), sort_keys=True, default=str) == canon_str:
+            REPLAY_STATS["exact"] += 1
             return rec["output"]
 
     want = _primary_id(canonical).lower()
     if want:
         for rec in recs:
             if _primary_id(rec.get("input", {})).lower() == want:
+                REPLAY_STATS["fuzzy"] += 1
                 return rec["output"]
         # substring match (model phrased the hint differently)
         for rec in recs:
             got = _primary_id(rec.get("input", {})).lower()
             if got and (want in got or got in want):
+                REPLAY_STATS["fuzzy"] += 1
                 return rec["output"]
 
     if recs:
+        REPLAY_STATS["fallback"] += 1
         return recs[0]["output"]
+    REPLAY_STATS["miss"] += 1
     return json.dumps({
         "replay_miss": True,
         "tool": tool,
         "note": "no recording for this tool in the replay fixture; "
                 "treat as data unavailable",
     })
+
+
+def reset_replay_state() -> None:
+    """Clear all module state (caches, queues, counters). Test support —
+    production processes are one investigation per process and never need it."""
+    with _LOCK:
+        _REPLAY_CACHE.clear()
+        _SESSION_CACHE.clear()
+        _MODEL_QUEUES.clear()
+        global _REPLAY_PATH_LOADED, _MODEL_QUEUES_PATH
+        _REPLAY_PATH_LOADED = None
+        _MODEL_QUEUES_PATH = None
+        for k in REPLAY_STATS:
+            REPLAY_STATS[k] = 0
+        MODEL_STATS.update({"served": 0, "diverged_at": None, "live": 0})
+        _MODEL_SEQ["n"] = 0
+
+
+def replay_meta(path: str) -> dict:
+    """Return the fixture's _meta record (symptom/region/minutes), if present."""
+    _load_replay(path)
+    for rec in _REPLAY_CACHE.get("_meta", []):
+        return rec.get("input", {}) or {}
+    return {}
+
+
+def replay_fidelity() -> dict:
+    """Fidelity summary for the current process's replay lookups."""
+    total = sum(REPLAY_STATS.values())
+    score = (REPLAY_STATS["exact"] + REPLAY_STATS["fuzzy"]) / total if total else 0.0
+    return {**REPLAY_STATS, "total": total, "fidelity": round(score, 3)}
+
+
+# ── Dual-plane recording: the model plane ─────────────────────────────────────
+#
+# Tool I/O alone is half the flight. Recording every model request/response as
+# well enables two rigorous replay modes:
+#   exact  — recorded model responses are served for byte-matching requests;
+#            no live model, no nondeterminism: the trajectory reproduces by
+#            construction. Used to PROVE a change is behavior-neutral (every
+#            request the new code builds must hash-match the recording).
+#   pinned — recorded responses are served while requests still match; the
+#            live model takes over at the FIRST divergent request, so any
+#            trajectory change is attributable to the edit under test, never
+#            to server-side jitter upstream of it.
+#
+# cachePoint blocks are stripped before hashing: they are billing directives,
+# not content, so cached and uncached agents compare as equal.
+
+import hashlib
+
+MODEL_STATS = {"served": 0, "diverged_at": None, "live": 0}
+
+
+def _strip_cache_points(obj):
+    if isinstance(obj, list):
+        return [_strip_cache_points(x) for x in obj
+                if not (isinstance(x, dict) and set(x.keys()) == {"cachePoint"})]
+    if isinstance(obj, dict):
+        return {k: _strip_cache_points(v) for k, v in obj.items()}
+    return obj
+
+
+def _request_hash(kwargs: dict) -> str:
+    canon = _strip_cache_points({k: v for k, v in kwargs.items() if k != "modelId"})
+    return hashlib.sha256(
+        json.dumps(canon, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+_MODEL_QUEUES: dict[str, list[str]] = {}
+_MODEL_QUEUES_PATH: str | None = None
+_MODEL_SEQ = {"n": 0}
+
+
+def _model_queues(path: str) -> dict[str, list[str]]:
+    """Recorded model responses indexed by request hash (FIFO per hash).
+
+    Hash matching (not sequence) is essential: investigation branches run in
+    parallel threads whose interleaving differs run to run, so a global call
+    order is not reproducible even between two identical live runs."""
+    global _MODEL_QUEUES_PATH
+    with _LOCK:
+        if _MODEL_QUEUES_PATH != path:
+            _load_replay(path)
+            _MODEL_QUEUES.clear()
+            for rec in _REPLAY_CACHE.get("_model", []):
+                h = rec.get("input", {}).get("hash", "")
+                _MODEL_QUEUES.setdefault(h, []).append(rec["output"])
+            _MODEL_QUEUES_PATH = path
+    return _MODEL_QUEUES
+
+
+class RecordingBedrock:
+    """Wraps a bedrock-runtime client; records/replays the model plane.
+
+    Modes (CLOUDCTL_REPLAY_MODEL): unset/'' = live (record if CLOUDCTL_RECORD);
+    'exact' = serve recorded responses by request hash, hard-fail on any
+    unmatched request (proof of behavior-neutrality);
+    'pinned' = serve while requests match, go live from the first mismatch
+    (divergence attributable to the change under test, not upstream jitter).
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def converse(self, **kwargs):
+        mode = os.environ.get("CLOUDCTL_REPLAY_MODEL", "")
+        h = _request_hash(kwargs)
+        if mode in ("exact", "pinned") and os.environ.get("CLOUDCTL_REPLAY"):
+            queues = _model_queues(os.environ["CLOUDCTL_REPLAY"])
+            with _LOCK:
+                q = queues.get(h)
+                out = q.pop(0) if q else None
+            if out is not None:
+                MODEL_STATS["served"] += 1
+                return json.loads(out)
+            if MODEL_STATS["diverged_at"] is None:
+                MODEL_STATS["diverged_at"] = MODEL_STATS["served"]
+            if mode == "exact":
+                raise RuntimeError(
+                    f"exact replay: no recorded response for request hash "
+                    f"{h[:12]} (after {MODEL_STATS['served']} matched calls). "
+                    f"The change under test is NOT behavior-neutral."
+                )
+        resp = self._client.converse(**kwargs)
+        MODEL_STATS["live"] += 1
+        if os.environ.get("CLOUDCTL_RECORD"):
+            with _LOCK:
+                seq = _MODEL_SEQ["n"]
+                _MODEL_SEQ["n"] += 1
+            slim = {k: v for k, v in resp.items() if k != "ResponseMetadata"}
+            _record("_model", {"seq": seq, "hash": h},
+                    json.dumps(slim, default=str))
+        return resp
 
 
 def recordable(tool_name: str):
