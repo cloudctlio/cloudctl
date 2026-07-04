@@ -75,15 +75,39 @@ _VALID_REGION_RE  = re.compile(
 from cloudctl.mcp.tools.recorder import recordable, recorded  # noqa: E402
 
 
+# Bounded timeouts + capped retries for EVERY tool-plane AWS read. A single
+# boto call with no read timeout once stalled an investigation for 40 minutes
+# (2026-07-04) — no read may block the agent indefinitely. Applied centrally so
+# all ~40 client() call sites inherit it; a caller may still override per client.
+def _tool_boto_config():
+    from botocore.config import Config as _BotoConfig
+    return _BotoConfig(
+        connect_timeout=8,
+        read_timeout=30,
+        retries={"max_attempts": 3, "mode": "adaptive"},
+    )
+
+
 def _make_session(profile: str | None, region: str):
-    """Fresh boto3 Session each call — keeps SSO tokens current."""
+    """Fresh boto3 Session each call — keeps SSO tokens current. Every client it
+    hands out carries bounded timeouts + capped retries (see _tool_boto_config)
+    so no tool-plane AWS read can hang the investigation."""
     import boto3
     if profile and not _VALID_PROFILE_RE.match(profile):
         raise ValueError("Invalid AWS profile name")
     if region and not _VALID_REGION_RE.match(region):
         raise ValueError(f"Invalid AWS region: {region}")
-    return boto3.Session(profile_name=profile, region_name=region) if profile \
-        else boto3.Session(region_name=region)
+
+    default_cfg = _tool_boto_config()
+
+    class _BoundedSession(boto3.Session):
+        def client(self, *args, **kwargs):
+            cfg = kwargs.get("config")
+            kwargs["config"] = default_cfg.merge(cfg) if cfg is not None else default_cfg
+            return super().client(*args, **kwargs)
+
+    return _BoundedSession(profile_name=profile, region_name=region) if profile \
+        else _BoundedSession(region_name=region)
 
 
 def _serialise(obj) -> object:

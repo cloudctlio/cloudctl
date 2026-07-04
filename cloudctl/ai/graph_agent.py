@@ -1793,7 +1793,11 @@ def debug_incident_graph(
 
     resume_thread = _os.environ.get("CLOUDCTL_RESUME_THREAD", "")
     thread_id = resume_thread or session_id
-    invoke_config = {"configurable": {"thread_id": thread_id}}
+    # recursion_limit bounds the number of graph steps; combined with the
+    # per-call boto/Bedrock timeouts this bounds total wall-clock. The ceiling
+    # below is the hard backstop that emits a partial report instead of hanging.
+    invoke_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
+    _ceiling_s = int(_os.environ.get("CLOUDCTL_INVESTIGATION_CEILING_S", "1200"))
 
     initial_state = None if resume_thread else {
         "symptom": symptom,
@@ -1814,7 +1818,46 @@ def debug_incident_graph(
     }
     from cloudctl.mcp.tools.recorder import reset_usage_stats, usage_report
     reset_usage_stats()
-    final_state = _get_graph().invoke(initial_state, invoke_config)
+
+    graph = _get_graph()
+
+    def _invoke_bounded(arg):
+        """Run one graph invocation under the wall-clock ceiling. On breach,
+        return None so the caller emits a best-effort partial report from the
+        last checkpoint rather than blocking forever. Per-call timeouts mean the
+        abandoned worker thread finishes on its own shortly after."""
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            fut = _ex.submit(graph.invoke, arg, invoke_config)
+            try:
+                return fut.result(timeout=_ceiling_s)
+            except concurrent.futures.TimeoutError:
+                return None
+
+    final_state = _invoke_bounded(initial_state)
+    if final_state is None:
+        # Ceiling breached — assemble whatever the checkpoint holds.
+        try:
+            snap = graph.get_state(invoke_config)
+            checkpointed = dict(snap.values) if snap and snap.values else {}
+        except Exception:  # noqa: BLE001
+            checkpointed = {}
+        partial = checkpointed.get("final_report") or {}
+        report = {
+            "root_cause": partial.get("root_cause")
+                or (f"Investigation exceeded the {_ceiling_s}s time ceiling before "
+                    "reaching a conclusion. Partial findings below; resume with "
+                    f"CLOUDCTL_RESUME_THREAD={thread_id}."),
+            "evidence": partial.get("evidence", []),
+            "remediation_steps": partial.get("remediation_steps", []),
+            "severity": partial.get("severity", "UNKNOWN"),
+            "confidence": "LOW",
+            "resources_investigated": partial.get("resources_investigated", []),
+            "_timed_out": True,
+            "_thread_id": thread_id,
+            "_usage": usage_report(),
+        }
+        return json.dumps(report), checkpointed.get("all_fetched", {}) or {}
 
     # Human-in-the-loop: clarify_node may interrupt when no hypothesis
     # survived. Prompt the operator on a real terminal and resume from the
@@ -1832,7 +1875,9 @@ def debug_incident_graph(
                 answer = input("> ").strip()
         except Exception:  # noqa: BLE001
             answer = ""
-        final_state = _get_graph().invoke(Command(resume=answer), invoke_config)
+        resumed = _invoke_bounded(Command(resume=answer))
+        if resumed is not None:
+            final_state = resumed
 
     parsed = final_state["final_report"]
     all_fetched = final_state.get("all_fetched", {})
