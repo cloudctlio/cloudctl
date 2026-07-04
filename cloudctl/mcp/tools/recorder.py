@@ -188,8 +188,47 @@ def replay_fidelity() -> dict:
 # not content, so cached and uncached agents compare as equal.
 
 import hashlib
+import time
 
 MODEL_STATS = {"served": 0, "diverged_at": None, "live": 0}
+
+# Per-process cost/latency accounting. Pure instrumentation: reads the usage
+# fields Bedrock already returns; changes no token the model sees and no tool
+# call, so it is behavior-neutral. Sonnet 4.6 Bedrock rates ($/M tokens).
+_RATE = {"in": 3.00, "out": 15.00, "cache_write": 3.75, "cache_read": 0.30}
+USAGE_STATS = {"calls": 0, "input": 0, "output": 0,
+               "cache_read": 0, "cache_write": 0, "wall_seconds": 0.0}
+
+
+def reset_usage_stats() -> None:
+    USAGE_STATS.update({"calls": 0, "input": 0, "output": 0,
+                        "cache_read": 0, "cache_write": 0, "wall_seconds": 0.0})
+
+
+def usage_report() -> dict:
+    u = USAGE_STATS
+    cost = (u["input"] * _RATE["in"] + u["output"] * _RATE["out"]
+            + u["cache_write"] * _RATE["cache_write"]
+            + u["cache_read"] * _RATE["cache_read"]) / 1e6
+    return {
+        "model_calls":       u["calls"],
+        "input_tokens":      u["input"],
+        "output_tokens":     u["output"],
+        "cache_read_tokens": u["cache_read"],
+        "cache_write_tokens": u["cache_write"],
+        "wall_seconds":      round(u["wall_seconds"], 1),
+        "est_cost_usd":      round(cost, 4),
+    }
+
+
+def _accumulate_usage(resp: dict, elapsed: float) -> None:
+    u = resp.get("usage", {}) or {}
+    USAGE_STATS["calls"] += 1
+    USAGE_STATS["input"] += u.get("inputTokens", 0)
+    USAGE_STATS["output"] += u.get("outputTokens", 0)
+    USAGE_STATS["cache_read"] += u.get("cacheReadInputTokens", 0)
+    USAGE_STATS["cache_write"] += u.get("cacheWriteInputTokens", 0)
+    USAGE_STATS["wall_seconds"] += elapsed
 
 
 def _strip_cache_points(obj):
@@ -257,7 +296,9 @@ class RecordingBedrock:
                 out = q.pop(0) if q else None
             if out is not None:
                 MODEL_STATS["served"] += 1
-                return json.loads(out)
+                served = json.loads(out)
+                _accumulate_usage(served, 0.0)   # replayed: no wall time
+                return served
             if MODEL_STATS["diverged_at"] is None:
                 MODEL_STATS["diverged_at"] = MODEL_STATS["served"]
             if mode == "exact":
@@ -266,7 +307,9 @@ class RecordingBedrock:
                     f"{h[:12]} (after {MODEL_STATS['served']} matched calls). "
                     f"The change under test is NOT behavior-neutral."
                 )
+        _t0 = time.monotonic()
         resp = self._client.converse(**kwargs)
+        _accumulate_usage(resp, time.monotonic() - _t0)
         MODEL_STATS["live"] += 1
         if os.environ.get("CLOUDCTL_RECORD"):
             with _LOCK:

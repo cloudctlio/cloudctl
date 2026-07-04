@@ -1812,6 +1812,8 @@ def debug_incident_graph(
         "discrimination": {},
         "observation": {},
     }
+    from cloudctl.mcp.tools.recorder import reset_usage_stats, usage_report
+    reset_usage_stats()
     final_state = _get_graph().invoke(initial_state, invoke_config)
 
     # Human-in-the-loop: clarify_node may interrupt when no hypothesis
@@ -1844,6 +1846,8 @@ def debug_incident_graph(
     }
     # Resume a crashed run with CLOUDCTL_RESUME_THREAD=<this value>
     parsed["_thread_id"] = thread_id
+    # Cost/latency of this investigation (behavior-neutral instrumentation).
+    parsed["_usage"] = usage_report()
 
     # Resolution plumbing: lift deployment_source/iac_file_hint from any
     # get_deployment_info result gathered during investigation — the
