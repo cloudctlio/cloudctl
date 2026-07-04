@@ -1762,7 +1762,7 @@ def debug_incident_graph(
         detect_hallucinations, enforce_confidence,
         verify_cited_values, redact_output,
         audit_log_agent_call, new_session_id,
-        check_evidence_grounding,
+        check_evidence_grounding, cap_speculative_dismissal,
     )
 
     rate_check = check_rate_limit()
@@ -1882,6 +1882,10 @@ def debug_incident_graph(
 
     hal_report = detect_hallucinations(parsed, all_fetched)
     parsed = enforce_confidence(parsed, all_fetched, hal_report)
+    # Safety net: never let a "this alert is a false positive / not a real fault"
+    # verdict ship at high confidence (see cap_speculative_dismissal). Fires only
+    # on dismissal language; leaves genuine fault diagnoses untouched.
+    parsed = cap_speculative_dismissal(parsed)
 
     # Feature 3: Evidence-conclusion grounding check
     # Downgrades confidence when the conclusion names specific resources or

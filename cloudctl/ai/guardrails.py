@@ -410,6 +410,54 @@ def validate_tool_call(
 
 # ── Guardrail 5 — Confidence Enforcement ──────────────────────────────────────
 
+# A verdict that dismisses the reported symptom as not a real fault — a "false
+# positive", a monitoring artifact, "everything is actually healthy" — is the
+# single most dangerous conclusion a diagnosis agent can ship: it tells the
+# on-call to stand down on a live alert. In production, symptoms are often
+# vague ("service X is unhealthy"), and when the true fault is silent (a success
+# response carrying wrong data, a failure confined to one path) the agent can
+# find no obvious cause and rationalise the alert away — sometimes fabricating a
+# mechanism to explain it. This is a general real-world safety invariant, not a
+# fix for any one incident: you cannot be confident a live alert is spurious
+# unless you actually inspected the alerting system and found a concrete defect
+# in it. It fires only on dismissal language, so it never touches a genuine
+# fault diagnosis (which asserts a real cause).
+_DISMISSAL_MARKERS = (
+    "false positive", "false-positive", "false alarm", "spurious",
+    "not a real fault", "no real fault", "no actual fault", "not an actual fault",
+    "not a genuine", "monitoring artifact", "alert is a false",
+    "is fully operational", "is actually healthy", "no real issue",
+)
+
+
+def is_symptom_dismissal(agent_output: dict) -> bool:
+    """True when a verdict dismisses the reported symptom as not a real fault."""
+    text = (
+        str(agent_output.get("root_cause", "")) + " "
+        + " ".join(str(e) for e in agent_output.get("evidence", []))
+    ).lower()
+    return any(m in text for m in _DISMISSAL_MARKERS)
+
+
+def cap_speculative_dismissal(agent_output: dict) -> dict:
+    """Cap confidence to LOW on a verdict that dismisses the reported symptom as
+    not a real fault. A live alert cannot be confidently declared spurious
+    without a concrete, inspected defect in the alerting system — that is a
+    human-review event, not a confident auto-diagnosis. See the note above."""
+    claimed = agent_output.get("confidence", "MEDIUM")
+    if claimed == "LOW" or not is_symptom_dismissal(agent_output):
+        return agent_output
+    output = copy.deepcopy(agent_output)
+    output["confidence"] = "LOW"
+    output["confidence_override_reason"] = (
+        f"Confidence capped from {claimed} to LOW: the verdict dismisses the "
+        "reported symptom as not a real fault. A live alert cannot be confidently "
+        "declared spurious without a concrete, inspected defect in the alerting "
+        "system — this is a human-review event, not a confident auto-diagnosis."
+    )
+    return output
+
+
 def enforce_confidence(
     agent_output: dict,
     fetched_data: dict,
