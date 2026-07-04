@@ -194,22 +194,42 @@ MODEL_STATS = {"served": 0, "diverged_at": None, "live": 0}
 
 # Per-process cost/latency accounting. Pure instrumentation: reads the usage
 # fields Bedrock already returns; changes no token the model sees and no tool
-# call, so it is behavior-neutral. Sonnet 4.6 Bedrock rates ($/M tokens).
-_RATE = {"in": 3.00, "out": 15.00, "cache_write": 3.75, "cache_read": 0.30}
+# call, so it is behavior-neutral.
+#
+# Rates are PER MODEL ($/M tokens) — an investigation can mix models (e.g. the
+# PRISM log-intelligence node uses Haiku while the reasoning nodes use Sonnet),
+# and Haiku is ~4x cheaper, so a single Sonnet rate would badly misprice the
+# run and the budget cap. Each call is priced by its own modelId; unknown models
+# fall back to the Sonnet rate (the primary model) and are flagged.
+_RATES = {
+    "opus":   {"in": 15.00, "out": 75.00, "cache_write": 18.75, "cache_read": 1.50},
+    "sonnet": {"in": 3.00,  "out": 15.00, "cache_write": 3.75,  "cache_read": 0.30},
+    "haiku":  {"in": 0.80,  "out": 4.00,  "cache_write": 1.00,  "cache_read": 0.08},
+}
+_DEFAULT_RATE = _RATES["sonnet"]
+
+
+def _rate_for(model_id: str) -> dict:
+    m = (model_id or "").lower()
+    for family, rate in _RATES.items():
+        if family in m:
+            return rate
+    return _DEFAULT_RATE
+
+
 USAGE_STATS = {"calls": 0, "input": 0, "output": 0,
-               "cache_read": 0, "cache_write": 0, "wall_seconds": 0.0}
+               "cache_read": 0, "cache_write": 0, "wall_seconds": 0.0,
+               "cost": 0.0, "unknown_model_calls": 0}
 
 
 def reset_usage_stats() -> None:
     USAGE_STATS.update({"calls": 0, "input": 0, "output": 0,
-                        "cache_read": 0, "cache_write": 0, "wall_seconds": 0.0})
+                        "cache_read": 0, "cache_write": 0, "wall_seconds": 0.0,
+                        "cost": 0.0, "unknown_model_calls": 0})
 
 
 def usage_report() -> dict:
     u = USAGE_STATS
-    cost = (u["input"] * _RATE["in"] + u["output"] * _RATE["out"]
-            + u["cache_write"] * _RATE["cache_write"]
-            + u["cache_read"] * _RATE["cache_read"]) / 1e6
     return {
         "model_calls":       u["calls"],
         "input_tokens":      u["input"],
@@ -217,7 +237,8 @@ def usage_report() -> dict:
         "cache_read_tokens": u["cache_read"],
         "cache_write_tokens": u["cache_write"],
         "wall_seconds":      round(u["wall_seconds"], 1),
-        "est_cost_usd":      round(cost, 4),
+        "est_cost_usd":      round(u["cost"], 4),
+        "unpriced_model_calls": u["unknown_model_calls"],
     }
 
 
@@ -246,14 +267,24 @@ def _check_budget() -> None:
         )
 
 
-def _accumulate_usage(resp: dict, elapsed: float) -> None:
+def _accumulate_usage(resp: dict, elapsed: float, model_id: str = "") -> None:
     u = resp.get("usage", {}) or {}
+    in_t    = u.get("inputTokens", 0)
+    out_t   = u.get("outputTokens", 0)
+    cr_t    = u.get("cacheReadInputTokens", 0)
+    cw_t    = u.get("cacheWriteInputTokens", 0)
     USAGE_STATS["calls"] += 1
-    USAGE_STATS["input"] += u.get("inputTokens", 0)
-    USAGE_STATS["output"] += u.get("outputTokens", 0)
-    USAGE_STATS["cache_read"] += u.get("cacheReadInputTokens", 0)
-    USAGE_STATS["cache_write"] += u.get("cacheWriteInputTokens", 0)
+    USAGE_STATS["input"] += in_t
+    USAGE_STATS["output"] += out_t
+    USAGE_STATS["cache_read"] += cr_t
+    USAGE_STATS["cache_write"] += cw_t
     USAGE_STATS["wall_seconds"] += elapsed
+    # price THIS call by its own model, then add to the running total
+    r = _rate_for(model_id)
+    if r is _DEFAULT_RATE and model_id and not any(f in model_id.lower() for f in _RATES):
+        USAGE_STATS["unknown_model_calls"] += 1
+    USAGE_STATS["cost"] += (in_t * r["in"] + out_t * r["out"]
+                            + cw_t * r["cache_write"] + cr_t * r["cache_read"]) / 1e6
     _check_budget()
 
 
@@ -323,7 +354,7 @@ class RecordingBedrock:
             if out is not None:
                 MODEL_STATS["served"] += 1
                 served = json.loads(out)
-                _accumulate_usage(served, 0.0)   # replayed: no wall time
+                _accumulate_usage(served, 0.0, kwargs.get("modelId", ""))   # replayed: no wall time
                 return served
             if MODEL_STATS["diverged_at"] is None:
                 MODEL_STATS["diverged_at"] = MODEL_STATS["served"]
@@ -335,7 +366,7 @@ class RecordingBedrock:
                 )
         _t0 = time.monotonic()
         resp = self._client.converse(**kwargs)
-        _accumulate_usage(resp, time.monotonic() - _t0)
+        _accumulate_usage(resp, time.monotonic() - _t0, kwargs.get("modelId", ""))
         MODEL_STATS["live"] += 1
         if os.environ.get("CLOUDCTL_RECORD"):
             with _LOCK:
