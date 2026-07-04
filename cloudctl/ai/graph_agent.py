@@ -1821,22 +1821,29 @@ def debug_incident_graph(
 
     graph = _get_graph()
 
+    from cloudctl.mcp.tools.recorder import BudgetExceededError
+    _stop_reason = {"why": ""}
+
     def _invoke_bounded(arg):
-        """Run one graph invocation under the wall-clock ceiling. On breach,
-        return None so the caller emits a best-effort partial report from the
-        last checkpoint rather than blocking forever. Per-call timeouts mean the
-        abandoned worker thread finishes on its own shortly after."""
+        """Run one graph invocation under the wall-clock ceiling AND the spend
+        budget. On breach, return None so the caller emits a best-effort partial
+        report from the last checkpoint rather than blocking or overspending.
+        Per-call timeouts mean the abandoned worker thread finishes shortly."""
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
             fut = _ex.submit(graph.invoke, arg, invoke_config)
             try:
                 return fut.result(timeout=_ceiling_s)
             except concurrent.futures.TimeoutError:
+                _stop_reason["why"] = f"exceeded the {_ceiling_s}s time ceiling"
+                return None
+            except BudgetExceededError as exc:
+                _stop_reason["why"] = str(exc)
                 return None
 
     final_state = _invoke_bounded(initial_state)
     if final_state is None:
-        # Ceiling breached — assemble whatever the checkpoint holds.
+        # Ceiling or budget breached — assemble whatever the checkpoint holds.
         try:
             snap = graph.get_state(invoke_config)
             checkpointed = dict(snap.values) if snap and snap.values else {}
@@ -1845,7 +1852,7 @@ def debug_incident_graph(
         partial = checkpointed.get("final_report") or {}
         report = {
             "root_cause": partial.get("root_cause")
-                or (f"Investigation exceeded the {_ceiling_s}s time ceiling before "
+                or (f"Investigation stopped early ({_stop_reason['why']}) before "
                     "reaching a conclusion. Partial findings below; resume with "
                     f"CLOUDCTL_RESUME_THREAD={thread_id}."),
             "evidence": partial.get("evidence", []),

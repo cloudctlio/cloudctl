@@ -28,3 +28,26 @@ def test_tool_boto_config_shape():
     cfg = _tool_boto_config()
     assert cfg.connect_timeout and cfg.read_timeout
     assert cfg.retries["max_attempts"] <= 3
+
+
+def test_budget_ceiling_raises_and_propagates(monkeypatch):
+    from cloudctl.mcp.tools import recorder as rec
+    rec.reset_usage_stats()
+    rec._accumulate_usage({"usage": {"inputTokens": 10000, "outputTokens": 1000}}, 1.0)
+    monkeypatch.setenv("CLOUDCTL_INVESTIGATION_BUDGET_USD", "0.01")
+    import pytest
+    with pytest.raises(rec.BudgetExceededError):
+        rec._check_budget()
+    # BaseException so it propagates past branch-level `except Exception`
+    assert issubclass(rec.BudgetExceededError, BaseException)
+    assert not issubclass(rec.BudgetExceededError, Exception)
+    monkeypatch.setenv("CLOUDCTL_INVESTIGATION_BUDGET_USD", "100")
+    rec._check_budget()  # under budget: no raise
+
+
+def test_no_budget_set_never_raises(monkeypatch):
+    from cloudctl.mcp.tools import recorder as rec
+    rec.reset_usage_stats()
+    rec._accumulate_usage({"usage": {"inputTokens": 10_000_000, "outputTokens": 1}}, 1.0)
+    monkeypatch.delenv("CLOUDCTL_INVESTIGATION_BUDGET_USD", raising=False)
+    rec._check_budget()  # no cap → never raises regardless of spend

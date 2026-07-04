@@ -221,6 +221,31 @@ def usage_report() -> dict:
     }
 
 
+class BudgetExceededError(BaseException):
+    """Raised when an investigation's estimated spend crosses its budget. A
+    BaseException (not Exception) so it propagates PAST the branch-level
+    `except Exception` handlers and cleanly aborts the whole graph invoke —
+    debug_incident_graph catches it and emits a best-effort partial report."""
+
+
+def _check_budget() -> None:
+    """Abort the investigation if estimated spend has crossed the budget set in
+    CLOUDCTL_INVESTIGATION_BUDGET_USD (unset/0 = no cap). Checked after each
+    model call, so it stops at the first call that tips over the limit."""
+    cap = os.environ.get("CLOUDCTL_INVESTIGATION_BUDGET_USD", "")
+    try:
+        cap_f = float(cap)
+    except (TypeError, ValueError):
+        return
+    if cap_f <= 0:
+        return
+    if usage_report()["est_cost_usd"] > cap_f:
+        raise BudgetExceededError(
+            f"estimated spend ${usage_report()['est_cost_usd']:.2f} crossed the "
+            f"${cap_f:.2f} budget"
+        )
+
+
 def _accumulate_usage(resp: dict, elapsed: float) -> None:
     u = resp.get("usage", {}) or {}
     USAGE_STATS["calls"] += 1
@@ -229,6 +254,7 @@ def _accumulate_usage(resp: dict, elapsed: float) -> None:
     USAGE_STATS["cache_read"] += u.get("cacheReadInputTokens", 0)
     USAGE_STATS["cache_write"] += u.get("cacheWriteInputTokens", 0)
     USAGE_STATS["wall_seconds"] += elapsed
+    _check_budget()
 
 
 def _strip_cache_points(obj):
