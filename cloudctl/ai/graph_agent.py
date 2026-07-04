@@ -725,6 +725,7 @@ def _run_branch(
                 action=tool_input["action"],
                 resource_arn=tool_input.get("resource_arn", ""),
                 profile=profile, region=region,
+                resource_policy=tool_input.get("resource_policy", ""),
             )
         elif tool_name == "get_dependency_graph":
             raw = get_dependency_graph(profile=profile, region=region)

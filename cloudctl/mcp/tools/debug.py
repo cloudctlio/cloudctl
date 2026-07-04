@@ -1113,16 +1113,21 @@ def get_deployment_info(
 
 @recordable("probe_permission")
 def probe_permission(
-    role:         str,
-    action:       str,
-    resource_arn: str,
-    profile:      str | None,
-    region:       str,
+    role:            str,
+    action:          str,
+    resource_arn:    str,
+    profile:         str | None,
+    region:          str,
+    resource_policy: str = "",
 ) -> str:
     """Deterministically test whether an IAM role can perform an action.
 
     Uses the IAM policy simulator — no traffic, no logs needed. Turns a
-    permission hypothesis from an inference into a measurement.
+    permission hypothesis from an inference into a measurement. Pass
+    resource_policy (the target's resource-based policy document, fetched with
+    aws_read) to evaluate identity and resource layers together — this catches
+    an identity-Allow overridden by a resource-side Deny, or vice versa. The
+    tool never decides which policy to fetch; the caller supplies it.
     """
     session = _make_session(profile, region)
     iam = session.client("iam")
@@ -1133,7 +1138,19 @@ def probe_permission(
         kwargs: dict = {"PolicySourceArn": role_arn, "ActionNames": [action]}
         if resource_arn:
             kwargs["ResourceArns"] = [resource_arn]
-        results = iam.simulate_principal_policy(**kwargs).get("EvaluationResults", [])
+        resource_policy = (resource_policy or "").strip()
+        if resource_policy:
+            # Evaluate both layers together; CallerArn anchors the principal.
+            kwargs["ResourcePolicy"] = resource_policy
+            kwargs["CallerArn"] = role_arn
+        try:
+            results = iam.simulate_principal_policy(**kwargs).get("EvaluationResults", [])
+        except Exception:  # noqa: BLE001
+            # Resource policy rejected by the simulator (malformed/unsupported)
+            # — fall back to identity-only rather than failing the probe.
+            kwargs.pop("ResourcePolicy", None); kwargs.pop("CallerArn", None)
+            resource_policy = ""
+            results = iam.simulate_principal_policy(**kwargs).get("EvaluationResults", [])
         evaluated = [
             {
                 "action":   r.get("EvalActionName"),
@@ -1149,12 +1166,21 @@ def probe_permission(
             }
             for r in results
         ]
+        layers = ("identity + resource-based policy"
+                  if resource_policy else "identity-based policy only")
+        note = (
+            f"decision evaluates {layers}. "
+            + ("SCPs/permission boundaries are still not simulated."
+               if resource_policy else
+               "resource-based policies and SCPs are NOT simulated here (no "
+               "resource ARN given or none attached) — an 'allowed' result can "
+               "still be denied by those layers.")
+        )
         return json.dumps({
             "role_arn":  role_arn,
+            "resource_policy_evaluated": bool(resource_policy),
             "results":   evaluated,
-            "note": "decision is authoritative for identity-based policies; "
-                    "resource-based policies and SCPs are NOT simulated here — "
-                    "an 'allowed' result can still be denied by those layers.",
+            "note":      note,
         }, indent=2)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"[:400]})
@@ -1491,8 +1517,11 @@ _AGENT_TOOLS = [
                 "Deterministically test whether an IAM role is allowed to perform "
                 "an action on a resource, using the IAM policy simulator. No "
                 "traffic or logs needed — use this to CONFIRM or REFUTE a "
-                "permission hypothesis directly. Note: simulates identity-based "
-                "policies only; resource policies and SCPs are separate layers."
+                "permission hypothesis directly. When a resource ARN is supplied, "
+                "the target's resource-based policy is fetched and evaluated "
+                "together with the role's identity policy, so a deny on either "
+                "layer is caught. SCPs and permission boundaries remain outside "
+                "the simulation."
             ),
             "inputSchema": {"json": {
                 "type": "object",
@@ -1503,6 +1532,8 @@ _AGENT_TOOLS = [
                                      "description": "IAM action to test, in service:Operation format"},
                     "resource_arn": {"type": "string",
                                      "description": "Target resource ARN (optional; * if omitted)"},
+                    "resource_policy": {"type": "string",
+                                     "description": "Optional: the target's resource-based policy document (fetch it with aws_read, e.g. get_resource_policy / get_bucket_policy / get_key_policy). Supplying it makes the check evaluate identity and resource layers together."},
                 },
                 "required": ["role", "action"],
             }},
