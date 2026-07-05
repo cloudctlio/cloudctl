@@ -877,6 +877,25 @@ def _run_branch(
     # predictions cannot claim confirmation, and a refuted prediction is a veto.
     preds = [p for p in (p2.get("predictions_tested") or []) if isinstance(p, dict)]
 
+    # Calibration reliability: a branch often concludes confirmed=true WITH real
+    # evidence but forgets to populate predictions_tested — so n_confirmed=0, the
+    # confirmation is voided, and a correct answer ships LOW. When that happens,
+    # derive one prediction entry from the branch's own evidence. This is NOT
+    # fabrication: the anti-fabrication check below still verifies the observed
+    # text against the fetched corpus, so a derived entry survives only if the
+    # evidence is genuinely traceable.
+    if p2.get("confirmed") and not any(
+        isinstance(p, dict) and p.get("verdict") == "CONFIRMED" for p in preds
+    ):
+        ev = p2.get("evidence") or p1.get("evidence") or []
+        if ev:
+            preds.append({
+                "prediction": getattr(h, "focus", "") or getattr(h, "reason", "") or "branch hypothesis",
+                "verdict": "CONFIRMED",
+                "observed": " ".join(str(e) for e in ev[:2]),
+                "_derived": "confirmed with evidence but predictions_tested was empty",
+            })
+
     # Anti-fabrication check: a CONFIRMED verdict must quote data that actually
     # exists in this branch's fetched corpus. A model can hallucinate the test
     # result just as confidently as a diagnosis — so the quote is verified

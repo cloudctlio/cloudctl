@@ -7,6 +7,7 @@ git, and GitHub CLI.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -75,13 +76,17 @@ def validate_change(directory: str, tool: str = "terraform") -> str:
     if tool not in ("terraform", "cdk"):
         return json.dumps({"error": f"Unknown tool: {tool!r}. Supported: terraform, cdk"})
 
+    # Honor an env override for the binary so a specific version can be used
+    # without a PATH shim (CLOUDCTL_TERRAFORM_BIN / CLOUDCTL_CDK_BIN).
     if tool == "terraform":
+        tf = os.environ.get("CLOUDCTL_TERRAFORM_BIN", "terraform")
         steps = [
-            ["terraform", "init", "-backend=false", "-input=false", "-no-color"],
-            ["terraform", "validate", "-no-color"],
+            [tf, "init", "-backend=false", "-input=false", "-no-color"],
+            [tf, "validate", "-no-color"],
         ]
     else:
-        steps = [["npx", "cdk", "synth", "--quiet"]]
+        cdk = os.environ.get("CLOUDCTL_CDK_BIN", "npx")
+        steps = [[cdk, "cdk", "synth", "--quiet"] if cdk == "npx" else [cdk, "synth", "--quiet"]]
 
     for cmd in steps:
         try:

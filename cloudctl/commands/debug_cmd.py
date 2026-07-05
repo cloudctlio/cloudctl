@@ -259,6 +259,11 @@ def debug_issue(
              "diff+validation before push). Without this flag the agent stops "
              "at each gate for confirmation; non-interactive runs stop safely.",
     ),
+    base_branch: Optional[str] = typer.Option(
+        None, "--base-branch",
+        help="With --resolve: git branch to base the fix on (e.g. develop). "
+             "Skips the interactive prompt; defaults to 'develop' if omitted.",
+    ),
     json_out: Optional[str] = typer.Option(
         None, "--json-out",
         help="With --agent: also write the raw agent JSON (root_cause, evidence, "
@@ -359,13 +364,17 @@ def debug_issue(
                 if not root or not _os.path.isdir(root):
                     warn("--iac-root is required and must be a valid directory. Skipping resolution.")
                 else:
-                    base = "develop"
-                    try:
-                        base = console.input(
-                            "[dim]Base branch for fix PR [develop]: [/dim]"
-                        ).strip() or "develop"
-                    except (EOFError, KeyboardInterrupt):
-                        pass
+                    if base_branch:
+                        base = base_branch          # --base-branch flag wins, no prompt
+                    else:
+                        base = "develop"
+                        if _sys.stdin.isatty():
+                            try:
+                                base = console.input(
+                                    "[dim]Base branch for fix PR [develop]: [/dim]"
+                                ).strip() or "develop"
+                            except (EOFError, KeyboardInterrupt):
+                                pass
 
                     import sys as _sys  # noqa: PLC0415
 

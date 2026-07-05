@@ -88,24 +88,32 @@ def _tool_boto_config():
     )
 
 
+import boto3 as _boto3  # noqa: E402
+
+
+class _BoundedSession(_boto3.Session):
+    """boto3 Session whose every client carries bounded timeouts + capped
+    retries, so no tool-plane AWS read can hang the investigation. Defined once
+    at module scope (not per _make_session call); the default config is built
+    once and merged under any caller-supplied config (caller wins on overlap)."""
+    _DEFAULT_CFG = None
+
+    def client(self, *args, **kwargs):
+        if _BoundedSession._DEFAULT_CFG is None:
+            _BoundedSession._DEFAULT_CFG = _tool_boto_config()
+        cfg = kwargs.get("config")
+        base = _BoundedSession._DEFAULT_CFG
+        kwargs["config"] = base.merge(cfg) if cfg is not None else base
+        return super().client(*args, **kwargs)
+
+
 def _make_session(profile: str | None, region: str):
-    """Fresh boto3 Session each call — keeps SSO tokens current. Every client it
-    hands out carries bounded timeouts + capped retries (see _tool_boto_config)
-    so no tool-plane AWS read can hang the investigation."""
-    import boto3
+    """Fresh boto3 Session each call — keeps SSO tokens current. Returns a
+    _BoundedSession so every client it hands out is timeout-bounded."""
     if profile and not _VALID_PROFILE_RE.match(profile):
         raise ValueError("Invalid AWS profile name")
     if region and not _VALID_REGION_RE.match(region):
         raise ValueError(f"Invalid AWS region: {region}")
-
-    default_cfg = _tool_boto_config()
-
-    class _BoundedSession(boto3.Session):
-        def client(self, *args, **kwargs):
-            cfg = kwargs.get("config")
-            kwargs["config"] = default_cfg.merge(cfg) if cfg is not None else default_cfg
-            return super().client(*args, **kwargs)
-
     return _BoundedSession(profile_name=profile, region_name=region) if profile \
         else _BoundedSession(region_name=region)
 
@@ -324,7 +332,7 @@ def debug_incident(
         "severity":         result.severity,
         "timeline_summary": rich,
         "data_sources":     list(fetcher.availability.keys()),
-    }), indent=2)
+    }), separators=(",", ":"))
 
 
 @recordable("query_metrics")
@@ -401,7 +409,7 @@ def query_metrics(
                 "dimensions": dimensions, "minutes": minutes, "stat": stat,
                 "datapoints": 0,
                 "note": "No data in the requested window — metric or dimensions may be wrong, or the resource has no recent traffic.",
-            }, indent=2)
+            }, separators=(",", ":"))
 
         out = {
             "namespace":   namespace,
@@ -421,7 +429,7 @@ def query_metrics(
                 out["baseline"] = baseline
                 if isinstance(baseline.get("avg"), (int, float)):
                     out["avg_vs_baseline_delta"] = current["avg"] - baseline["avg"]
-        return json.dumps(out, indent=2)
+        return json.dumps(out, separators=(",", ":"))
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"query_metrics failed: {type(exc).__name__}"})
 
@@ -453,9 +461,9 @@ def get_service_config(
                                f"and it is not in the list of recognized optimized services. "
                                f"Use cloudctl_list_resources to see available names.",
                 "available":   [],
-            }, indent=2)
+            }, separators=(",", ":"))
         return json.dumps({"found": True, "service_type": service_type,
-                           "config": _serialise(cfg)}, indent=2)
+                           "config": _serialise(cfg)}, separators=(",", ":"))
 
     method_name, hint_key = _SERVICE_FETCHERS[service_type]
     method      = getattr(fetcher, method_name)
@@ -480,10 +488,10 @@ def get_service_config(
             "tip":         f"No {service_type} resource matched '{resource_hint}'. "
                            f"Use cloudctl_list_resources to see available names.",
             "available":   available,
-        }, indent=2)
+        }, separators=(",", ":"))
 
     return json.dumps({"found": True, "service_type": service_type,
-                       "config": _serialise(cfg)}, indent=2)
+                       "config": _serialise(cfg)}, separators=(",", ":"))
 
 
 def _list_ecs(s) -> list[str]:
@@ -729,7 +737,7 @@ def list_resources(
         "region":       region,
         "count":        len(names),
         "resources":    names,
-    }, indent=2)
+    }, separators=(",", ":"))
 
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -855,7 +863,7 @@ def tail_logs(
         # a template's count is a fact the line sample can miss.
         "log_templates":    _mine_log_templates(logs),
         "events":           _serialise(logs[:max_events]),
-    }, indent=2)
+    }, separators=(",", ":"))
 
 
 @recordable("get_event_timeline")
@@ -940,7 +948,7 @@ def get_event_timeline(
         "inflection_point": inflection,
         "sources_fetched":  list(fetcher.availability.keys()),
         "timeline":         tl_dicts[-50:],
-    }, indent=2)
+    }, separators=(",", ":"))
 
 
 @recordable("search_cloudtrail")
@@ -970,7 +978,7 @@ def search_cloudtrail(
         "minutes":       minutes,
         "event_count":   len(events),
         "events":        _serialise(events),
-    }, indent=2)
+    }, separators=(",", ":"))
 
 
 @recordable("get_deployment_info")
@@ -1130,7 +1138,7 @@ def get_deployment_info(
         "last_event_name":   last_event_name,
         "iac_file_hint":     iac_file_hint,
         "drift_warning":     drift_warning,
-    }, indent=2)
+    }, separators=(",", ":"))
 
 
 # ── Agent mode ────────────────────────────────────────────────────────────────
@@ -1205,7 +1213,7 @@ def probe_permission(
             "resource_policy_evaluated": bool(resource_policy),
             "results":   evaluated,
             "note":      note,
-        }, indent=2)
+        }, separators=(",", ":"))
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"[:400]})
 
@@ -1292,7 +1300,7 @@ def aws_read(
         "service":   service,
         "operation": op_snake,
         "data":      data,
-    }, indent=2, default=str)
+    }, separators=(",", ":"), default=str)
 
 
 @recordable("get_dependency_graph")
@@ -1367,7 +1375,7 @@ def get_dependency_graph(profile: str | None, region: str) -> str:
         "note": "edges derived by one generic rule: a resource whose live "
                 "configuration references another resource's ARN or name "
                 "depends on it",
-    }, indent=2)
+    }, separators=(",", ":"))
 
 
 _AGENT_TOOLS = [
