@@ -1600,6 +1600,35 @@ _AGENT_TOOLS = [
     },
     {
         "toolSpec": {
+            "name": "probe_http",
+            "description": (
+                "LAST-RESORT active reproduction: make ONE bounded, READ-ONLY "
+                "HTTP request to a service endpoint you discovered from config "
+                "and observe the ACTUAL response. Use ONLY when passive evidence "
+                "(metrics, logs, config) is insufficient to confirm or localize "
+                "the fault — when you cannot determine from telemetry alone what "
+                "the system is actually returning. It reveals what telemetry "
+                "cannot. Strictly read-only (GET/HEAD only, mutations blocked in "
+                "code), budget-limited, and disabled unless probing is enabled. "
+                "Pass the discovered endpoint url; optionally a method and any "
+                "auth headers you found in config."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "url":     {"type": "string",
+                                "description": "endpoint URL discovered from config"},
+                    "method":  {"type": "string",
+                                "description": "GET or HEAD (read-only only)"},
+                    "headers": {"type": "object",
+                                "description": "optional auth headers from config"},
+                },
+                "required": ["url"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
             "name": "get_dependency_graph",
             "description": (
                 "Build the REAL dependency graph of the deployed application: "

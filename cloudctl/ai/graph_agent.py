@@ -66,6 +66,7 @@ class IncidentReport(BaseModel):
     confidence: str
     resources_investigated: list[str]
     alternatives_considered: list[dict] | None = None
+    additional_causes: list[dict] | None = None   # independent confirmed faults
 
     @field_validator("severity")
     @classmethod
@@ -669,6 +670,7 @@ def _run_branch(
     bedrock = _make_bedrock(profile, region)
     branch_fetched: dict = {}
     tools_called: list[str] = []
+    _interned: dict = {}   # rung 4: sha1(output) -> reference id, within this branch
 
     def dispatch(tool_name: str, tool_input: dict) -> str:
         tools_called.append(tool_name)
@@ -743,6 +745,13 @@ def _run_branch(
                 params=tool_input.get("params") or {},
                 profile=profile, region=region,
             )
+        elif tool_name == "probe_http":
+            from cloudctl.mcp.tools.probe import probe_http
+            raw = probe_http(
+                url=tool_input["url"],
+                method=tool_input.get("method", "GET"),
+                headers=tool_input.get("headers") or {},
+            )
         else:
             return json.dumps({"error": f"unknown tool: {tool_name}"})
 
@@ -754,7 +763,21 @@ def _run_branch(
         except Exception:
             pass
 
-        return _truncate_tool_output(raw, tool_name)
+        out = _truncate_tool_output(raw, tool_name)
+        # Rung 4 — evidence interning: a byte-identical result already seen in
+        # THIS branch is replaced by a short reference, never re-sent. Lossless
+        # (the model already has the full block above) and never elides unseen
+        # content. Small results are left alone (a reference wouldn't save).
+        if len(out) > 400:
+            import hashlib
+            key = hashlib.sha1(out.encode("utf-8", "replace")).hexdigest()
+            ref = _interned.get(key)
+            if ref is not None:
+                return json.dumps({"_identical_to": ref,
+                                   "note": "identical to an earlier result this "
+                                           "investigation already returned in full"})
+            _interned[key] = f"{tool_name}:{resource_name or len(_interned)}"
+        return out
 
     def _loop(system_text: str, init_messages: list, max_turns: int) -> dict:
         msgs = list(init_messages)
@@ -1293,6 +1316,16 @@ Select the hypothesis with the strongest direct evidence from real AWS data.
 If multiple branches found real issues, list them all in evidence.
 Treat unconfirmed or low-confidence branches as ruled-out alternatives.
 
+MULTIPLE INDEPENDENT CAUSES: usually one root cause explains the whole symptom.
+But if TWO OR MORE branches each CONFIRM a distinct fault (each with its own
+CONFIRMED prediction) and neither explains the other — they are independent
+faults, not competing hypotheses — do NOT force-pick one. Report the primary
+root cause, and add an "additional_causes" list naming each other confirmed
+fault with its evidence, so a real cascade or coincident-failure incident is
+not silently reduced to a single cause. Only genuinely CONFIRMED, non-
+overlapping faults qualify; a weakly-supported second branch stays a ruled-out
+alternative.
+
 REQUIRED: You MUST populate alternatives_considered with every hypothesis that was
 investigated but ruled out. Each entry MUST have both a "hypothesis" and "reason" field
 explaining why it was not the primary cause. At least 2 alternatives are required for
@@ -1399,10 +1432,28 @@ def synthesize_node(state: GraphState) -> dict:
     )
     # Strip all_fetched + tools_called before synthesis — they can be 20-30K tokens
     # of raw tool responses that synthesize never uses. Only evidence + conclusion matter.
+    # Rung 2 — reference-not-regenerate: parallel branches frequently cite the
+    # SAME evidence string. Assign each unique item an id (E1, E2, ...) once and
+    # replace repeats across branches with that id, so synthesize reads each
+    # distinct fact a single time instead of N times. Lossless — the full text
+    # lives in the catalog below. (compact separators = rung 1.)
+    _ev_ids: dict = {}
+
+    def _ref(ev_list):
+        out = []
+        for e in ev_list or []:
+            s = str(e)
+            if s not in _ev_ids:
+                _ev_ids[s] = f"E{len(_ev_ids) + 1}"
+                out.append({"id": _ev_ids[s], "text": s})
+            else:
+                out.append(_ev_ids[s])   # already stated — reference only
+        return out
+
     branches_slim = [
         {
             "hypothesis": br.get("hypothesis", {}),
-            "evidence":   br.get("evidence", []),
+            "evidence":   _ref(br.get("evidence", [])),
             "predictions_tested": br.get("predictions_tested", []),
             "conclusion": br.get("conclusion", ""),
             "confidence": br.get("confidence", "LOW"),
@@ -1410,13 +1461,15 @@ def synthesize_node(state: GraphState) -> dict:
         }
         for br in all_branch_results
     ]
-    branches_text = json.dumps(branches_slim, indent=2)
+    branches_text = json.dumps(branches_slim, separators=(",", ":"))
     obs = state.get("observation") or {}
     user_content = (
         f"Symptom: {state['symptom']}\n\n"
         f"Measured observation (real data, gathered before investigation):\n"
         f"{json.dumps(obs, indent=2) if obs else '(measurement unavailable)'}\n\n"
-        f"Branch investigation results:\n{branches_text}"
+        f"Branch investigation results (evidence items appear as {{id,text}} on "
+        f"first mention and as the bare id \"E#\" when another branch cites the "
+        f"same fact — both refer to the identical evidence):\n{branches_text}"
         f"{arbitration_note}"
     )
 
@@ -1575,13 +1628,22 @@ Challenge the conclusion with these questions:
    resources, services, and data the investigation looked at). Every resource,
    component, system, or mechanism the root cause hinges on must correspond to
    something in that inventory. If the conclusion invokes a component or causal
-   mechanism that appears NOWHERE in the fetched inventory — a "monitoring tool",
-   a "health evaluator", a process or system nobody actually observed — it is
-   FABRICATED, no matter how plausible it sounds. Real negative facts ("no such
-   stack", "parameter absent") assembled into an invented mechanism are still a
-   fabrication. Reject a fabricated mechanism with verdict "needs_reinvestigation"
+   mechanism that appears NOWHERE in the fetched inventory — a process, system,
+   or component nobody actually observed — it is FABRICATED, no matter how
+   plausible it sounds. Real negative facts (something absent, something not
+   found) assembled into an invented mechanism are still a fabrication. Reject a
+   fabricated mechanism with verdict "needs_reinvestigation"
    (investigate what the symptom's real dependencies actually show) — never let an
    invented mechanism ship.
+
+8. RECONCILIATION TEST — when a directly OBSERVED signal and a DERIVED/predicted
+   signal about the same thing disagree, the diagnosis must EXPLAIN the
+   discrepancy rather than silently side with one. A directly observed signal is
+   strong evidence of what actually happened; a derived result that contradicts
+   it is a LEAD to investigate further, not a reason to dismiss the observation
+   (and the observation itself must be checked for recency and relevance). If the
+   conclusion trusted one signal over a conflicting one without reconciling them,
+   issue "needs_reinvestigation" naming the specific conflict to resolve.
 
 If the conclusion passes all tests: respond with this JSON exactly:
 {"verdict": "confirmed", "notes": "one sentence why it holds up"}
@@ -1867,6 +1929,8 @@ def debug_incident_graph(
     }
     from cloudctl.mcp.tools.recorder import reset_usage_stats, usage_report
     reset_usage_stats()
+    from cloudctl.mcp.tools.probe import reset_probe_budget
+    reset_probe_budget()
 
     graph = _get_graph()
 
