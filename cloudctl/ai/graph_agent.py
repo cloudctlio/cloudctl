@@ -102,6 +102,13 @@ class GraphState(TypedDict):
 
 _MODEL = "us.anthropic.claude-sonnet-4-6"
 
+# Decorrelated critic: the review pass can run on a DIFFERENT model than the
+# investigator so it doesn't share the same blind spots. Defaults to the same
+# model (safe out of the box); set CLOUDCTL_CRITIC_MODEL to a different model
+# id (e.g. an Opus/Haiku inference profile) to actually decorrelate.
+import os as _os_critic
+_CRITIC_MODEL = _os_critic.environ.get("CLOUDCTL_CRITIC_MODEL", _MODEL)
+
 # Prompt caching. A cachePoint marks a prefix boundary Bedrock may reuse across
 # calls; it does NOT change the tokens the model sees, so at temperature 0 the
 # generated output is byte-identical with or without it. We cache only content
@@ -1564,6 +1571,18 @@ Challenge the conclusion with these questions:
    is sound but padded with untested side-claims, issue verdict "revised" with the
    SAME root cause minus every untested claim.
 
+7. FABRICATION TEST (you are armed with the FETCHED INVENTORY below — the actual
+   resources, services, and data the investigation looked at). Every resource,
+   component, system, or mechanism the root cause hinges on must correspond to
+   something in that inventory. If the conclusion invokes a component or causal
+   mechanism that appears NOWHERE in the fetched inventory — a "monitoring tool",
+   a "health evaluator", a process or system nobody actually observed — it is
+   FABRICATED, no matter how plausible it sounds. Real negative facts ("no such
+   stack", "parameter absent") assembled into an invented mechanism are still a
+   fabrication. Reject a fabricated mechanism with verdict "needs_reinvestigation"
+   (investigate what the symptom's real dependencies actually show) — never let an
+   invented mechanism ship.
+
 If the conclusion passes all tests: respond with this JSON exactly:
 {"verdict": "confirmed", "notes": "one sentence why it holds up"}
 
@@ -1594,13 +1613,24 @@ def critique_node(state: GraphState) -> dict:
         for br in state["branch_results"]
     ], indent=2)
 
+    # Arm the critic with the inventory of what was ACTUALLY fetched, so it can
+    # ground the diagnosis's claims against real evidence and catch fabricated
+    # mechanisms (the FABRICATION TEST). Keys of all_fetched are the tool calls /
+    # resources the investigation touched — a compact, cache-friendly index.
+    fetched = state.get("all_fetched") or {}
+    inventory = sorted({str(k)[:160] for k in fetched.keys()})
+    inventory_text = "\n".join(f"  - {k}" for k in inventory) or "  (nothing fetched)"
+
     user_content = (
         f"Symptom: {state['symptom']}\n\n"
         f"Chosen conclusion:\n{json.dumps(report, indent=2)}\n\n"
-        f"What each branch found:\n{branches_summary}"
+        f"What each branch found:\n{branches_summary}\n\n"
+        f"FETCHED INVENTORY (every resource/data the investigation actually "
+        f"looked at — anything the conclusion names that is NOT here is "
+        f"fabricated):\n{inventory_text}"
     )
     resp = bedrock.converse(
-        modelId=_MODEL,
+        modelId=_CRITIC_MODEL,
         system=_sys(_CRITIQUE_SYSTEM),
         messages=[{"role": "user", "content": [{"text": user_content}]}],
         inferenceConfig={"maxTokens": 600, "temperature": 0},
