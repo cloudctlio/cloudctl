@@ -122,6 +122,14 @@ def _serialise(obj) -> object:
     import datetime
     if isinstance(obj, datetime.datetime):
         return obj.isoformat()
+    if isinstance(obj, bytes):
+        # botocore returns some fields (e.g. WAF search_string) as raw bytes.
+        # json.dumps can't serialise bytes and would crash the whole tool call,
+        # so decode to text, or a safe placeholder for non-text blobs.
+        try:
+            return obj.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"<{len(obj)} bytes, not UTF-8>"
     if isinstance(obj, dict):
         return {k: _serialise(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -1319,37 +1327,95 @@ def get_dependency_graph(profile: str | None, region: str) -> str:
     tomorrow is covered the day it appears in an ARN.
     """
     session = _make_session(profile, region)
+    from concurrent.futures import ThreadPoolExecutor
 
-    # 1. Enumerate everything, generically. Node labels use the raw ARN
-    #    namespace — AWS's own vocabulary, which the model already knows.
+    # 1. Enumerate resources from GENERIC account indexers — no curated service
+    #    list, so a service AWS ships tomorrow is covered the day it appears:
+    #      (a) AWS Resource Explorer — indexes EVERY resource type, including the
+    #          non-taggable ones the Tagging API misses (route tables, ENIs, IAM,
+    #          security groups). Requires Resource Explorer enabled with a default
+    #          view; if not, it is skipped (not an error) and we fall back to (b).
+    #      (b) Resource Groups Tagging API — every taggable resource in the region.
+    #    Both are service-agnostic; neither is required alone.
     resources: list[dict] = []
+    seen: set = set()
+
+    def _parse_arn(arn: str):
+        parts = arn.split(":", 5)
+        if len(parts) < 6:
+            return None
+        ns, rest = parts[2], parts[5]
+        name = rest.split("/")[-1] if "/" in rest else rest.split(":")[-1]
+        return ns, name
+
+    def _add(arn: str, ns: str, name: str) -> None:
+        key = (ns, name)
+        if key in seen:
+            if arn:   # enrich an ARN-less earlier entry
+                for ex in resources:
+                    if (ex["service"], ex["name"]) == key and not ex["arn"]:
+                        ex["arn"] = arn
+                        break
+            return
+        seen.add(key)
+        resources.append({"arn": arn, "service": ns, "name": name})
+
+    try:
+        rex = session.client("resource-explorer-2")
+        token = None
+        for _ in range(10):   # bounded pagination
+            kw = {"QueryString": "*", "MaxResults": 100}
+            if token:
+                kw["NextToken"] = token
+            resp = rex.search(**kw)
+            for r in resp.get("Resources", []):
+                pa = _parse_arn(r.get("Arn", ""))
+                if pa:
+                    _add(r["Arn"], *pa)
+            token = resp.get("NextToken")
+            if not token:
+                break
+    except Exception:  # noqa: BLE001
+        pass   # Resource Explorer not enabled — fall back to tagging
+
     try:
         tagging = session.client("resourcegroupstaggingapi")
         paginator = tagging.get_paginator("get_resources")
         for page in paginator.paginate(PaginationConfig={"MaxItems": 300}):
             for r in page.get("ResourceTagMappingList", []):
-                arn = r.get("ResourceARN", "")
-                parts = arn.split(":", 5)
-                if len(parts) < 6:
-                    continue
-                ns, rest = parts[2], parts[5]
-                name = rest.split("/")[-1] if "/" in rest else rest.split(":")[-1]
-                resources.append({"arn": arn, "service": ns, "name": name})
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"resource enumeration failed: "
-                                    f"{type(exc).__name__}: {exc}"[:300]})
+                pa = _parse_arn(r.get("ResourceARN", ""))
+                if pa:
+                    _add(r["ResourceARN"], *pa)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not resources:
+        return json.dumps({"error": "resource enumeration returned nothing — "
+                                    "neither Resource Explorer nor the Tagging API "
+                                    "returned resources in this region"})
 
     nodes = {f"{r['service']}:{r['name']}" for r in resources}
     edges: list[dict] = []
 
     # 2. One uniform edge rule: whose config mentions whom.
+    # Fetch every resource's config IN PARALLEL — the per-resource generic_
+    # resource_config call is a 1-3s network round-trip, and doing up to 60 of
+    # them sequentially added a 1-3 min bottleneck before triage. The edge match
+    # below is fast CPU work and stays sequential.
+    from concurrent.futures import ThreadPoolExecutor
     from cloudctl.debug.fetcher import DebugFetcher
     fetcher = DebugFetcher(session)
-    for res in resources[:60]:
+
+    def _fetch_cfg(res):
         try:
-            cfg = fetcher.generic_resource_config(res["service"], res["name"])
+            return res, fetcher.generic_resource_config(res["service"], res["name"])
         except Exception:  # noqa: BLE001
-            continue
+            return res, None
+
+    with ThreadPoolExecutor(max_workers=10) as _ex:
+        fetched_cfgs = list(_ex.map(_fetch_cfg, resources[:60]))
+
+    for res, cfg in fetched_cfgs:
         if not cfg:
             continue
         blob = json.dumps(cfg, default=str)
@@ -1602,16 +1668,20 @@ _AGENT_TOOLS = [
         "toolSpec": {
             "name": "probe_http",
             "description": (
-                "LAST-RESORT active reproduction: make ONE bounded, READ-ONLY "
-                "HTTP request to a service endpoint you discovered from config "
-                "and observe the ACTUAL response. Use ONLY when passive evidence "
-                "(metrics, logs, config) is insufficient to confirm or localize "
-                "the fault — when you cannot determine from telemetry alone what "
-                "the system is actually returning. It reveals what telemetry "
-                "cannot. Strictly read-only (GET/HEAD only, mutations blocked in "
-                "code), budget-limited, and disabled unless probing is enabled. "
-                "Pass the discovered endpoint url; optionally a method and any "
-                "auth headers you found in config."
+                "Active reproduction: make ONE bounded, READ-ONLY HTTP request "
+                "to a service endpoint you discovered from config and observe the "
+                "ACTUAL response. Reach for this whenever passive evidence cannot "
+                "settle the question — in particular, when every reading "
+                "(metrics, logs, config) looks clean yet the symptom persists, the "
+                "fault may live only in the response itself (a success status "
+                "carrying wrong data, one broken path); telemetry cannot show that "
+                "and reading more of it will not help — you must exercise the "
+                "system once and look. Strictly read-only (GET/HEAD only, "
+                "mutations blocked in code), budget-limited. "
+                "NOTE: each probe is shown to a human operator for approval before "
+                "it runs, so state a clear, specific reason; the operator may run "
+                "it for you and paste back the response, or decline. If declined, "
+                "do not claim the response was verified."
             ),
             "inputSchema": {"json": {
                 "type": "object",
@@ -1622,8 +1692,12 @@ _AGENT_TOOLS = [
                                 "description": "GET or HEAD (read-only only)"},
                     "headers": {"type": "object",
                                 "description": "optional auth headers from config"},
+                    "reason":  {"type": "string",
+                                "description": "one line: what you expect to learn "
+                                "and why passive evidence can't settle it (shown "
+                                "to the operator who approves the probe)"},
                 },
-                "required": ["url"],
+                "required": ["url", "reason"],
             }},
         }
     },
@@ -1739,7 +1813,7 @@ def debug_incident_agent(
     from cloudctl.ai.guardrails import (
         validate_query, sanitise_fetched_data, redact_output,
         validate_tool_call, enforce_confidence, check_rate_limit,
-        detect_hallucinations, verify_cited_values,
+        detect_hallucinations, verify_cited_values, verify_tool_coverage,
         audit_log_agent_call, audit_log_tool_call, new_session_id,
     )
     from cloudctl.ai.live_learner import get_investigation_hints
@@ -1766,7 +1840,14 @@ def debug_incident_agent(
     bedrock = session.client(
         "bedrock-runtime",
         region_name=region,
-        config=_BotoConfig(retries={"mode": "adaptive", "max_attempts": 10}),
+        # Bounded timeouts are a hard requirement for an unattended tool: without
+        # them a network hang on converse() can freeze for over an hour with no
+        # catchable exception (the vector_bucket_access_denied 118-min hang).
+        config=_BotoConfig(
+            retries={"mode": "adaptive", "max_attempts": 10},
+            connect_timeout=10,
+            read_timeout=120,
+        ),
     )
 
     # Audit: open session (SOC2 CC6 — log query by hash only, never raw)
@@ -1781,8 +1862,10 @@ def debug_incident_agent(
     # Cap at 2 MB to prevent unbounded memory growth across 12 turns.
     all_fetched: dict = {}
     _ALL_FETCHED_MAX_BYTES = 2 * 1024 * 1024
+    tools_called: set[str] = set()
 
     def _dispatch(tool_name: str, tool_input: dict) -> str:
+        tools_called.add(tool_name)
         # Guardrail 4 — scope enforcement on every tool call
         if tool_name == "query_metrics":
             _ns  = tool_input.get("namespace", "")
@@ -1866,6 +1949,8 @@ def debug_incident_agent(
 
     messages: list[dict] = [{"role": "user", "content": [{"text": user_content}]}]
     turns_used = 0
+    invalid_json_retries = 0   # retry once if the model returns non-JSON
+    coverage_retries = 0       # retry once if mandatory tools were never called
 
     for _ in range(max_turns):
         turns_used += 1
@@ -1895,75 +1980,97 @@ def debug_incident_agent(
         messages.append(msg)
 
         if stop_reason == "end_turn":
-            for block in msg.get("content", []):
-                if "text" in block:
-                    text = block["text"].strip()
+            text = next(
+                (b["text"] for b in msg.get("content", []) if "text" in b), ""
+            ).strip()
+            # Extract JSON from response — try three forms in order:
+            # 1. Fenced code block: ```json { ... } ```
+            # 2. Bare JSON object anywhere in the text: { ... }
+            # 3. The whole text as-is (direct JSON response)
+            candidate = text
+            m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+            if m:
+                candidate = m.group(1)
+            else:
+                m2 = _re.search(r'\{.*"root_cause".*\}', text, _re.DOTALL)
+                if m2:
+                    candidate = m2.group(0)
 
-                    # Extract JSON from response — try three forms in order:
-                    # 1. Fenced code block: ```json { ... } ```
-                    # 2. Bare JSON object anywhere in the text: { ... }
-                    # 3. The whole text as-is (direct JSON response)
-                    candidate = text
-                    m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
-                    if m:
-                        candidate = m.group(1)
-                    else:
-                        m2 = _re.search(r'\{.*"root_cause".*\}', text, _re.DOTALL)
-                        if m2:
-                            candidate = m2.group(0)
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                # Don't accept chatty prose as a diagnosis — retry once asking
+                # for valid JSON, then fall back.
+                if invalid_json_retries < 1:
+                    invalid_json_retries += 1
+                    messages.append({"role": "user", "content": [{"text": (
+                        "Your response was not valid JSON. Respond again with "
+                        "ONLY the final JSON object: root_cause, evidence, "
+                        "remediation_steps, severity, confidence, "
+                        "resources_investigated."
+                    )}]})
+                    continue
+                parsed = {
+                    "root_cause":            text,
+                    "evidence":              [],
+                    "remediation_steps":     [],
+                    "severity":              "UNKNOWN",
+                    "confidence":            "LOW",
+                    "resources_investigated": [],
+                }
 
-                    try:
-                        parsed = json.loads(candidate)
-                    except Exception:
-                        parsed = {
-                            "root_cause":            text,
-                            "evidence":              [],
-                            "remediation_steps":     [],
-                            "severity":              "UNKNOWN",
-                            "confidence":            "LOW",
-                            "resources_investigated": [],
-                        }
+            # Guardrail 8 — mandatory tool coverage: a conclusion drawn without
+            # the tools the symptom class requires is untrustworthy. Retry once,
+            # forcing the missing tools, before accepting.
+            cov = verify_tool_coverage(symptom, tools_called)
+            if not cov.satisfied and coverage_retries < 1:
+                coverage_retries += 1
+                missing = ", ".join(cov.missing_tools)
+                them = "them" if len(cov.missing_tools) > 1 else "it"
+                messages.append({"role": "user", "content": [{"text": (
+                    f"You concluded without calling {missing}. Call {them} now "
+                    f"before finalizing, then output your final JSON."
+                )}]})
+                continue
 
-                    # Guardrail 5 — confidence enforcement
-                    hal_report = detect_hallucinations(parsed, all_fetched)
-                    parsed     = enforce_confidence(parsed, all_fetched, hal_report)
+            # Guardrail 5 — confidence enforcement
+            hal_report = detect_hallucinations(parsed, all_fetched)
+            parsed     = enforce_confidence(parsed, all_fetched, hal_report)
 
-                    # Verification turn: every numeric/quoted claim must trace
-                    # to fetched data. Unverified items are surfaced separately
-                    # and force confidence to LOW — wrong facts are worse than
-                    # admitted uncertainty.
-                    verified, unverified = verify_cited_values(parsed, all_fetched)
-                    if unverified:
-                        parsed["unverified_claims"] = unverified
-                        parsed["evidence"]          = verified
-                        parsed["confidence"]        = "LOW"
-                        parsed["confidence_override_reason"] = (
-                            f"{len(unverified)} evidence item(s) cited values "
-                            "not present in fetched data"
-                        )
+            # Verification turn: every numeric/quoted claim must trace to fetched
+            # data. Unverified items are surfaced separately and force confidence
+            # to LOW — wrong facts are worse than admitted uncertainty.
+            verified, unverified = verify_cited_values(parsed, all_fetched)
+            if unverified:
+                parsed["unverified_claims"] = unverified
+                parsed["evidence"]          = verified
+                parsed["confidence"]        = "LOW"
+                parsed["confidence_override_reason"] = (
+                    f"{len(unverified)} evidence item(s) cited values "
+                    "not present in fetched data"
+                )
 
-                    # Guardrail 3 — output redaction
-                    parsed = redact_output(parsed)
+            # Guardrail 3 — output redaction
+            parsed = redact_output(parsed)
 
-                    # Attach guardrail metadata for harness scoring
-                    parsed["_guardrails"] = {
-                        "hallucination_rate":    hal_report.hallucination_rate,
-                        "hallucination_verdict": hal_report.verdict,
-                        "unsupported_claims":    hal_report.unsupported[:3],
-                        "unverified_count":      len(unverified),
-                        "confidence_overridden": "confidence_override_reason" in parsed,
-                        "turns_used":            turns_used,
-                        "account_id":            account_id,
-                    }
+            # Attach guardrail metadata for harness scoring
+            parsed["_guardrails"] = {
+                "hallucination_rate":    hal_report.hallucination_rate,
+                "hallucination_verdict": hal_report.verdict,
+                "unsupported_claims":    hal_report.unsupported[:3],
+                "unverified_count":      len(unverified),
+                "confidence_overridden": "confidence_override_reason" in parsed,
+                "turns_used":            turns_used,
+                "account_id":            account_id,
+            }
 
-                    audit_log_agent_call(
-                        session_id=session_id, event="end",
-                        account_id=account_id, region=region,
-                        query_hash=query_hash, turns_used=turns_used,
-                        confidence=parsed.get("confidence", ""),
-                    )
-                    return json.dumps(parsed, indent=2), all_fetched
-            break
+            audit_log_agent_call(
+                session_id=session_id, event="end",
+                account_id=account_id, region=region,
+                query_hash=query_hash, turns_used=turns_used,
+                confidence=parsed.get("confidence", ""),
+            )
+            return json.dumps(parsed, indent=2), all_fetched
 
         if stop_reason == "tool_use":
             tool_results = []

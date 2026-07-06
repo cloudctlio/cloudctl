@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict
 
 from botocore.config import Config as _BotoConfig
+
+log = logging.getLogger("cloudctl.graph_agent")
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, field_validator
 
@@ -101,14 +105,23 @@ class GraphState(TypedDict):
 
 # ── Shared Bedrock client factory ──────────────────────────────────────────────
 
-_MODEL = "us.anthropic.claude-sonnet-4-6"
+# Model ids are configurable so a --model flag / config / env can override them
+# without editing code; each falls back to a sane default.
+_MODEL = os.environ.get("CLOUDCTL_MODEL", "us.anthropic.claude-sonnet-4-6")
+
+# Lightweight model for the PRISM log-intelligence pass (cheap, high-volume).
+# NOTE: the Bedrock inference-profile id REQUIRES the "-v1:0" suffix; without it
+# converse() returns ValidationException("provided model identifier is invalid")
+# and PRISM silently dies (verified against this account 2026-07-05).
+_LOG_INTEL_MODEL = os.environ.get(
+    "CLOUDCTL_LOG_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
 
 # Decorrelated critic: the review pass can run on a DIFFERENT model than the
 # investigator so it doesn't share the same blind spots. Defaults to the same
 # model (safe out of the box); set CLOUDCTL_CRITIC_MODEL to a different model
 # id (e.g. an Opus/Haiku inference profile) to actually decorrelate.
-import os as _os_critic
-_CRITIC_MODEL = _os_critic.environ.get("CLOUDCTL_CRITIC_MODEL", _MODEL)
+_CRITIC_MODEL = os.environ.get("CLOUDCTL_CRITIC_MODEL", _MODEL)
 
 # Prompt caching. A cachePoint marks a prefix boundary Bedrock may reuse across
 # calls; it does NOT change the tokens the model sees, so at temperature 0 the
@@ -116,6 +129,19 @@ _CRITIC_MODEL = _os_critic.environ.get("CLOUDCTL_CRITIC_MODEL", _MODEL)
 # that repeats verbatim across many calls: the tool schema (sent on every
 # tool-use turn, identical everywhere) and static system prompts.
 _CACHE_POINT = {"cachePoint": {"type": "default"}}
+
+
+def _round_robin_merge(groups: list[list[str]]) -> list[str]:
+    """Interleave lists one item at a time so a downstream truncation window is
+    shared fairly across all groups, instead of the first group consuming it."""
+    out: list[str] = []
+    if not groups:
+        return out
+    for i in range(max(len(g) for g in groups)):
+        for g in groups:
+            if i < len(g):
+                out.append(g[i])
+    return out
 
 
 def _sys(text: str) -> list[dict]:
@@ -148,18 +174,12 @@ def _conv(msgs: list[dict]) -> list[dict]:
 
 
 def _make_bedrock(profile: str | None, region: str):
-    from cloudctl.mcp.tools.debug import _make_session
     from cloudctl.mcp.tools.recorder import RecordingBedrock
-    session = _make_session(profile, region)
-    client = session.client(
-        "bedrock-runtime",
-        region_name=region,
-        config=_BotoConfig(
-            retries={"mode": "adaptive", "max_attempts": 10},
-            connect_timeout=10,
-            read_timeout=120,
-        ),
-    )
+    from cloudctl.ai.model_providers import make_model_client
+    # Model-agnostic: bedrock (default) | anthropic | openai, via
+    # CLOUDCTL_MODEL_PROVIDER. Each returns a client with converse(**kwargs) in
+    # the Converse shape, so the graph and recorder are unchanged.
+    client = make_model_client(profile, region)
     # Dual-plane recording/replay: records model requests+responses alongside
     # tool I/O; serves them back in exact/pinned replay modes. Live behavior
     # is unchanged when the recorder env vars are unset.
@@ -570,6 +590,17 @@ if you looked in the right place and the predicted observation is absent, and
 UNTESTED only if no available tool could check it. You may not set
 confirmed=true unless at least one prediction is CONFIRMED and none is REFUTED.
 
+DISCOVERED-CAUSE rule — if your investigation surfaces a likely cause that was
+NOT among the predictions above (you found the fault by following the evidence),
+do NOT merely file it as evidence and stop. That is the most common reason a
+correct branch fails to confirm: it gathers conclusive evidence but never frames
+a testable claim, so it cannot be CONFIRMED. Instead: turn the discovery into a
+NEW falsifiable prediction ("if THIS is the cause, then <specific discriminating
+observation> must hold, and it would NOT hold under the alternative causes"),
+TEST it with a tool call, and add it to predictions_tested with its verdict.
+Only then may you set confirmed=true. A cause you found but never framed and
+tested is asserted, not verified — verify it.
+
 Phase 2 rules — operational investigation:
   Use tail_logs, query_metrics, search_cloudtrail, and get_service_config on the
   resource's dependencies — its permissions layer, encryption layer, network
@@ -592,6 +623,33 @@ NETWORK rule — check ALL layers when diagnosing connectivity:
   1. Source SG egress  2. Target SG ingress  3. NACLs (stateless, both directions)
   4. Route table  5. VPC endpoint policy  6. DNS resolution
 Call get_service_config with service_type="vpc" to see all at once.
+
+PARTIAL-FAILURE rule — if the impact is NON-uniform (affects only part of the
+traffic, or some instances/paths and not their peers), the cause lives in
+something ONLY the affected part uses; a systemic cause would affect everything.
+  1. Read the DISTRIBUTION, not the aggregate: query_metrics percentiles and
+     PER-TARGET / per-instance dimensions to see which instance/path carries the
+     anomaly, rather than an average that hides it.
+  2. If telemetry cannot localize it, REPRODUCE: fire several probe_http requests
+     and correlate the anomalous responses to the specific serving component
+     (via response headers, hostname, or trace ids), pinning the fault to one
+     component instead of treating it as systemic.
+  3. Then inspect that component's OWN configuration for what differs from peers.
+
+CLEAN-TELEMETRY rule — if every reading you can take (metrics, logs, config,
+events) looks healthy yet the symptom stands, do NOT conclude "no fault found" or
+reach for the nearest incidental config weakness. A fault can live ENTIRELY in
+what the system returns to a request — a success status carrying wrong output, a
+single broken path — which no metric, log, or config will ever show. When passive
+evidence is exhausted and unresolved: REPRODUCE (probe_http) to observe the actual
+response, or, if reproduction is unavailable, state explicitly that the fault may
+be runtime-only and is therefore unverified — never substitute a confident passive
+guess for an observation you did not make.
+
+DEPLOYMENT-AT-ONSET rule — if a deployment or rollout coincides with onset, that
+is a LEAD to examine WHAT it changed (diff the new configuration against its
+peers or prior intent), NOT a licence to attribute the incident to "deployment
+churn". The churn is a symptom of the change; find the change.
 
 Maximum 8 tool calls. Conclude with ONLY this JSON:
 {{
@@ -746,11 +804,12 @@ def _run_branch(
                 profile=profile, region=region,
             )
         elif tool_name == "probe_http":
-            from cloudctl.mcp.tools.probe import probe_http
-            raw = probe_http(
+            from cloudctl.mcp.tools.probe import probe_http_gated
+            raw = probe_http_gated(
                 url=tool_input["url"],
                 method=tool_input.get("method", "GET"),
                 headers=tool_input.get("headers") or {},
+                reason=tool_input.get("reason", ""),
             )
         else:
             return json.dumps({"error": f"unknown tool: {tool_name}"})
@@ -935,14 +994,10 @@ def _run_branch(
     for p in preds:
         if p.get("verdict") != "CONFIRMED":
             continue
-        tokens = re.findall(r"[a-z0-9][a-z0-9_.\-:/]{4,}", str(p.get("observed", "")).lower())
-        matched = sum(1 for t in tokens if t in corpus)
-        if not tokens or matched * 2 < len(tokens):
+        ok, reason = _observed_is_traceable(p.get("observed", ""), corpus)
+        if not ok:
             p["verdict"] = "UNTESTED"
-            p["_downgraded"] = (
-                "observed text not traceable to fetched data "
-                f"({matched}/{len(tokens)} tokens found)"
-            )
+            p["_downgraded"] = reason
     n_confirmed = sum(1 for p in preds if p.get("verdict") == "CONFIRMED")
     n_refuted   = sum(1 for p in preds if p.get("verdict") == "REFUTED")
     confirmed   = bool(p2.get("confirmed", False))
@@ -975,7 +1030,18 @@ def investigate_node(state: GraphState) -> dict:
             for h in state["hypotheses"]
         }
         for f in as_completed(futures):
-            result = f.result()
+            try:
+                result = f.result()
+            except Exception as exc:  # noqa: BLE001
+                # Isolate one branch's failure (mid-flight IAM expiry, a Bedrock
+                # exception, a bug in post-loop scoring) so the OTHER branches'
+                # work is not discarded. Catch Exception only: BudgetExceededError
+                # is a BaseException and still propagates — that abort is
+                # deliberate (spend ceiling), and must stop the whole run.
+                h = futures[f]
+                log.error("investigation branch %r failed, continuing with the "
+                          "others: %s", getattr(h, "service", h), exc)
+                continue
             branch_results.append(result.model_dump())
             all_fetched_merged.update(result.all_fetched)
 
@@ -1050,7 +1116,7 @@ def log_intelligence_node(state: GraphState) -> dict:
 
     def _survey() -> dict:
         from cloudctl.mcp.tools.debug import _mine_log_templates
-        events_out: list[str] = []
+        per_group: list[list[str]] = []
         raw_events: list[dict] = []
         grps: list[str] = []
         err = ""
@@ -1066,13 +1132,19 @@ def log_intelligence_node(state: GraphState) -> dict:
                 for evt in events:
                     evt["_group"] = short
                 raw_events.extend(events)
+                lines_here: list[str] = []
                 for evt in events[:20]:
                     msg = evt.get("event", "").strip()
                     if msg:
                         ts = evt.get("time", "")
-                        events_out.append(f"[{ts}] [{short}] {msg[:300]}")
+                        lines_here.append(f"[{ts}] [{short}] {msg[:300]}")
+                if lines_here:
+                    per_group.append(lines_here)
         except Exception as exc:  # noqa: BLE001
             err = f"{type(exc).__name__}: {exc}"[:300]
+        # Round-robin across groups so one noisy group can't starve the 80-line
+        # window that feeds the model — every active service gets represented.
+        events_out = _round_robin_merge(per_group)
         # Frequency view over everything fetched — the per-group line sample
         # can miss a flood entirely; template counts cannot.
         templates = [
@@ -1101,9 +1173,9 @@ def log_intelligence_node(state: GraphState) -> dict:
     template_text = "\n".join(survey.get("templates", [])[:12])
     bedrock = _make_bedrock(state["profile"], state["region"])
 
-    try:
-        resp = bedrock.converse(
-            modelId="us.anthropic.claude-haiku-4-5-20251001",
+    def _converse_logintel():
+        return bedrock.converse(
+            modelId=_LOG_INTEL_MODEL,
             system=_sys(_LOG_INTEL_SYSTEM),
             messages=[{"role": "user", "content": [{"text": (
                 f"INCIDENT SYMPTOM: {state['symptom']}\n\n"
@@ -1113,6 +1185,21 @@ def log_intelligence_node(state: GraphState) -> dict:
             )}]}],
             inferenceConfig={"maxTokens": 800, "temperature": 0},
         )
+
+    try:
+        try:
+            resp = _converse_logintel()
+        except Exception as exc:  # noqa: BLE001
+            # _make_bedrock already sets adaptive retries (max_attempts=10), so
+            # most throttling is absorbed; this explicit last-resort retry means
+            # a burst throttle can't silently drop the PRISM log signal and leave
+            # the discriminate node blind.
+            if "throttl" in (type(exc).__name__ + str(exc)).lower():
+                import time as _t
+                _t.sleep(2)
+                resp = _converse_logintel()
+            else:
+                raise
         text = resp["output"]["message"]["content"][0]["text"].strip()
         insights = _extract_json(text, "behavioral_consistency") or {}
         if not isinstance(insights, dict):
@@ -1173,20 +1260,13 @@ Rule 0 — Temporal filtering (apply before all other rules):
   + ~5 minutes) is valid incident evidence. Discard earlier events as
   deployment artifacts before applying rules 1-3.
 
-Rule 1 — Behavioral consistency test (highest weight):
-  If behavioral_consistency = "uniform": every service replica shows the SAME
-  anomaly. Identical replicas with identical infra cannot behave differently
-  due to infra — they share the same network rules, the same permissions, the
-  same runtime definition.
-  Therefore: uniform anomaly → cause is APPLICATION CODE, not infrastructure.
-
-  If behavioral_consistency = "partial": only some replicas are affected.
-  Infrastructure failures (capacity, network, permissions, encryption) can affect a subset.
-  Therefore: partial anomaly → cause may be INFRASTRUCTURE.
-
-  If behavioral_consistency = "single_request": one request generates vastly
-  more log lines than others. Infrastructure failures do not cause this.
-  Therefore: single_request → APPLICATION CODE (loop, log flood, retry burst).
+Rule 1 — Behavioral consistency (evidence to weigh, not a verdict):
+  behavioral_consistency reports the SHAPE of the anomaly across the fleet:
+  "uniform" = every replica shows it, "partial" = only some replicas, and
+  "single_request" = one request dominates the log volume. Treat this as one
+  piece of evidence and infer the cause from what the evidence ACTUALLY shows —
+  do not map a shape to a cause category by itself, and do not let a shape
+  override a directly observed failing interaction with a specific resource.
 
 Rule 2 — Evidence quality test:
   Prefer evidence from direct observation (log line content, metric value)
@@ -1196,8 +1276,12 @@ Rule 2 — Evidence quality test:
 Rule 3 — Parsimony:
   The simplest explanation consistent with ALL observations is preferred.
 
-Return ONLY this JSON:
+Return ONLY this JSON. Emit the three decision fields FIRST so they survive
+even if the response is truncated; the classifications array comes last:
 {
+  "cause_category": "application_code | infrastructure | configuration | dependency",
+  "cause_category_confidence": "LOW | MEDIUM | HIGH",
+  "investigation_constraint": "One binding sentence for synthesis, e.g.: The anomaly is uniform across all replicas with identical infrastructure — the root cause is application code behavior, not an AWS service failure.",
   "evidence_classifications": [
     {
       "evidence": "quote from branch result or log analysis",
@@ -1205,10 +1289,7 @@ Return ONLY this JSON:
       "rule_applied": "1 | 2 | 3",
       "reasoning": "one sentence"
     }
-  ],
-  "cause_category": "application_code | infrastructure | configuration | dependency",
-  "cause_category_confidence": "LOW | MEDIUM | HIGH",
-  "investigation_constraint": "One binding sentence for synthesis, e.g.: The anomaly is uniform across all replicas with identical infrastructure — the root cause is application code behavior, not an AWS service failure."
+  ]
 }
 """
 
@@ -1245,7 +1326,7 @@ def discriminate_node(state: GraphState) -> dict:
                 f"LOG INTELLIGENCE:\n{log_summary}\n\n"
                 f"INVESTIGATION BRANCHES:\n{branch_summary}"
             )}]}],
-            inferenceConfig={"maxTokens": 800, "temperature": 0},
+            inferenceConfig={"maxTokens": 1500, "temperature": 0},
         )
         text = resp["output"]["message"]["content"][0]["text"].strip()
         discrimination = _extract_json(text, "cause_category") or {}
@@ -1346,6 +1427,99 @@ must fit well within the response limit or it will be truncated and discarded:
   ]
 }}
 """
+
+
+_TRACE_STRUCT = set(".:/_-")
+
+
+def _observed_is_traceable(observed: str, corpus: str) -> tuple[bool, str]:
+    """Anti-fabrication: a CONFIRMED prediction must quote data that actually
+    exists in the fetched corpus. Fabrication lives in specific FACTS —
+    identifiers, ARNs, values, error codes — NOT in prose, which a real
+    observation naturally phrases in the model's own words. So verify the
+    DISTINCTIVE tokens (those carrying a digit or a structural char) trace to the
+    corpus and ignore plain words; requiring half of ALL words to match (the old
+    rule) wrongly downgraded legitimate observations whose facts were real but
+    surrounded by prose. Returns (traceable, downgrade_reason)."""
+    tokens = re.findall(r"[a-z0-9][a-z0-9_.\-:/]{4,}", (observed or "").lower())
+    distinctive = [
+        t for t in tokens
+        if any(c.isdigit() for c in t) or any(c in _TRACE_STRUCT for c in t)
+    ]
+    if not distinctive:
+        # No specific fact was cited — nothing fabricatable to verify; do not
+        # penalise a legitimately prose-phrased observation on this check.
+        return True, ""
+    matched = sum(1 for t in distinctive if t in corpus)
+    if matched * 2 < len(distinctive):
+        return False, ("observed facts not traceable to fetched data "
+                       f"({matched}/{len(distinctive)} specific tokens found)")
+    return True, ""
+
+
+def _calibrate_confidence(all_branch_results: list[dict],
+                          agent_conf: str) -> tuple[str, str | None]:
+    """VERDICT confidence calibration. Pure function so the policy is
+    unit-testable without a live model.
+
+    Confidence reflects what the ANALYSIS earned, not a cautious default. It is
+    LOWERED only for concrete, analysis-grounded reasons — no real evidence, an
+    unresolved contest between hypotheses, or a winner that refuted its own
+    prediction — and RAISED when an under-rated answer carries objective
+    verification (a confirmed prediction with no alternative verified). A single
+    dominant, self-consistent branch keeps the level its reasoning earned,
+    including HIGH; it is never capped merely to be safe.
+
+    Returns (confidence_level, calibration_note_or_None).
+    """
+    _order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+    def _pred_stats(br: dict) -> tuple[int, int]:
+        preds = [p for p in br.get("predictions_tested", []) if isinstance(p, dict)]
+        return (
+            sum(1 for p in preds if p.get("verdict") == "CONFIRMED"),
+            sum(1 for p in preds if p.get("verdict") == "REFUTED"),
+        )
+
+    confirmed = [br for br in all_branch_results if br.get("confirmed")]
+    evidenced = [
+        br for br in all_branch_results
+        if len(br.get("evidence") or []) >= 3 and br.get("conclusion")
+    ]
+    # A branch "stands" if it is verified (confirmed) or well-evidenced. Prefer a
+    # verified branch as the winner; otherwise the well-evidenced one.
+    standing = confirmed or evidenced
+
+    # Nothing to be confident about — no branch confirmed a prediction or produced
+    # substantial evidence.
+    if not standing:
+        return "LOW", "no branch confirmed a prediction or produced substantial evidence"
+
+    # Genuinely unresolved — the analysis could not separate ≥2 competing causes
+    # (two verified-but-contradicting, or two well-evidenced and neither verified).
+    # This is the analysis's OWN uncertainty, not caution.
+    if len(confirmed) >= 2 or (not confirmed and len(evidenced) >= 2):
+        return ("MEDIUM" if _order.get(agent_conf, 0) > 1 else agent_conf,
+                "two hypotheses retain substantial/verified support — unresolved")
+
+    winner = standing[0]
+
+    # The winning hypothesis refuted its OWN prediction — its conclusion is unsafe.
+    if _pred_stats(winner)[1] > 0:
+        return "LOW", "winning hypothesis has a refuted prediction of its own"
+
+    # Objective verification the model may have UNDER-rated: a confirmed prediction
+    # with no alternative verified justifies raising a too-low confidence.
+    n_conf, _ = _pred_stats(winner)
+    alt_verified = any(_pred_stats(br)[0] > 0
+                       for br in all_branch_results if br is not winner)
+    if n_conf >= 1 and not alt_verified and _order.get(agent_conf, 0) < _order["HIGH"]:
+        return "HIGH", ("raised: winning hypothesis has a confirmed prediction and "
+                        "no alternative was verified")
+
+    # Otherwise confidence follows the analysis — the dominant, self-consistent
+    # branch keeps the level its reasoning earned, HIGH included.
+    return agent_conf, None
 
 
 def synthesize_node(state: GraphState) -> dict:
@@ -1521,39 +1695,13 @@ def synthesize_node(state: GraphState) -> dict:
             result = result2
 
     # VERDICT confidence calibration — confidence follows prediction outcomes,
-    # not branch agreement. In a correct investigation exactly ONE branch should
-    # confirm (the true cause); the old ≥2-branches rule punished the design
-    # working as intended and produced LOW on conclusively-evidenced answers.
-    def _pred_stats(br: dict) -> tuple[int, int]:
-        preds = [p for p in br.get("predictions_tested", []) if isinstance(p, dict)]
-        return (
-            sum(1 for p in preds if p.get("verdict") == "CONFIRMED"),
-            sum(1 for p in preds if p.get("verdict") == "REFUTED"),
-        )
-
-    _order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-    confirmed_branches = [br for br in all_branch_results if br.get("confirmed")]
-    agent_conf = result.get("confidence", "LOW")
-
-    if len(confirmed_branches) == 1:
-        n_conf, _ = _pred_stats(confirmed_branches[0])
-        alternatives_dead = all(
-            _pred_stats(br)[1] > 0 or _pred_stats(br)[0] == 0
-            for br in all_branch_results if br is not confirmed_branches[0]
-        )
-        floor = "HIGH" if (n_conf >= 1 and alternatives_dead) else "MEDIUM"
-        if _order.get(agent_conf, 0) < _order[floor]:
-            result["confidence"] = floor
-            result["confidence_calibration"] = (
-                f"raised from {agent_conf}: winning hypothesis has {n_conf} confirmed "
-                f"prediction(s) and every alternative is refuted or unconfirmed"
-            )
-    elif not confirmed_branches:
-        # Nothing survived prediction testing — never report above LOW.
-        result["confidence"] = "LOW"
-    else:
-        # ≥2 confirmed branches contradict each other — stay conservative.
-        result["confidence"] = "MEDIUM" if agent_conf == "HIGH" else agent_conf
+    # not branch agreement (see _calibrate_confidence for the policy).
+    _conf, _cal_note = _calibrate_confidence(
+        all_branch_results, result.get("confidence", "LOW")
+    )
+    result["confidence"] = _conf
+    if _cal_note:
+        result["confidence_calibration"] = _cal_note
 
     # Propagate arbitration fetched data back into state
     if all_fetched_merged != state.get("all_fetched"):
@@ -1577,6 +1725,17 @@ _CRITIQUE_SYSTEM = """\
 You are a skeptical senior SRE reviewing an incident diagnosis before it ships to the on-call page.
 You did NOT investigate this incident — you only see the symptom, the chosen conclusion,
 and what each hypothesis branch found.
+
+CORE TEST — VERIFY, DON'T ASSUME. This is the root of every check below. Any
+claim that something is ABSENT, not the cause, fine, healthy, permitted, or that
+a fault CANNOT be confirmed, is valid ONLY if it traces to an actual observation
+that CHECKED that thing — never to an assumption, a default belief, or a
+DERIVED/predicted proxy (a simulator result, a metric, a "usually", "should
+be"). Negative and "all clear" claims are exactly where unverified assumptions
+hide, because — unlike a positive finding — they require no discovery to state.
+Whenever the conclusion rests on an unverified absence or negative, reject it
+with "needs_reinvestigation" naming the specific check that would actually
+confirm it. The tests below are named instances of this one principle:
 
 Challenge the conclusion with these questions:
 1. SPECIFICITY TEST — Does the root cause explain the exact SHAPE of the symptom?
@@ -1838,7 +1997,17 @@ def _make_checkpointer():
         conn = sqlite3.connect(
             os.path.join(ckpt_dir, "graph_checkpoints.db"),
             check_same_thread=False,
+            timeout=30,   # wait for a busy lock instead of failing instantly
         )
+        # WAL lets concurrent readers/writers coexist and avoids the "database is
+        # locked" crash when two cloudctl runs (or an IDE subagent + a CLI run)
+        # touch the checkpoint DB at once — strict file locking on Windows hits
+        # this readily under the default rollback journal.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+        except Exception:  # noqa: BLE001
+            pass
         return SqliteSaver(conn)
     except Exception:  # noqa: BLE001
         return None
@@ -2049,8 +2218,9 @@ def debug_incident_graph(
     parsed = enforce_confidence(parsed, all_fetched, hal_report)
     # Safety net: never let a "this alert is a false positive / not a real fault"
     # verdict ship at high confidence (see cap_speculative_dismissal). Fires only
-    # on dismissal language; leaves genuine fault diagnoses untouched.
-    parsed = cap_speculative_dismissal(parsed)
+    # on dismissal language; exempts a grounded misconfigured-alarm diagnosis
+    # (needs all_fetched to verify the alarm is real, not invented).
+    parsed = cap_speculative_dismissal(parsed, all_fetched)
 
     # Feature 3: Evidence-conclusion grounding check
     # Downgrades confidence when the conclusion names specific resources or
@@ -2071,11 +2241,30 @@ def debug_incident_graph(
     parsed = redact_output(parsed)
 
     reinvestigated = final_state.get("critique_round", 0) > 0
+
+    # Per-branch confirmation trace — makes the correct-but-LOW question (why did
+    # a branch that found the right cause fail to CONFIRM a prediction?) directly
+    # observable in the result, instead of inferred. For each branch: whether it
+    # confirmed, how many predictions it framed and their verdicts, evidence
+    # count, and any anti-fabrication downgrade reasons.
+    def _branch_trace(br: dict) -> dict:
+        preds = [p for p in (br.get("predictions_tested") or []) if isinstance(p, dict)]
+        return {
+            "service":     br.get("hypothesis", {}).get("service", "?"),
+            "confirmed":   br.get("confirmed", False),
+            "n_predictions": len(preds),
+            "n_confirmed": sum(1 for p in preds if p.get("verdict") == "CONFIRMED"),
+            "n_refuted":   sum(1 for p in preds if p.get("verdict") == "REFUTED"),
+            "n_evidence":  len(br.get("evidence") or []),
+            "downgrades":  [p.get("_downgraded") for p in preds if p.get("_downgraded")],
+        }
+
     parsed["_guardrails"] = {
         "agent_version": "graph_v2",
         "hypotheses_explored": len(final_state.get("hypotheses", [])),
         "branches_completed": len(final_state.get("branch_results", [])),
         "branches_confirmed": sum(1 for br in final_state.get("branch_results", []) if br.get("confirmed")),
+        "branch_verdicts": [_branch_trace(br) for br in final_state.get("branch_results", [])],
         "critique_applied": "_critique_notes" in parsed,
         "reinvestigated": reinvestigated,
         "hallucination_rate": hal_report.hallucination_rate,

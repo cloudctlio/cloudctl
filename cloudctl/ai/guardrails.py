@@ -464,14 +464,52 @@ def is_symptom_dismissal(agent_output: dict) -> bool:
     return any(m in text for m in _DISMISSAL_MARKERS)
 
 
-def cap_speculative_dismissal(agent_output: dict) -> dict:
+# Concrete defects IN the alerting/monitoring system itself. When a "false
+# positive" conclusion is BACKED by one of these AND that defect is grounded in
+# real fetched data, it is a legitimate diagnosis (a genuinely misconfigured
+# alarm), not speculation — and must NOT be capped. The grounding requirement is
+# what stops this from re-opening the confabulation loophole: an INVENTED alarm
+# (describe_alarms returned []) has no real alarm/threshold in the fetched data,
+# so it stays capped; a real misconfigured alarm does and is exempt.
+_ALERTING_DEFECT_MARKERS = (
+    "alarm threshold", "threshold is set", "threshold set to", "wrong threshold",
+    "misconfigured alarm", "alarm is misconfigured", "treatmissingdata",
+    "alarm period", "alarm evaluation", "alarm datapoints", "alarm dimension",
+    "alarm on the wrong metric", "metric filter", "alarm's threshold",
+)
+
+
+def _grounded_alerting_defect(text: str, fetched_data: dict | None) -> bool:
+    """True only when the verdict cites a concrete alerting-system defect AND a
+    REAL alarm (with a real threshold) is present in the fetched data — not an
+    invented one."""
+    if not any(m in text for m in _ALERTING_DEFECT_MARKERS):
+        return False
+    if not fetched_data:
+        return False   # cannot verify grounding → do not exempt (safe default)
+    corpus = json.dumps(fetched_data, default=str).lower()
+    has_alarm = '"alarmname"' in corpus or "alarmarn" in corpus
+    has_threshold = bool(re.search(r'"threshold":\s*-?[0-9]', corpus))
+    return has_alarm and has_threshold
+
+
+def cap_speculative_dismissal(agent_output: dict, fetched_data: dict | None = None) -> dict:
     """Cap confidence to LOW on a verdict that dismisses the reported symptom as
     not a real fault. A live alert cannot be confidently declared spurious
     without a concrete, inspected defect in the alerting system — that is a
-    human-review event, not a confident auto-diagnosis. See the note above."""
+    human-review event, not a confident auto-diagnosis. EXEMPTION: when the
+    dismissal IS backed by a concrete, grounded alerting-system defect (a real
+    misconfigured alarm found in the fetched data), it is a valid diagnosis and
+    is left alone — honoring the "unless backed by an inspected defect" clause."""
     claimed = agent_output.get("confidence", "MEDIUM")
     if claimed == "LOW" or not is_symptom_dismissal(agent_output):
         return agent_output
+    text = (
+        str(agent_output.get("root_cause", "")) + " "
+        + " ".join(str(e) for e in agent_output.get("evidence", []))
+    ).lower()
+    if _grounded_alerting_defect(text, fetched_data):
+        return agent_output   # valid, evidenced misconfigured-alarm diagnosis
     output = copy.deepcopy(agent_output)
     output["confidence"] = "LOW"
     output["confidence_override_reason"] = (

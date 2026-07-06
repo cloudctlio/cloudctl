@@ -19,6 +19,68 @@ _ACCOUNT = typer.Option(None,   "--account", "-a", help="AWS profile | Azure sub
 _REGION  = typer.Option(None,   "--region",  "-r", help="Region to focus on")
 
 
+def _probe_consent(plan: dict) -> dict:
+    """Interactive consent gate for one reproduction probe. Shows the operator
+    exactly what will run and why, then returns their decision. Runs under the
+    probe module's lock, so prompts never overlap across parallel branches."""
+    import sys as _sys  # noqa: PLC0415
+    console.print()
+    console.print("[bold yellow]⚠  Active reproduction requested[/bold yellow]")
+    console.print(f"    [bold]{plan['method']}[/bold] {plan['url']}")
+    console.print(f"    why:    {plan['reason']}")
+    console.print(f"    safety: [dim]{plan['safety']}[/dim]")
+    if not _sys.stdin.isatty():
+        console.print("[dim]    non-interactive session — declining probe[/dim]")
+        return {"decision": "skip", "reason": "non-interactive session"}
+    try:
+        ans = console.input(
+            "    [a]pprove (cloudctl runs it)  /  "
+            "[p] I'll run it (paste response)  /  [s]kip: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return {"decision": "skip", "reason": "operator interrupted"}
+
+    if ans in ("a", "approve", "y", "yes"):
+        return {"decision": "approve"}
+    if ans in ("p", "paste"):
+        console.print("    Run this from anywhere that can reach it, then paste "
+                      "the response body (end with an empty line):")
+        console.print(f"      [dim]curl -s -X {plan['method']} '{plan['url']}'[/dim]")
+        lines: list[str] = []
+        while True:
+            try:
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if line == "":
+                break
+            lines.append(line)
+        return {"decision": "paste", "pasted": "\n".join(lines)}
+    return {"decision": "skip", "reason": "operator skipped"}
+
+
+def _enable_active_reproduction() -> None:
+    """Opt in to active reproduction: turn the capability on, wire the
+    interactive consent gate, and explain to the operator what it does before
+    anything runs — never hidden."""
+    import os as _os  # noqa: PLC0415
+    from cloudctl.mcp.tools.probe import set_consent_handler  # noqa: PLC0415
+
+    _os.environ["CLOUDCTL_ENABLE_PROBES"] = "1"
+    set_consent_handler(_probe_consent)
+
+    console.print(
+        "\n[bold]Active reproduction is ON.[/bold] When passive telemetry can't "
+        "settle the diagnosis, the agent may propose a [bold]read-only[/bold] "
+        "HTTP probe (a single GET/HEAD) to see what the service actually returns."
+        "\n  • Every probe is shown to you first — nothing runs without approval."
+        "\n  • Approve to have cloudctl run it, or run it yourself and paste the "
+        "response (useful when the endpoint isn't reachable from here), or skip."
+        "\n  • Probes are bounded (timeout, size cap, no redirects) and can never "
+        "mutate anything.\n"
+    )
+
+
 def _render_incident(finding, account: Optional[str]) -> None:
     cs        = finding.confidence
     cs_level  = cs.level if cs else "UNKNOWN"
@@ -271,6 +333,13 @@ def debug_issue(
              "table. For automated grading (tests/harness/scorer.py) — the "
              "rendered table is lossy, the raw JSON is the actual grading input.",
     ),
+    reproduce: bool = typer.Option(
+        False, "--reproduce",
+        help="Opt in to ACTIVE REPRODUCTION: allow the agent to propose bounded, "
+             "read-only HTTP probes when passive telemetry can't settle the "
+             "diagnosis. Every probe is shown to you for approval before it runs "
+             "(approve / run-it-yourself-and-paste / skip). Off by default.",
+    ),
 ) -> None:
     """
     Debug a cloud infrastructure issue using AI analysis of real data.
@@ -291,12 +360,25 @@ def debug_issue(
         )
 
         console.print(f"\n[bold]Agent investigating:[/bold] {issue}")
-        with console.status("[dim]Claude is driving the investigation (3 parallel branches)...[/dim]"):
+
+        if reproduce:
+            _enable_active_reproduction()
+
+        if reproduce:
+            # Active reproduction pauses for interactive consent; a live spinner
+            # would clobber the prompt, so run without it.
             raw, all_fetched = debug_incident_graph(
                 symptom=issue,
                 profile=account,
                 region=region or "us-east-1",
             )
+        else:
+            with console.status("[dim]Claude is driving the investigation (3 parallel branches)...[/dim]"):
+                raw, all_fetched = debug_incident_graph(
+                    symptom=issue,
+                    profile=account,
+                    region=region or "us-east-1",
+                )
         d = _json.loads(raw)
 
         # Surface guardrail errors before rendering

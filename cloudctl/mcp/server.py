@@ -219,13 +219,17 @@ def _dispatch(tool_name: str, args: dict) -> str:
     """Route a tool call to the appropriate handler."""
     # ── Debug ──
     if tool_name == "cloudctl_debug_incident":
-        from cloudctl.mcp.tools.debug import debug_incident  # noqa: PLC0415
-        return debug_incident(
+        # Route IDE/MCP diagnosis through the SAME VERDICT+PRISM graph the CLI
+        # uses (parallel hypotheses, symptom verification, causal discrimination),
+        # so IDE-driven diagnostics are as accurate as `cloudctl debug --agent`.
+        from cloudctl.ai.graph_agent import debug_incident_graph  # noqa: PLC0415
+        raw, _fetched = debug_incident_graph(
             symptom=args["symptom"],
             profile=args.get("aws_profile") or None,
             region=args.get("region", "us-east-1"),
             minutes=int(args.get("minutes", 60)),
         )
+        return raw
     if tool_name == "cloudctl_get_service_config":
         from cloudctl.mcp.tools.debug import get_service_config  # noqa: PLC0415
         return get_service_config(

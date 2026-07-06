@@ -28,6 +28,7 @@ import ipaddress
 import json
 import os
 import socket
+import threading
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -54,6 +55,92 @@ def probes_used() -> int:
 
 def _probes_enabled() -> bool:
     return os.environ.get("CLOUDCTL_ENABLE_PROBES", "") in ("1", "true", "yes")
+
+
+# ── Consent gate ──────────────────────────────────────────────────────────────
+# Active reproduction is opt-in AND consent-gated: even when enabled, no probe
+# runs until a human sees exactly what it will do and approves. The gate is
+# transparent (shows target + reason + safety bounds), serialized (parallel
+# investigation branches can't prompt over each other), and offers a paste-back
+# path so a target the console can't reach (a private ALB) is still reproducible
+# by the operator running the same request from where they can and pasting the
+# response. If no handler is registered we DECLINE — we never fall back to a
+# silent probe.
+_CONSENT_LOCK = threading.Lock()
+_consent_handler = None   # callable(plan: dict) -> {"decision": .., "pasted": ..}
+
+
+def set_consent_handler(fn) -> None:
+    """Register the interactive consent handler (owned by the CLI layer, which
+    has the console). Passing None restores decline-by-default."""
+    global _consent_handler
+    _consent_handler = fn
+
+
+def _resolve_decision(plan: dict) -> dict:
+    if _consent_handler is not None:
+        return _consent_handler(plan) or {"decision": "skip"}
+    # No interactive handler wired. Allow a deterministic auto-mode for
+    # CI/replay only; otherwise decline — never probe without consent.
+    auto = os.environ.get("CLOUDCTL_PROBE_AUTO", "").lower()
+    if auto in ("approve", "yes", "y"):
+        return {"decision": "approve"}
+    return {"decision": "skip", "reason": "no interactive consent available"}
+
+
+def probe_http_gated(url: str, method: str = "GET",
+                     headers: dict | None = None, reason: str = "") -> str:
+    """Consent-gated wrapper around probe_http. Presents the plan to a human and
+    only acts on their decision: approve (cloudctl runs it), paste (operator ran
+    it, provides the response), or skip (continue passively)."""
+    if not _probes_enabled():
+        return _err("reproduction disabled — enable with --reproduce "
+                    "(or CLOUDCTL_ENABLE_PROBES=1) to allow consent-gated, "
+                    "read-only reproduction probes")
+
+    plan = {
+        "action": "reproduce",
+        "method": (method or "GET").upper(),
+        "url": url,
+        "reason": reason or "(no reason given)",
+        "safety": ("read-only (GET/HEAD/OPTIONS), 8s timeout, 64KB cap, "
+                   "no redirects, SSRF-guarded"),
+    }
+
+    # Serialize: only one consent prompt at a time across parallel branches.
+    with _CONSENT_LOCK:
+        decision = _resolve_decision(plan)
+        choice = (decision.get("decision") or "skip").lower()
+
+        if choice in ("approve", "a", "yes", "y"):
+            result = probe_http(url, method=method, headers=headers)
+            try:
+                obj = json.loads(result)
+                if isinstance(obj, dict):
+                    obj["_reproduction"] = "cloudctl-executed (operator approved)"
+                    return json.dumps(obj, default=str)
+            except Exception:
+                pass
+            return result
+
+        if choice in ("paste", "p", "operator"):
+            pasted = (decision.get("pasted") or "").strip()
+            _PROBE_STATS["used"] += 1   # the operator spent a reproduction on our behalf
+            return json.dumps({
+                "_reproduction": "operator-executed (response pasted by operator)",
+                "observed_response": pasted[:_MAX_BODY_BYTES],
+                "probes_used": _PROBE_STATS["used"],
+            })
+
+        # skip / decline / anything unrecognized → never probe.
+        return json.dumps({
+            "probe_declined": True,
+            "note": ("operator declined this reproduction. Do NOT claim the "
+                     "endpoint's response was verified or observed; reason only "
+                     "from passive evidence, and say so explicitly if the fault "
+                     "may be runtime-only and thus unverified."),
+            "reason": decision.get("reason", "operator skipped"),
+        })
 
 
 def _err(reason: str, **extra) -> str:
