@@ -1893,6 +1893,12 @@ class TestDebugToolsFallback:
                 region="us-east-1"
             )
             res = json.loads(res_str)
+            # list_resources now discovers GENERICALLY (Resource Explorer → Tagging
+            # API) and returns resource NAMES (usable with get_service_config),
+            # filtered by service_type. The mq broker's name is its last ARN
+            # segment; the full ARN is preserved under resources_detailed.
             assert res["service_type"] == "mq"
             assert res["count"] == 1
-            assert res["resources"] == ["arn:aws:mq:us-east-1:123:broker:my-broker"]
+            assert res["resources"] == ["my-broker"]
+            assert res["resources_detailed"][0]["arn"] == "arn:aws:mq:us-east-1:123:broker:my-broker"
+            assert res["resources_detailed"][0]["service"] == "mq"

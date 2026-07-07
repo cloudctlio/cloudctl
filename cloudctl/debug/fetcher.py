@@ -83,6 +83,7 @@ class DebugFetcher:
         log_group: str,
         filter_pattern: str = "",
         minutes: int = 60,
+        max_events: int = 100,
     ) -> list[dict]:
         if not self._session:
             self._mark("cloudwatch_logs", False)
@@ -99,7 +100,23 @@ class DebugFetcher:
             )
             if filter_pattern:
                 kwargs["filterPattern"] = filter_pattern
-            resp  = logs.filter_log_events(**kwargs)
+            # Paginate (bounded) and keep the MOST RECENT events. filter_log_events
+            # returns oldest-first; a single 100-event page of a busy group is all
+            # startup chatter, hiding a later error burst and making the model
+            # conclude "logs are clean". Hard page/event caps keep this from
+            # hanging or over-fetching.
+            raw: list[dict] = []
+            token = None
+            for _ in range(5):   # ≤5 pages / ≤500 events
+                if token:
+                    kwargs["nextToken"] = token
+                resp  = logs.filter_log_events(**kwargs)
+                raw.extend(resp.get("events", []))
+                token = resp.get("nextToken")
+                if not token or len(raw) >= 500:
+                    break
+            raw.sort(key=lambda e: e.get("timestamp", 0))
+            recent = raw[-max_events:] if (max_events and max_events > 0) else raw
             events = [
                 {
                     "time":   datetime.fromtimestamp(
@@ -108,7 +125,7 @@ class DebugFetcher:
                     "source": f"CloudWatch/Logs/{log_group}",
                     "event":  e.get("message", "").strip()[:500],
                 }
-                for e in resp.get("events", [])
+                for e in recent
             ]
             self._mark("cloudwatch_logs", bool(events))
             return events
@@ -4143,40 +4160,59 @@ class DebugFetcher:
 
             events: list[dict] = []
 
+            def _paged_lookup(attr_key: str, attr_val: str, max_pages: int = 3) -> list[dict]:
+                # Bounded pagination: the newest 20-30 events in a busy account can
+                # all postdate the causal change; without paging, a config change
+                # from hours ago (still inside the window) is silently missed and
+                # "no changes found" becomes a false negative. Hard page cap keeps
+                # cost bounded / non-hanging.
+                out: list[dict] = []
+                token = None
+                for _ in range(max_pages):
+                    kw = dict(
+                        LookupAttributes=[{"AttributeKey": attr_key, "AttributeValue": attr_val}],
+                        StartTime=start, EndTime=end, MaxResults=50,
+                    )
+                    if token:
+                        kw["NextToken"] = token
+                    resp = ct.lookup_events(**kw)
+                    out.extend(resp.get("Events", []))
+                    token = resp.get("NextToken")
+                    if not token:
+                        break
+                return out
+
+            def _to_row(e) -> dict:
+                detail = _j.loads(e.get("CloudTrailEvent", "{}"))
+                uid    = detail.get("userIdentity", {})
+                actor  = (
+                    uid.get("userName")
+                    or uid.get("sessionContext", {})
+                       .get("sessionIssuer", {}).get("userName", "")
+                    or uid.get("arn", "").split("/")[-1]
+                )
+                return {
+                    "time":          str(e.get("EventTime", "")),
+                    "event_name":    e.get("EventName", ""),
+                    "actor":         actor,
+                    "resources":     [r.get("ResourceName", "") for r in e.get("Resources", [])],
+                    "error_code":    detail.get("errorCode", ""),
+                    "error_message": detail.get("errorMessage", "")[:200],
+                    "request_params": str(detail.get("requestParameters") or "")[:300],
+                }
+
             if event_names:
                 # Search for each event name individually (CloudTrail API only accepts one
                 # LookupAttribute at a time) and merge results
                 for en in event_names[:5]:
                     try:
-                        resp = ct.lookup_events(
-                            LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": en}],
-                            StartTime=start,
-                            EndTime=end,
-                            MaxResults=20,
-                        )
-                        for e in resp.get("Events", []):
+                        for e in _paged_lookup("EventName", en):
                             resources = [r.get("ResourceName", "") for r in e.get("Resources", [])]
                             if resource_name and not any(
                                 resource_name.lower() in (r or "").lower() for r in resources
                             ):
                                 continue
-                            detail = _j.loads(e.get("CloudTrailEvent", "{}"))
-                            uid    = detail.get("userIdentity", {})
-                            actor  = (
-                                uid.get("userName")
-                                or uid.get("sessionContext", {})
-                                   .get("sessionIssuer", {}).get("userName", "")
-                                or uid.get("arn", "").split("/")[-1]
-                            )
-                            events.append({
-                                "time":          str(e.get("EventTime", "")),
-                                "event_name":    e.get("EventName", ""),
-                                "actor":         actor,
-                                "resources":     resources,
-                                "error_code":    detail.get("errorCode", ""),
-                                "error_message": detail.get("errorMessage", "")[:200],
-                                "request_params": str(detail.get("requestParameters") or "")[:300],
-                            })
+                            events.append(_to_row(e))
                     except Exception:
                         pass
             else:
@@ -4188,31 +4224,8 @@ class DebugFetcher:
                 ])))
                 for sv in search_values[:2]:
                     try:
-                        resp = ct.lookup_events(
-                            LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": sv}],
-                            StartTime=start,
-                            EndTime=end,
-                            MaxResults=30,
-                        )
-                        for e in resp.get("Events", []):
-                            detail = _j.loads(e.get("CloudTrailEvent", "{}"))
-                            uid    = detail.get("userIdentity", {})
-                            actor  = (
-                                uid.get("userName")
-                                or uid.get("sessionContext", {})
-                                   .get("sessionIssuer", {}).get("userName", "")
-                                or uid.get("arn", "").split("/")[-1]
-                            )
-                            resources = [r.get("ResourceName", "") for r in e.get("Resources", [])]
-                            events.append({
-                                "time":          str(e.get("EventTime", "")),
-                                "event_name":    e.get("EventName", ""),
-                                "actor":         actor,
-                                "resources":     resources,
-                                "error_code":    detail.get("errorCode", ""),
-                                "error_message": detail.get("errorMessage", "")[:200],
-                                "request_params": str(detail.get("requestParameters") or "")[:300],
-                            })
+                        page = _paged_lookup("ResourceName", sv)
+                        events.extend(_to_row(e) for e in page)
                         if events:
                             break
                     except Exception:
@@ -4227,7 +4240,7 @@ class DebugFetcher:
                     seen.add(key)
                     unique.append(ev)
             unique.sort(key=lambda e: e["time"], reverse=True)
-            return unique[:30]
+            return unique[:50]
         except Exception:  # noqa: BLE001
             return []
 
@@ -4498,5 +4511,376 @@ class DebugFetcher:
                 pass
         result["metrics_last_60min"] = metrics
         return result
+
+    # ── X-Ray distributed-tracing fusion ──────────────────────────────────────
+    #
+    # Traces are the richest single signal for latency/timeout/error-propagation
+    # incidents: the service graph shows WHERE in the call graph faults and
+    # latency concentrate, and the selected offender traces name the specific
+    # segment (service + operation) carrying the fault. Entirely generic — every
+    # field below is read straight off the X-Ray API with no service or scenario
+    # vocabulary. Most accounts do not have X-Ray enabled, so this NEVER raises:
+    # a missing/empty/denied source returns a structured "unavailable" signal.
+
+    def xray_traces(
+        self,
+        minutes: int = 60,
+        resource_hint: str | None = None,
+        filter_expression: str | None = None,
+        max_offenders: int = 5,
+    ) -> dict:
+        """Distill X-Ray into a compact, structured signal (never raw segments).
+
+        Returns a dict shaped:
+            {
+              "available": bool,
+              "reason": str,                       # populated when unavailable
+              "window_minutes": int,
+              "service_graph_summary": [ {service, edge, avg_latency_ms,
+                                          error_rate, fault_rate, throttle_rate,
+                                          request_count}, ... ],
+              "top_slow_traces":  [ {trace_id, duration_ms, has_error,
+                                     has_fault, has_throttle}, ... ],
+              "top_fault_traces": [ {trace_id, culprit_service, culprit_op,
+                                     fault_type, latency_ms}, ... ],
+            }
+
+        Graceful degradation is the point: when X-Ray is not enabled, no traces
+        fall in-window, or the caller lacks xray:* permission, this returns
+        available=False with a clear reason and empty lists — a normal
+        informative result, so an incident with no tracing is unaffected.
+        """
+        unavailable = {
+            "available": False,
+            "reason": "no trace data available (X-Ray not enabled / no traces in window)",
+            "window_minutes": int(minutes),
+            "service_graph_summary": [],
+            "top_slow_traces": [],
+            "top_fault_traces": [],
+        }
+        if not self._session:
+            self._mark("xray_traces", False)
+            return dict(unavailable)
+
+        try:
+            xray = self._session.client("xray")
+        except Exception:  # noqa: BLE001
+            self._mark("xray_traces", False)
+            return dict(unavailable)
+
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=min(max(int(minutes), 1), 360))
+
+        def _is_access_denied(exc: Exception) -> bool:
+            code = ""
+            try:
+                code = exc.response["Error"]["Code"]  # botocore ClientError
+            except Exception:  # noqa: BLE001
+                code = type(exc).__name__
+            return "AccessDenied" in code or "UnauthorizedException" in code
+
+        # ── 1. Service graph — topology + where faults/latency concentrate ────
+        graph_summary: list[dict] = []
+        try:
+            services = self._xray_service_graph(xray, start, end)
+        except Exception as exc:  # noqa: BLE001
+            self._mark("xray_traces", False)
+            out = dict(unavailable)
+            if _is_access_denied(exc):
+                out["reason"] = ("no trace data available (access denied to "
+                                 "xray:GetServiceGraph — X-Ray permission missing)")
+            return out
+
+        for node in services:
+            node_name = node.get("Name") or node.get("ReferenceId", "")
+            node_type = node.get("Type", "")
+            # Emit one row per outbound EDGE (caller→callee) plus a self row for
+            # the node's own summary statistics. Edges are where a dependency's
+            # fault surfaces to its caller; the node row captures terminal faults.
+            self_row = self._xray_stats_row(node.get("SummaryStatistics") or {})
+            if self_row:
+                graph_summary.append({
+                    "service": node_name, "service_type": node_type,
+                    "edge": node_name, **self_row,
+                })
+            for edge in node.get("Edges") or []:
+                dest = self._xray_ref_name(edge.get("ReferenceId"), services)
+                row = self._xray_stats_row(edge.get("SummaryStatistics") or {})
+                if row:
+                    graph_summary.append({
+                        "service": node_name, "service_type": node_type,
+                        "edge": f"{node_name} -> {dest}", **row,
+                    })
+
+        # Surface the highest-fault / highest-latency edges first, and cap the
+        # list so a large mesh cannot blow up the output.
+        graph_summary.sort(
+            key=lambda r: (r.get("fault_rate", 0.0) + r.get("error_rate", 0.0)
+                           + r.get("throttle_rate", 0.0), r.get("avg_latency_ms", 0.0)),
+            reverse=True,
+        )
+        graph_summary = graph_summary[:20]
+
+        # ── 2. Trace summaries — pick the top offenders ───────────────────────
+        try:
+            summaries = self._xray_trace_summaries(
+                xray, start, end, filter_expression, resource_hint,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Graph may still have succeeded; degrade to graph-only rather than
+            # discarding it.
+            self._mark("xray_traces", bool(graph_summary))
+            return {
+                "available": bool(graph_summary),
+                "reason": "" if graph_summary else unavailable["reason"],
+                "window_minutes": int(minutes),
+                "service_graph_summary": graph_summary,
+                "top_slow_traces": [],
+                "top_fault_traces": [],
+            }
+
+        if not graph_summary and not summaries:
+            self._mark("xray_traces", False)
+            return dict(unavailable)
+
+        # Slowest traces by measured duration.
+        by_slow = sorted(
+            summaries, key=lambda s: s.get("Duration", 0) or 0, reverse=True
+        )
+        top_slow = [
+            {
+                "trace_id": s.get("Id", ""),
+                "duration_ms": round((s.get("Duration", 0) or 0) * 1000, 1),
+                "has_error": bool(s.get("HasError")),
+                "has_fault": bool(s.get("HasFault")),
+                "has_throttle": bool(s.get("HasThrottle")),
+            }
+            for s in by_slow[:max_offenders]
+        ]
+
+        # Error/Fault/Throttle-bearing traces — these carry a culprit segment.
+        faulted = [
+            s for s in summaries
+            if s.get("HasFault") or s.get("HasError") or s.get("HasThrottle")
+        ]
+        faulted.sort(key=lambda s: s.get("Duration", 0) or 0, reverse=True)
+        fault_ids = [s.get("Id", "") for s in faulted[:max_offenders] if s.get("Id")]
+
+        # ── 3. batch_get_traces on ONLY the selected offenders ────────────────
+        top_fault: list[dict] = []
+        if fault_ids:
+            try:
+                traces = self._xray_batch_get(xray, fault_ids)
+                for tr in traces:
+                    culprit = self._xray_locate_culprit(tr)
+                    if culprit:
+                        top_fault.append(culprit)
+            except Exception:  # noqa: BLE001
+                # Keep the summaries even if segment fetch fails.
+                top_fault = [
+                    {
+                        "trace_id": s.get("Id", ""),
+                        "culprit_service": "",
+                        "culprit_op": "",
+                        "fault_type": ("fault" if s.get("HasFault")
+                                       else "throttle" if s.get("HasThrottle")
+                                       else "error"),
+                        "latency_ms": round((s.get("Duration", 0) or 0) * 1000, 1),
+                    }
+                    for s in faulted[:max_offenders]
+                ]
+
+        self._mark("xray_traces", True)
+        return {
+            "available": True,
+            "reason": "",
+            "window_minutes": int(minutes),
+            "service_graph_summary": graph_summary,
+            "top_slow_traces": top_slow,
+            "top_fault_traces": top_fault,
+        }
+
+    # -- X-Ray helpers (all generic; no service/scenario literals) -------------
+
+    def _xray_service_graph(self, xray, start, end) -> list[dict]:
+        """Bounded-pagination GetServiceGraph → list of service nodes."""
+        services: list[dict] = []
+        token = None
+        for _ in range(5):   # ≤5 pages
+            kw: dict = {"StartTime": start, "EndTime": end}
+            if token:
+                kw["NextToken"] = token
+            resp = xray.get_service_graph(**kw)
+            services.extend(resp.get("Services", []))
+            token = resp.get("NextToken")
+            if not token or len(services) >= 200:
+                break
+        return services
+
+    @staticmethod
+    def _xray_ref_name(ref_id, services: list[dict]) -> str:
+        for s in services:
+            if s.get("ReferenceId") == ref_id:
+                return s.get("Name") or str(ref_id)
+        return str(ref_id)
+
+    @staticmethod
+    def _xray_stats_row(stats: dict) -> dict | None:
+        """Distill an X-Ray SummaryStatistics block into flat rates/latency.
+        Returns None for an empty block so silent edges are dropped."""
+        if not stats:
+            return None
+        total = stats.get("TotalCount", 0) or 0
+        err = stats.get("ErrorStatistics", {}) or {}
+        flt = stats.get("FaultStatistics", {}) or {}
+        # X-Ray reports throttle inside ErrorStatistics.ThrottleCount.
+        throttle = err.get("ThrottleCount", 0) or 0
+        errors = err.get("TotalCount", 0) or 0
+        faults = flt.get("TotalCount", 0) or 0
+        denom = total if total else max(errors + faults + throttle, 1)
+        avg_latency_s = stats.get("TotalResponseTime", 0) or 0
+        # TotalResponseTime is the SUM across requests in seconds; average it.
+        avg_ms = round((avg_latency_s / total) * 1000, 1) if total else round(
+            avg_latency_s * 1000, 1)
+        return {
+            "request_count": int(total),
+            "avg_latency_ms": avg_ms,
+            "error_rate": round(errors / denom, 4),
+            "fault_rate": round(faults / denom, 4),
+            "throttle_rate": round(throttle / denom, 4),
+        }
+
+    def _xray_trace_summaries(
+        self, xray, start, end, filter_expression, resource_hint,
+    ) -> list[dict]:
+        """Bounded-pagination GetTraceSummaries. resource_hint is folded into a
+        generic FilterExpression only when the caller gave no explicit one — it
+        is a substring match against the trace, not a service-specific rule."""
+        expr = filter_expression or ""
+        if not expr and resource_hint:
+            # Generic annotation/service-name contains filter; if X-Ray rejects
+            # the expression we retry without it rather than failing.
+            safe = str(resource_hint).replace('"', "")
+            expr = f'service("{safe}") OR annotation.resource = "{safe}"'
+        summaries: list[dict] = []
+        token = None
+        used_expr = expr
+        for attempt in range(2):
+            try:
+                token = None
+                summaries = []
+                for _ in range(4):   # ≤4 pages
+                    kw: dict = {"StartTime": start, "EndTime": end}
+                    if used_expr:
+                        kw["FilterExpression"] = used_expr
+                    if token:
+                        kw["NextToken"] = token
+                    resp = xray.get_trace_summaries(**kw)
+                    summaries.extend(resp.get("TraceSummaries", []))
+                    token = resp.get("NextToken")
+                    if not token or len(summaries) >= 200:
+                        break
+                return summaries
+            except Exception:  # noqa: BLE001
+                if attempt == 0 and used_expr:
+                    used_expr = ""   # retry unfiltered
+                    continue
+                raise
+        return summaries
+
+    def _xray_batch_get(self, xray, trace_ids: list[dict]) -> list[dict]:
+        """BatchGetTraces for the selected offender ids (bounded to 5 at a time,
+        the API max), returning the full trace docs for culprit localization."""
+        traces: list[dict] = []
+        ids = [t for t in trace_ids if t][:25]
+        for i in range(0, len(ids), 5):
+            resp = xray.batch_get_traces(TraceIds=ids[i:i + 5])
+            traces.extend(resp.get("Traces", []))
+        return traces
+
+    @staticmethod
+    def _xray_locate_culprit(trace: dict) -> dict | None:
+        """Scan a trace's segment/subsegment docs and identify the ONE segment
+        carrying the fault/error/throttle (preferred) or, absent any, the single
+        largest latency contributor. Purely structural — reads error/fault/
+        throttle flags and timing that X-Ray attaches to every segment, with no
+        service-specific knowledge."""
+        import json as _j
+
+        best_fault = None          # (severity_rank, latency_ms, name, op, ftype)
+        best_latency = None        # (latency_ms, name, op)
+        _sev = {"throttle": 1, "error": 2, "fault": 3}
+
+        def _walk(doc: dict, inherited_name: str):
+            nonlocal best_fault, best_latency
+            name = doc.get("name") or inherited_name
+            op = ""
+            http = doc.get("http") or {}
+            req = http.get("request") or {}
+            op = req.get("method") or req.get("url") or doc.get("origin") or ""
+            start_t = doc.get("start_time")
+            end_t = doc.get("end_time")
+            latency_ms = round((end_t - start_t) * 1000, 1) if (
+                isinstance(start_t, (int, float)) and isinstance(end_t, (int, float))
+            ) else 0.0
+
+            ftype = ""
+            if doc.get("fault"):
+                ftype = "fault"
+            elif doc.get("error"):
+                ftype = "error"
+            elif doc.get("throttle"):
+                ftype = "throttle"
+            # HTTP status is a generic fault signal too (5xx=fault, 4xx=error).
+            if not ftype:
+                status = (http.get("response") or {}).get("status")
+                if isinstance(status, (int, float)):
+                    if status >= 500:
+                        ftype = "fault"
+                    elif status == 429:
+                        ftype = "throttle"
+
+            if ftype:
+                rank = _sev.get(ftype, 0)
+                cand = (rank, latency_ms, name, op, ftype)
+                if best_fault is None or cand[:2] > best_fault[:2]:
+                    best_fault = cand
+            cand_l = (latency_ms, name, op)
+            if best_latency is None or cand_l[0] > best_latency[0]:
+                best_latency = cand_l
+
+            for sub in doc.get("subsegments") or []:
+                _walk(sub, name)
+
+        for seg in trace.get("Segments") or []:
+            raw = seg.get("Document")
+            if not raw:
+                continue
+            try:
+                doc = raw if isinstance(raw, dict) else _j.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            _walk(doc, doc.get("name", ""))
+
+        trace_id = trace.get("Id", "")
+        if best_fault is not None:
+            _, latency_ms, name, op, ftype = best_fault
+            return {
+                "trace_id": trace_id,
+                "culprit_service": name,
+                "culprit_op": op,
+                "fault_type": ftype,
+                "latency_ms": latency_ms,
+            }
+        if best_latency is not None:
+            latency_ms, name, op = best_latency
+            return {
+                "trace_id": trace_id,
+                "culprit_service": name,
+                "culprit_op": op,
+                "fault_type": "latency",
+                "latency_ms": latency_ms,
+            }
+        return None
 
 

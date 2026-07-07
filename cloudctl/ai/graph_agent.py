@@ -55,6 +55,10 @@ class BranchResult(BaseModel):
     all_fetched: dict = {}
     # VERDICT: per-prediction test outcomes from the investigation
     predictions_tested: list[dict] = []
+    # Feature 5 (VOI): True when the branch stopped its tool loop early because
+    # its hypothesis was decisively resolved with the accuracy floor met — a
+    # measurement hook, behavior-neutral (does not affect confidence/verdict).
+    voi_early_stop: bool = False
 
     @field_validator("confidence")
     @classmethod
@@ -63,6 +67,11 @@ class BranchResult(BaseModel):
 
 
 class IncidentReport(BaseModel):
+    # Preserve extra keys (confidence_calibration, _critique_notes, deployment_
+    # source, …) through model_dump instead of silently dropping them — several
+    # diagnostic/plumbing fields are attached to the report dict after synthesis.
+    model_config = {"extra": "allow"}
+
     root_cause: str
     evidence: list[str]
     remediation_steps: list[str]
@@ -71,6 +80,14 @@ class IncidentReport(BaseModel):
     resources_investigated: list[str]
     alternatives_considered: list[dict] | None = None
     additional_causes: list[dict] | None = None   # independent confirmed faults
+    # Provenance trail: each entry maps ONE reported claim (an evidence[] item
+    # or a root_cause sentence) to the all_fetched keys (from _evidence_key —
+    # the existing per-tool-call citation ids) whose stored value actually
+    # contains the claim's facts, plus a short verbatim quote from that value.
+    provenance: list[dict] | None = None
+    # Claims that carry verifiable specifics (identifiers/values) yet traced to
+    # ZERO fetched sources. Flag + confidence weight only — never a hard cap.
+    unsourced_claims: list[str] | None = None
 
     @field_validator("severity")
     @classmethod
@@ -142,6 +159,60 @@ def _round_robin_merge(groups: list[list[str]]) -> list[str]:
             if i < len(g):
                 out.append(g[i])
     return out
+
+
+def _evidence_key(tool_name: str, tool_input: dict) -> str:
+    """Build a stable, human-readable evidence-store key that is UNIQUE per
+    distinct tool call. The old key was f"{tool_name}:{resource_name}", but
+    several tools (tail_logs→resource_hint, query_metrics→namespace/metric/dims,
+    aws_read→service/operation, probe_permission→role/action, probe_http→url)
+    carry no resource_name, so every one of their calls collapsed to the same
+    key and overwrote the previous result — silently gutting the anti-fabrication
+    corpus, the critique inventory, and the hallucination/grounding checks that
+    all key off this store. This derives the discriminator generically from the
+    call's identifying inputs (no per-tool/per-service literals), so distinct
+    calls never collide.
+    """
+    parts: list[str] = []
+    for k, v in (tool_input or {}).items():
+        if k in ("region", "profile", "minutes", "reason"):
+            continue
+        if isinstance(v, (str, int, float)) and str(v).strip():
+            parts.append(f"{k}={v}")
+        elif isinstance(v, dict) and v:
+            parts.append(f"{k}=" + ",".join(f"{kk}:{vv}" for kk, vv in v.items()))
+        elif isinstance(v, (list, tuple)) and v:
+            parts.append(f"{k}=" + ",".join(str(x) for x in v))
+    disc = "|".join(parts)[:180]
+    return f"{tool_name}:{disc}" if disc else tool_name
+
+
+def _store_unique(store: dict, key: str, value) -> str:
+    """Insert value under key, guaranteeing no in-store collision silently
+    overwrites an earlier distinct result. An identical value already present is
+    deduplicated (lossless); a different value under a taken key is renamed with
+    a numeric suffix. Returns the key actually used."""
+    if key not in store:
+        store[key] = value
+        return key
+    if store[key] == value:
+        return key
+    n = 2
+    while f"{key}#{n}" in store:
+        if store[f"{key}#{n}"] == value:
+            return f"{key}#{n}"
+        n += 1
+    store[f"{key}#{n}"] = value
+    return f"{key}#{n}"
+
+
+def _merge_fetched(dst: dict, src: dict) -> None:
+    """Merge one branch's fetched corpus into the shared one WITHOUT lossy key
+    collisions across branches. Two branches that each fetched a differently-keyed
+    result under the same tool descriptor previously clobbered each other at
+    .update(); here a colliding-but-different value is renamed instead of lost."""
+    for k, v in (src or {}).items():
+        _store_unique(dst, k, v)
 
 
 def _sys(text: str) -> list[dict]:
@@ -292,13 +363,14 @@ def observe_node(state: GraphState) -> dict:
             return json.dumps({"error": tc.reason})
         try:
             if tool_name == "list_resources":
-                raw = list_resources(tool_input["service_type"],
+                raw = list_resources(tool_input.get("service_type", ""),
                                      state["profile"], state["region"])
             elif tool_name == "tail_logs":
                 raw = tail_logs(
                     resource_hint=tool_input["resource_hint"],
                     minutes=int(tool_input.get("minutes") or state["minutes"]),
                     profile=state["profile"], region=state["region"], max_events=50,
+                    filter_pattern=tool_input.get("filter_pattern", ""),
                 )
             elif tool_name == "query_metrics":
                 raw = query_metrics(
@@ -371,6 +443,30 @@ def observe_node(state: GraphState) -> dict:
     return {"observation": observation}
 
 
+# ── Generic diagnostic methodology scaffold (Feature 3) ───────────────────────
+#
+# Domain-agnostic REASONING FRAMES the model applies to WHATEVER resources it
+# discovers — deliberately NOT scenario answers. It names no service, resource
+# type, or error code, and maps no symptom to any cause: it is methodology, not
+# a lookup table. Kept as ONE static constant shared by the fully-static triage
+# prompt and the branch-investigation prompt, so the text is invariant across
+# every incident and sits inside a prompt-cacheable prefix (the triage system
+# block is entirely static). Complements — does not duplicate — the existing
+# DEPLOYMENT-AT-ONSET and CALL-GRAPH rules in the branch prompt.
+_DIAGNOSTIC_SCAFFOLD = """\
+DIAGNOSTIC FRAMES — apply these generic checks to WHATEVER resources you find;
+they name no service and map no symptom to any cause:
+  - USE (any resource): inspect its Utilization, Saturation, and Errors.
+  - RED (any request path): inspect its Rate, Errors, and Duration.
+  - DEPENDENCY-WALK: start at the failing symptom and walk INWARD along what it
+    calls, what it reads/writes, and what authorizes it — test each hop before
+    guessing an intrinsic cause.
+  - CHANGE-FIRST: a fault with a clear onset usually follows a change; establish
+    what changed at onset before theorizing an intrinsic defect.
+
+"""
+
+
 # ── Node 1: triage (agentic resource discovery) ───────────────────────────────
 
 _TRIAGE_SYSTEM = """\
@@ -394,9 +490,12 @@ list_resources rules:
 Hypothesis rules:
   1. Each hypothesis must name a specific resource by name (table, queue, cluster,
      function, key) and describe the failure mode on that resource.
-  2. Deployment side-effects (instance or container replacement, connection
+  2. Deployment MECHANICS (instance or container replacement, connection
      draining, image pulls) are almost NEVER the root cause — they are symptoms
-     of routine change. Do not use them as a primary hypothesis.
+     of routine change; do not use the churn itself as a primary hypothesis.
+     BUT a wrong CHANGE shipped by a deployment (a regressed env var, a bad
+     policy edit, a flipped flag) IS a valid primary hypothesis — target the
+     specific changed setting, not the mechanical churn around it.
   3. Cover structurally distinct layers: the data layer, the compute layer,
      and the permissions/configuration layer.
   4. For silent failures (service running but producing wrong output): the
@@ -417,6 +516,7 @@ Falsifiability rule (mandatory):
   A hypothesis whose predictions cannot be checked with the available tools is
   a bad hypothesis — replace it.
 
+""" + _DIAGNOSTIC_SCAFFOLD + """\
 After your tool calls, respond with ONLY a JSON array of exactly 3 objects:
 [
   {"service": "aws-service-name", "reason": "one sentence",
@@ -506,13 +606,24 @@ def triage_node(state: GraphState) -> dict:
                     if p.startswith("["):
                         text = p
                         break
+            parsed_raw = None
             try:
-                raw = json.loads(text)
-                if not isinstance(raw, list):
-                    raw = [raw]
-                hypotheses = [Hypothesis(**h).model_dump() for h in raw[:3]]
+                parsed_raw = json.loads(text)
             except Exception:
-                pass
+                # Salvage a JSON array/object embedded in prose instead of
+                # discarding all three hypotheses on a stray character.
+                parsed_raw = _extract_json(text, "service")
+            if isinstance(parsed_raw, dict):
+                parsed_raw = [parsed_raw]
+            if isinstance(parsed_raw, list):
+                # Parse each hypothesis INDEPENDENTLY: one malformed entry must
+                # not abort the whole list (which previously collapsed triage to
+                # the hard-coded IAM fallback).
+                for h in parsed_raw[:3]:
+                    try:
+                        hypotheses.append(Hypothesis(**h).model_dump())
+                    except Exception:
+                        continue
             break
 
         if stop_reason == "tool_use":
@@ -530,7 +641,31 @@ def triage_node(state: GraphState) -> dict:
                 msgs.append({"role": "user", "content": tool_results})
 
     if not hypotheses:
-        hypotheses = [{"service": "iam", "reason": "permission denied", "focus": "check role policies"}]
+        # Robust fallback: do NOT collapse to a single hard-coded guess. The old
+        # default was a fixed IAM "permission denied" hypothesis, which biased
+        # every unparseable triage toward one fault class regardless of symptom.
+        # Derive neutral hypotheses from whatever resources were actually
+        # discovered (hint-free — no fault category assumed).
+        for svc, parsed in (discovered or {}).items():
+            if svc.startswith("_"):
+                continue
+            names = parsed.get("resources") if isinstance(parsed, dict) else None
+            first = names[0] if isinstance(names, list) and names else ""
+            hypotheses.append({
+                "service": svc,
+                "reason": f"triage returned no parseable hypotheses; {svc} was discovered and may be implicated by the symptom",
+                "focus": f"{first or svc} — inspect configuration and operational state",
+                "predictions": [],
+            })
+            if len(hypotheses) >= 3:
+                break
+        if not hypotheses:
+            hypotheses = [{
+                "service": "unknown",
+                "reason": "triage produced no parseable hypotheses and discovery found no resources",
+                "focus": "enumerate the resources the symptom implicates, then inspect their config and logs",
+                "predictions": [],
+            }]
 
     return {
         "hypotheses": hypotheses,
@@ -574,8 +709,11 @@ Maximum 3 tool calls. Conclude with ONLY this JSON:
 """
 
 _PHASE2_SYSTEM = """\
-You are an AWS incident investigator. Configuration looked correct — now investigate
-operational state to prove or disprove this hypothesis.
+You are an AWS incident investigator. Phase 1 checked configuration state — now
+investigate operational state to prove or disprove this hypothesis. Read the
+Phase 1 finding below: if it already found a STRUCTURAL issue, that finding
+STANDS — your job is to corroborate it with operational evidence and test the
+predictions, NOT to assume the configuration is fine.
 
 Your hypothesis: {reason}
 Primary service: {service}
@@ -651,6 +789,22 @@ is a LEAD to examine WHAT it changed (diff the new configuration against its
 peers or prior intent), NOT a licence to attribute the incident to "deployment
 churn". The churn is a symptom of the change; find the change.
 
+CALL-GRAPH rule — for any latency, timeout, or error-that-propagates-across-
+services symptom, get_traces is the richest single signal: it returns the
+service-dependency graph with per-edge latency/error/fault/throttle rates and
+localizes offending traces to the exact segment (service + operation) carrying
+the fault, so you can pinpoint WHICH hop in the call path accumulates the time or
+failures instead of guessing. If it reports available=false (tracing not enabled
+/ no traces in window), simply fall back to metrics and logs — it is not a fault.
+
+VALUE-OF-INFORMATION rule — do not gather breadth for its own sake. Before each
+call, ask: which single check would most CHANGE which hypothesis is favored?
+Prefer that maximally-discriminating check over one that only re-confirms what
+you already believe. And the moment a prediction is decisively resolved — CONFIRMED
+with observed data you can quote, or REFUTED — and the mandatory evidence is in
+hand, STOP and conclude: further calls that cannot change the verdict have no value.
+
+""" + _DIAGNOSTIC_SCAFFOLD + """\
 Maximum 8 tool calls. Conclude with ONLY this JSON:
 {{
   "conclusion": "one paragraph — hypothesis confirmed or ruled out, and why",
@@ -706,6 +860,61 @@ def _detect_contradiction(branch_results: list[dict]) -> tuple[bool, list[dict]]
     return len(services) > 1, confirmed
 
 
+# ── Feature 5: value-of-information adaptive early-stop ───────────────────────
+
+def _voi_should_stop_branch(
+    conclusion: dict | None,
+    tools_called: set[str],
+    symptom: str,
+    corpus_lower: str,
+) -> bool:
+    """Deterministic VOI early-stop predicate. Returns True ONLY when the
+    hypothesis is DECISIVELY resolved AND the accuracy FLOOR is satisfied — so a
+    branch can end its tool loop instead of burning the remaining ceiling on
+    checks whose information value is ~zero. Otherwise returns False (keep
+    investigating). Pure and side-effect free.
+
+    It can NEVER cut accuracy, by construction:
+      FLOOR 1 — every mandatory tool for this symptom class must already have
+                been called (reuses verify_tool_coverage; never skips required
+                evidence such as logs/metrics).
+      FLOOR 2 — at least one falsifiable prediction must have been TESTED, i.e.
+                carry a decisive CONFIRMED or REFUTED verdict. A branch that has
+                not tested its predictions is never stopped.
+      TRACEABILITY — a CONFIRMED verdict counts only if its observed data traces
+                to the fetched corpus (no stopping on a fabricated confirmation).
+                A REFUTED prediction is itself decisive (the hypothesis is
+                falsified), so it licenses a stop directly.
+
+    Conservative default: anything short of the above (no conclusion yet,
+    coverage unmet, predictions untested, untraceable confirmation) → False.
+    """
+    if not isinstance(conclusion, dict):
+        return False   # no decisive verdict emitted yet → keep going
+
+    # FLOOR 1: mandatory-tool coverage for this symptom class.
+    from cloudctl.ai.guardrails import verify_tool_coverage
+    if not verify_tool_coverage(symptom, set(tools_called)).satisfied:
+        return False
+
+    preds = [p for p in (conclusion.get("predictions_tested") or [])
+             if isinstance(p, dict)]
+    verdicts = [str(p.get("verdict", "")).upper() for p in preds]
+
+    # FLOOR 2: at least one prediction decisively tested.
+    if "REFUTED" in verdicts:
+        return True   # hypothesis falsified — decisively resolved
+    if "CONFIRMED" not in verdicts:
+        return False  # nothing decisively tested → keep going
+
+    # Confirmed path: the confirming observation must be corpus-traceable.
+    for p in preds:
+        if str(p.get("verdict", "")).upper() == "CONFIRMED":
+            if _has_traceable_fact(str(p.get("observed", "")), corpus_lower):
+                return True
+    return False
+
+
 def _run_branch(
     hypothesis: dict,
     symptom: str,
@@ -719,6 +928,7 @@ def _run_branch(
         list_resources, get_service_config, tail_logs,
         query_metrics, search_cloudtrail, get_event_timeline,
         get_deployment_info, probe_permission, get_dependency_graph, aws_read,
+        get_traces,
     )
     from cloudctl.ai.guardrails import (
         sanitise_fetched_data, validate_tool_call, audit_log_tool_call,
@@ -749,7 +959,7 @@ def _run_branch(
             return json.dumps({"error": tc.reason})
 
         if tool_name == "list_resources":
-            raw = list_resources(tool_input["service_type"], profile, region)
+            raw = list_resources(tool_input.get("service_type", ""), profile, region)
         elif tool_name == "get_service_config":
             raw = get_service_config(
                 tool_input["service_type"], tool_input["resource_name"],
@@ -760,6 +970,7 @@ def _run_branch(
                 resource_hint=tool_input["resource_hint"],
                 minutes=int(tool_input.get("minutes") or minutes),
                 profile=profile, region=region, max_events=50,
+                filter_pattern=tool_input.get("filter_pattern", ""),
             )
         elif tool_name == "get_event_timeline":
             raw = get_event_timeline(tool_input["symptom"], profile, region, minutes)
@@ -779,6 +990,13 @@ def _run_branch(
                 profile=profile, region=region,
                 event_names=tool_input.get("event_names") or None,
                 minutes=int(tool_input.get("minutes") or 1440),
+            )
+        elif tool_name == "get_traces":
+            raw = get_traces(
+                profile=profile, region=region,
+                minutes=int(tool_input.get("minutes") or minutes),
+                resource_hint=tool_input.get("resource_hint") or None,
+                filter_expression=tool_input.get("filter_expression") or None,
             )
         elif tool_name == "get_deployment_info":
             raw = get_deployment_info(
@@ -817,7 +1035,10 @@ def _run_branch(
         try:
             parsed = json.loads(raw)
             sanitised = sanitise_fetched_data(parsed) if isinstance(parsed, dict) else parsed
-            branch_fetched[f"{tool_name}:{resource_name}"] = sanitised
+            # Unique per distinct call (see _evidence_key) + collision-guarded, so
+            # tail_logs/query_metrics/aws_read/probe_* results never overwrite one
+            # another — the whole verification stack keys off this store.
+            _store_unique(branch_fetched, _evidence_key(tool_name, tool_input), sanitised)
             raw = json.dumps(sanitised, default=str)
         except Exception:
             pass
@@ -838,7 +1059,16 @@ def _run_branch(
             _interned[key] = f"{tool_name}:{resource_name or len(_interned)}"
         return out
 
-    def _loop(system_text: str, init_messages: list, max_turns: int) -> dict:
+    def _voi_stop_check(conclusion: dict | None) -> bool:
+        """Feature 5: decisively-resolved-and-floor-met check, evaluated on the
+        evidence gathered SO FAR (the pending call, if any, is what we may skip)."""
+        corpus_lower = json.dumps(branch_fetched, default=str).lower()
+        return _voi_should_stop_branch(
+            conclusion, set(tools_called), symptom, corpus_lower
+        )
+
+    def _loop(system_text: str, init_messages: list, max_turns: int,
+              stop_check=None) -> dict:
         msgs = list(init_messages)
         for _ in range(max_turns):
             try:
@@ -870,6 +1100,20 @@ def _run_branch(
                 return {"conclusion": text[:400], "confidence": "LOW",
                         "confirmed": False, "phase2_needed": True, "evidence": []}
             if stop_reason == "tool_use":
+                # VOI early-stop: if the model has ALREADY narrated a decisive,
+                # traceable conclusion (floor met) alongside this tool request,
+                # the pending call has ~zero information value — end the branch
+                # now instead of consuming more of the ceiling. Conservative: only
+                # fires on a decisively-resolved verdict; otherwise dispatch as
+                # usual. Never runs before the floor, never exceeds the ceiling.
+                if stop_check is not None:
+                    _txt = next(
+                        (b["text"] for b in msg.get("content", []) if "text" in b), ""
+                    ).strip()
+                    _prelim = _extract_json(_txt, "conclusion") if _txt else None
+                    if isinstance(_prelim, dict) and stop_check(_prelim):
+                        _prelim["_voi_early_stop"] = True
+                        return _prelim
                 tool_results = []
                 for block in msg.get("content", []):
                     if "toolUse" in block:
@@ -882,8 +1126,12 @@ def _run_branch(
                         })
                 if tool_results:
                     msgs.append({"role": "user", "content": tool_results})
-        return {"conclusion": "hit turn limit", "confidence": "LOW",
-                "confirmed": False, "phase2_needed": True, "evidence": list(branch_fetched.keys())}
+        # Do NOT report the fetched-store KEYS as evidence: tool-key strings like
+        # "get_service_config:resource_name=x" are not observations, yet ≥3 of
+        # them wrongly qualified the branch as "well-evidenced" in calibration.
+        return {"conclusion": "hit turn limit without a conclusion", "confidence": "LOW",
+                "confirmed": False, "phase2_needed": True, "evidence": [],
+                "_incomplete": "branch exhausted its turn budget before concluding"}
 
     init_msg = [{"role": "user", "content": [{"text": (
         f"Symptom: {symptom}\n\nInvestigate: {h.reason}\nStart with: {h.focus}"
@@ -917,18 +1165,32 @@ def _run_branch(
         for i, p in enumerate(h.predictions)
     ) or "  (none stated — derive one falsifiable prediction yourself and test it)"
 
-    # Phase 2: operational investigation (max 7 turns — was 10)
+    # Phase 2: operational investigation (max 7 turns — was 10). Frame the kickoff
+    # by what Phase 1 actually found: if Phase 1 confirmed a structural issue, do
+    # NOT tell Phase 2 "config looked correct" (that contradicts the finding and
+    # invites the branch to walk back a correct structural diagnosis).
+    if p1.get("confirmed"):
+        p2_kickoff = (
+            f"Symptom: {symptom}\n\n"
+            f"Phase 1 found a STRUCTURAL issue: {p1.get('conclusion', '')}\n"
+            f"That finding stands. Now gather the mandatory operational evidence "
+            f"(logs, metrics) to corroborate it and test the predictions for: {h.reason}"
+        )
+    else:
+        p2_kickoff = (
+            f"Symptom: {symptom}\n\n"
+            f"Phase 1 found no structural config issue. Now investigate operational "
+            f"state to prove or disprove: {h.reason}"
+        )
     p2 = _loop(
         _PHASE2_SYSTEM.format(
             reason=h.reason, service=h.service,
             phase1_conclusion=p1.get("conclusion", "no config issues found"),
             predictions=predictions_text,
         ),
-        [{"role": "user", "content": [{"text": (
-            f"Symptom: {symptom}\n\n"
-            f"Config looked correct. Now investigate operational state for: {h.reason}"
-        )}]}],
+        [{"role": "user", "content": [{"text": p2_kickoff}]}],
         max_turns=7,
+        stop_check=_voi_stop_check,   # Feature 5: VOI early-stop (floor-gated)
     )
 
     # Enforce mandatory tool coverage — if required tools weren't called, force a
@@ -950,6 +1212,7 @@ def _run_branch(
                 f"then output your final JSON conclusion."
             )}]}],
             max_turns=4,
+            stop_check=_voi_stop_check,   # Feature 5: stop once coverage+floor met
         )
         if p3.get("evidence"):
             p2 = {
@@ -977,7 +1240,14 @@ def _run_branch(
         isinstance(p, dict) and p.get("verdict") == "CONFIRMED" for p in preds
     ):
         ev = p2.get("evidence") or p1.get("evidence") or []
-        if ev:
+        joined = " ".join(str(e) for e in ev[:3])
+        # Only manufacture a CONFIRMED prediction when the branch's own evidence
+        # carries at least one distinctive, corpus-traceable FACT (identifier,
+        # value, error code). A purely prose "confirmation" with no verifiable
+        # specific is an assertion, not a test — it must NOT uphold confirmed=true
+        # or feed a HIGH raise (the prose-confirmed loophole). Without a traceable
+        # fact the confirmation stays voided below.
+        if ev and _has_traceable_fact(joined, json.dumps(branch_fetched, default=str).lower()):
             preds.append({
                 "prediction": getattr(h, "focus", "") or getattr(h, "reason", "") or "branch hypothesis",
                 "verdict": "CONFIRMED",
@@ -1013,6 +1283,7 @@ def _run_branch(
         tools_called=tools_called,
         all_fetched=branch_fetched,
         predictions_tested=preds,
+        voi_early_stop=bool(p2.get("_voi_early_stop", False)),
     )
 
 
@@ -1041,9 +1312,24 @@ def investigate_node(state: GraphState) -> dict:
                 h = futures[f]
                 log.error("investigation branch %r failed, continuing with the "
                           "others: %s", getattr(h, "service", h), exc)
+                # Record a marker branch so synthesis KNOWS this hypothesis was
+                # left uninvestigated — otherwise it silently vanishes and the
+                # alternatives_considered step confabulates a ruling-out reason.
+                hyp = h if isinstance(h, dict) else {"service": str(h), "reason": "", "focus": ""}
+                branch_results.append({
+                    "hypothesis": hyp,
+                    "evidence": [],
+                    "conclusion": f"investigation branch did not complete ({type(exc).__name__}); "
+                                  "this hypothesis was NOT ruled out — it was never fully tested",
+                    "confidence": "LOW",
+                    "confirmed": False,
+                    "tools_called": [],
+                    "predictions_tested": [],
+                    "_branch_error": f"{type(exc).__name__}: {exc}"[:200],
+                })
                 continue
             branch_results.append(result.model_dump())
-            all_fetched_merged.update(result.all_fetched)
+            _merge_fetched(all_fetched_merged, result.all_fetched)
 
     return {"branch_results": branch_results, "all_fetched": all_fetched_merged}
 
@@ -1234,6 +1520,12 @@ Rule -1 — Prediction test (a veto, apply first):
   A hypothesis with zero CONFIRMED predictions cannot be the primary cause;
   it is at best "untested". Prefer the hypothesis with the most CONFIRMED
   discriminating predictions.
+  EXCEPTION — a directly observed STRUCTURAL absence (the resource does not
+  exist, a feature is explicitly disabled, a required binding is entirely
+  missing) is itself a confirmed observation and counts as strong support even
+  if the branch did not frame it as a formal "prediction" entry — do not
+  discount a directly observed structural fault merely because predictions_tested
+  is empty.
   A CONFIRMED prediction only counts if it is CAUSALLY RELEVANT:
     - A permanent property of the system — one that was equally true while
       the system was working — cannot be the cause of a new incident. If the
@@ -1252,13 +1544,20 @@ Rule 0 — Temporal filtering (apply before all other rules):
   The symptom may also include a [HH:MM UTC] timestamp indicating when the incident
   was FIRST OBSERVED. Branch evidence may include get_deployment_info results
   with a last_changed_at field indicating the most recent deployment.
-  If error events in the evidence have timestamps BEFORE or AT the same time as
-  last_changed_at, those errors were caused by the deployment itself (instance
-  or container replacement, image pulls, routing re-registration) — not by the
-  incident.
-  Only evidence with timestamps AFTER the deployment settled (last_changed_at
-  + ~5 minutes) is valid incident evidence. Discard earlier events as
-  deployment artifacts before applying rules 1-3.
+  A deployment is BOTH a source of transient noise AND the single most common
+  real root cause — do not conflate the two:
+    - TRANSIENT deployment artifacts: errors during the rollout window (instance
+      or container replacement, image pulls, routing re-registration) that STOP
+      once the rollout settles. These are noise; discount them.
+    - REGRESSION introduced by the change: errors that BEGIN at/just after
+      last_changed_at and PERSIST. A bad deploy is a leading root-cause
+      candidate, not noise — if the symptom coincides with a change and persists,
+      the change is a PRIME SUSPECT. Examine WHAT it changed (diff the new config
+      against peers or prior intent); never dismiss a persistent post-deploy
+      regression as "deployment churn".
+  So: discard errors that ended when the rollout settled; but treat errors that
+  started at the deploy and continue as valid incident evidence pointing at the
+  change itself. Events strictly BEFORE the deployment predate this change.
 
 Rule 1 — Behavioral consistency (evidence to weigh, not a verdict):
   behavioral_consistency reports the SHAPE of the anomaly across the fleet:
@@ -1432,6 +1731,19 @@ must fit well within the response limit or it will be truncated and discarded:
 _TRACE_STRUCT = set(".:/_-")
 
 
+def _distinctive_tokens(text: str) -> list[str]:
+    """Extract the DISTINCTIVE fact tokens from text — those carrying a digit
+    or a structural char (identifiers, ARNs, values, error codes). Purely
+    shape-based: no service, resource, or scenario vocabulary. Shared by the
+    anti-fabrication checks and the provenance builder so they agree on what
+    counts as a verifiable specific."""
+    tokens = re.findall(r"[a-z0-9][a-z0-9_.\-:/]{4,}", (text or "").lower())
+    return [
+        t for t in tokens
+        if any(c.isdigit() for c in t) or any(c in _TRACE_STRUCT for c in t)
+    ]
+
+
 def _observed_is_traceable(observed: str, corpus: str) -> tuple[bool, str]:
     """Anti-fabrication: a CONFIRMED prediction must quote data that actually
     exists in the fetched corpus. Fabrication lives in specific FACTS —
@@ -1441,11 +1753,7 @@ def _observed_is_traceable(observed: str, corpus: str) -> tuple[bool, str]:
     corpus and ignore plain words; requiring half of ALL words to match (the old
     rule) wrongly downgraded legitimate observations whose facts were real but
     surrounded by prose. Returns (traceable, downgrade_reason)."""
-    tokens = re.findall(r"[a-z0-9][a-z0-9_.\-:/]{4,}", (observed or "").lower())
-    distinctive = [
-        t for t in tokens
-        if any(c.isdigit() for c in t) or any(c in _TRACE_STRUCT for c in t)
-    ]
+    distinctive = _distinctive_tokens(observed)
     if not distinctive:
         # No specific fact was cited — nothing fabricatable to verify; do not
         # penalise a legitimately prose-phrased observation on this check.
@@ -1457,8 +1765,189 @@ def _observed_is_traceable(observed: str, corpus: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _has_traceable_fact(text: str, corpus: str) -> bool:
+    """True only when `text` carries at least one DISTINCTIVE fact (a token with
+    a digit or structural char — an identifier, value, error code) that actually
+    traces to the corpus. Unlike _observed_is_traceable (which passes pure prose
+    to avoid downgrading legitimate prose observations), this REQUIRES a verified
+    specific — used to gate manufacturing a CONFIRMED verdict out of prose."""
+    return any(t in corpus for t in _distinctive_tokens(text))
+
+
+# ── Provenance trail (deterministic claim → source grounding) ─────────────────
+
+def _salient_tokens(text: str) -> list[str]:
+    """Tokens a claim can be GROUNDED on: the distinctive fact tokens (see
+    _distinctive_tokens), cleaned of trailing sentence punctuation so prose like
+    "…exhausted." is not mistaken for an identifier, plus standalone multi-digit
+    numbers (comma-normalized, so "12,000" matches a raw "12000"). Entirely
+    shape-based — generic across any service or scenario."""
+    norm = re.sub(r"(?<=\d),(?=\d)", "", (text or "").lower())
+    out: list[str] = []
+    for t in _distinctive_tokens(norm):
+        t = t.rstrip("._-:/")
+        # Re-check distinctiveness after stripping trailing punctuation — a
+        # prose word that was "distinctive" only via its sentence period is not
+        # a verifiable fact.
+        if len(t) >= 5 and (any(c.isdigit() for c in t)
+                            or any(c in _TRACE_STRUCT for c in t)):
+            out.append(t)
+    for n in re.findall(r"\d{2,}(?:\.\d+)?", norm):
+        if not any(n in t for t in out):
+            out.append(n)
+    return list(dict.fromkeys(out))
+
+
+def _split_claims(report: dict) -> list[str]:
+    """The claims a report makes: each evidence[] item, plus each root_cause
+    sentence (deterministic sentence split — no model call). Deduplicated,
+    order-preserving."""
+    claims: list[str] = []
+    for e in report.get("evidence") or []:
+        if isinstance(e, str) and e.strip():
+            claims.append(e.strip())
+    for s in re.split(r"(?<=[.!?])\s+", str(report.get("root_cause") or "")):
+        s = s.strip()
+        if s:
+            claims.append(s)
+    return list(dict.fromkeys(claims))
+
+
+def _quote_from(entry_text: str, token: str, window: int = 45) -> str:
+    """Short verbatim snippet from the stored evidence value around the first
+    occurrence of the matched token."""
+    i = entry_text.find(token)
+    if i < 0:
+        return ""
+    start = max(0, i - window)
+    end = min(len(entry_text), i + len(token) + window)
+    snippet = re.sub(r"\s+", " ", entry_text[start:end]).strip()
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(entry_text) else ""
+    return (prefix + snippet + suffix)[:140]
+
+
+def _build_report_provenance(
+    report: dict, all_fetched: dict
+) -> tuple[list[dict], list[str]]:
+    """Deterministic grounding pass: map each reported claim to the all_fetched
+    entries (keyed by _evidence_key — the existing per-tool-call citation ids)
+    whose stored value actually contains the claim's salient tokens.
+
+    Generic by construction: matching is purely token-shape based (identifiers,
+    values, error codes appearing verbatim in the stored data) — no service,
+    tool, or scenario vocabulary. Claims with NO salient tokens are pure prose:
+    nothing fabricatable to verify, so they are neither cited nor flagged
+    (mirrors _observed_is_traceable). Claims WITH salient tokens that trace to
+    zero entries are returned as unsourced — a flag/weight for the confidence
+    path, never a hard cap. With an EMPTY corpus nothing can be distinguished
+    from a missing fetch, so nothing is flagged.
+
+    Returns (provenance_entries, unsourced_claims)."""
+    entries: dict[str, str] = {}
+    for k, v in (all_fetched or {}).items():
+        try:
+            entries[str(k)] = json.dumps(v, default=str).lower()
+        except Exception:  # noqa: BLE001
+            entries[str(k)] = str(v).lower()
+
+    provenance: list[dict] = []
+    unsourced: list[str] = []
+    if not entries:
+        return provenance, unsourced
+
+    for claim in _split_claims(report):
+        toks = _salient_tokens(claim)
+        if not toks:
+            continue  # pure prose — nothing verifiable either way
+        scored: list[tuple[int, str, list[str]]] = []
+        for key, text in entries.items():
+            matched = [t for t in toks if t in text]
+            if matched:
+                scored.append((len(matched), key, matched))
+        if not scored:
+            unsourced.append(claim)
+            continue
+        # Most-covering sources first; key as deterministic tie-break.
+        scored.sort(key=lambda s: (-s[0], s[1]))
+        top = scored[:3]
+        best_key, best_matched = top[0][1], top[0][2]
+        provenance.append({
+            "claim": claim,
+            "evidence_keys": [k for _, k, _ in top],
+            "quote": _quote_from(entries[best_key], best_matched[0]),
+        })
+    return provenance, unsourced
+
+
+# ── Observability gap: make the ABSENCE of tracing productive ─────────────────
+
+# Generic symptom-class detector. Latency / timeout / error-propagation is the
+# incident class distributed tracing localizes best. These are METHODOLOGY
+# keywords about the SHAPE of the symptom — not service or scenario knowledge —
+# so classification stays hint-free.
+_LATENCY_CLASS_RE = re.compile(
+    r"\b(slow(?:ness|ing|er)?|latenc|timing\s*out|time[\s-]*out(?:s|ing)?|timed\s*out|"
+    r"degrad|laggy?|hang(?:s|ing)?|stall(?:s|ing|ed)?|"
+    r"unrespons|delay(?:s|ed|ing)?|"
+    r"p9\d|p99|percentile|"
+    r"propagat|cascad|downstream|upstream|call\s*(?:graph|chain|path)|"
+    r"5\d\d\b|error\s*rate|errors?\s+(?:spread|propagat|cascad))",
+    re.IGNORECASE,
+)
+
+_TRACING_RECOMMENDATION = (
+    "No distributed tracing was available for this incident. Enabling AWS X-Ray "
+    "(or OpenTelemetry) active tracing on the services in the call path would "
+    "localize this class of failure to a single hop in future incidents."
+)
+
+
+def _is_latency_propagation_class(symptom: str) -> bool:
+    """True when the symptom reads as a latency / timeout / error-propagation
+    incident — the class distributed tracing localizes best. Purely keyword-shape
+    based; carries no service or scenario knowledge."""
+    return bool(_LATENCY_CLASS_RE.search(symptom or ""))
+
+
+def _traces_were_unavailable(all_fetched: dict) -> bool:
+    """True only when get_traces WAS called and EVERY call reported
+    available=false. If tracing was never attempted, or any call returned data,
+    this is False — so the recommendation never fires on traces-available runs
+    and never claims tracing is absent when it was simply not queried."""
+    saw_call = False
+    for key, val in (all_fetched or {}).items():
+        if not str(key).startswith("get_traces"):
+            continue
+        saw_call = True
+        # A dict result with available truthy means tracing DID return data.
+        if isinstance(val, dict) and val.get("available"):
+            return False
+    return saw_call
+
+
+def _maybe_add_tracing_recommendation(report: dict, symptom: str,
+                                      all_fetched: dict) -> dict:
+    """Remediation-only addendum: when the incident is latency/propagation class
+    AND tracing was queried but unavailable, append ONE generic observability
+    recommendation. Never touches root_cause or confidence, never duplicates,
+    and never fires when traces were available or the symptom is another class."""
+    if not _is_latency_propagation_class(symptom):
+        return report
+    if not _traces_were_unavailable(all_fetched):
+        return report
+    steps = list(report.get("remediation_steps") or [])
+    if any("distributed tracing was available" in str(s) for s in steps):
+        return report   # already present — don't spam
+    steps.append(_TRACING_RECOMMENDATION)
+    report["remediation_steps"] = steps
+    return report
+
+
 def _calibrate_confidence(all_branch_results: list[dict],
-                          agent_conf: str) -> tuple[str, str | None]:
+                          agent_conf: str,
+                          chosen_root_cause: str = "",
+                          arbitrated: bool = False) -> tuple[str, str | None]:
     """VERDICT confidence calibration. Pure function so the policy is
     unit-testable without a live model.
 
@@ -1495,14 +1984,41 @@ def _calibrate_confidence(all_branch_results: list[dict],
     if not standing:
         return "LOW", "no branch confirmed a prediction or produced substantial evidence"
 
+    def _pick_winner(cands: list[dict]) -> dict:
+        # Calibrate the branch the FINAL report actually selected — matched by the
+        # branch's service name and its distinctive evidence tokens appearing in
+        # the chosen root cause — not an arbitrary as_completed() ordering. This
+        # stops the HIGH-raise / LOW-cap from being computed off a branch other
+        # than the one whose cause shipped.
+        rc = (chosen_root_cause or "").lower()
+        if rc:
+            best, best_score = None, 0
+            for br in cands:
+                svc = str(br.get("hypothesis", {}).get("service", "")).lower()
+                score = 2 if (svc and len(svc) >= 3 and svc in rc) else 0
+                for e in (br.get("evidence") or [])[:5]:
+                    toks = re.findall(r"[a-z0-9][a-z0-9_.\-:/]{4,}", str(e).lower())
+                    if any((any(c.isdigit() for c in t) or any(c in _TRACE_STRUCT for c in t))
+                           and t in rc for t in toks):
+                        score += 1
+                        break
+                if score > best_score:
+                    best, best_score = br, score
+            if best is not None:
+                return best
+        return cands[0]
+
     # Genuinely unresolved — the analysis could not separate ≥2 competing causes
     # (two verified-but-contradicting, or two well-evidenced and neither verified).
-    # This is the analysis's OWN uncertainty, not caution.
-    if len(confirmed) >= 2 or (not confirmed and len(evidenced) >= 2):
+    # This is the analysis's OWN uncertainty, not caution. EXCEPT when an
+    # arbitration branch was run to resolve the contradiction: it produced a
+    # ruling, so defer to the chosen winner rather than permanently capping every
+    # resolved contest at MEDIUM.
+    if not arbitrated and (len(confirmed) >= 2 or (not confirmed and len(evidenced) >= 2)):
         return ("MEDIUM" if _order.get(agent_conf, 0) > 1 else agent_conf,
                 "two hypotheses retain substantial/verified support — unresolved")
 
-    winner = standing[0]
+    winner = _pick_winner(standing)
 
     # The winning hypothesis refuted its OWN prediction — its conclusion is unsafe.
     if _pred_stats(winner)[1] > 0:
@@ -1573,7 +2089,7 @@ def synthesize_node(state: GraphState) -> dict:
                 state["session_id"],
             )
             all_branch_results.append(arb_result.model_dump())
-            all_fetched_merged.update(arb_result.all_fetched)
+            _merge_fetched(all_fetched_merged, arb_result.all_fetched)
             arbitration_note = (
                 f"\n\nARBITRATION: A 4th branch re-investigated the contradiction. "
                 f"It found: {arb_result.conclusion[:300]}"
@@ -1589,14 +2105,32 @@ def synthesize_node(state: GraphState) -> dict:
     category = discrimination.get("cause_category", "")
     category_conf = discrimination.get("cause_category_confidence", "")
     if constraint:
-        discrimination_block = (
-            f"CAUSAL DISCRIMINATION RESULT (cause_category={category}, "
-            f"confidence={category_conf}):\n"
-            f"BINDING CONSTRAINT: {constraint}\n"
-            f"You MUST respect this constraint when selecting the root cause. "
-            f"Do not attribute an application_code cause to an AWS infrastructure "
-            f"resource, and vice versa."
-        )
+        # Gate how binding the constraint is on ITS OWN confidence. A LOW /
+        # unclear category call is one weak signal, not a veto — treating it as
+        # binding let a sparse-log category guess override a correct root cause.
+        # And even a HIGH constraint must yield to a directly observed failing
+        # interaction (a specific observation outweighs a category inference),
+        # which also lets a reinvestigation's new evidence win over a stale call.
+        _binding = str(category_conf).upper() in ("HIGH", "MEDIUM")
+        if _binding:
+            discrimination_block = (
+                f"CAUSAL DISCRIMINATION RESULT (cause_category={category}, "
+                f"confidence={category_conf}):\n"
+                f"CONSTRAINT: {constraint}\n"
+                f"Respect this constraint when selecting the root cause UNLESS a "
+                f"branch presents directly observed evidence (a specific observed "
+                f"failing interaction with a named resource) that contradicts it — "
+                f"a direct observation outweighs a category inference. Absent such "
+                f"evidence, do not attribute the cause to a different category."
+            )
+        else:
+            discrimination_block = (
+                f"CAUSAL DISCRIMINATION SIGNAL (cause_category={category}, "
+                f"confidence={category_conf} — low/uncertain, ADVISORY ONLY):\n"
+                f"{constraint}\n"
+                f"This category call is low-confidence; treat it as one weak signal, "
+                f"not a constraint. Let directly observed branch evidence decide."
+            )
     else:
         discrimination_block = ""
 
@@ -1647,12 +2181,33 @@ def synthesize_node(state: GraphState) -> dict:
         f"{arbitration_note}"
     )
 
-    resp = bedrock.converse(
-        modelId=_MODEL,
-        system=_sys(system),
-        messages=[{"role": "user", "content": [{"text": user_content}]}],
-        inferenceConfig={"maxTokens": 2500, "temperature": 0},
-    )
+    try:
+        resp = bedrock.converse(
+            modelId=_MODEL,
+            system=_sys(system),
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 2500, "temperature": 0},
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Do NOT crash a fully-completed investigation on a synthesis-call error
+        # (exhausted-retry throttle, transient network). Assemble a best-effort
+        # report from the strongest branch so the gathered evidence isn't lost.
+        best = max(
+            all_branch_results,
+            key=lambda br: (bool(br.get("confirmed")), len(br.get("evidence") or [])),
+            default={},
+        )
+        return {"final_report": {
+            "root_cause": (best.get("conclusion")
+                           or f"Synthesis step failed ({type(exc).__name__}); "
+                              "reporting strongest branch finding."),
+            "evidence": best.get("evidence", []),
+            "remediation_steps": [],
+            "severity": "UNKNOWN",
+            "confidence": "LOW",
+            "resources_investigated": [],
+            "_synthesis_error": f"{type(exc).__name__}: {exc}"[:200],
+        }, "all_fetched": all_fetched_merged, "branch_results": all_branch_results}
     text = resp["output"]["message"]["content"][0]["text"].strip()
     result = _extract_json(text, "root_cause")
     if not result or not isinstance(result, dict):
@@ -1697,11 +2252,21 @@ def synthesize_node(state: GraphState) -> dict:
     # VERDICT confidence calibration — confidence follows prediction outcomes,
     # not branch agreement (see _calibrate_confidence for the policy).
     _conf, _cal_note = _calibrate_confidence(
-        all_branch_results, result.get("confidence", "LOW")
+        all_branch_results, result.get("confidence", "LOW"),
+        chosen_root_cause=result.get("root_cause", ""),
+        arbitrated=bool(arbitration_note),
     )
     result["confidence"] = _conf
     if _cal_note:
         result["confidence_calibration"] = _cal_note
+
+    # Provenance trail: deterministically map every reported claim to the
+    # fetched-corpus entries that actually contain its facts. (Rebuilt once more
+    # in debug_incident_graph against the FINAL report/corpus, since critique
+    # may revise claims and the observation is folded into the corpus there.)
+    _prov, _unsourced = _build_report_provenance(result, all_fetched_merged)
+    result["provenance"] = _prov
+    result["unsourced_claims"] = _unsourced
 
     # Propagate arbitration fetched data back into state
     if all_fetched_merged != state.get("all_fetched"):
@@ -1749,14 +2314,17 @@ Challenge the conclusion with these questions:
    A root cause that would affect more, less, or different things than the
    symptom shows is WRONG regardless of how much evidence supports it.
 
-2. DEPLOYMENT NOISE TEST — Is the conclusion anchored to events caused by our OWN
-   infrastructure management (deploys, rollouts, instance or container replacement,
-   image updates, routing re-registration) rather than a real fault? These events
-   appear after EVERY deployment and are almost never the actual root cause.
+2. DEPLOYMENT NOISE TEST — Is the conclusion anchored to the MECHANICS of our OWN
+   infrastructure management (instance or container replacement, image pulls,
+   routing re-registration) rather than a real fault? That churn appears after
+   EVERY deployment and is rarely the cause.
    KEY RULE: Compare evidence timestamps against get_deployment_info's last_changed_at.
-   If the error events happened at the same time as the last deployment AND the symptom
-   first_observed timestamp is AFTER those events, the errors are deployment artifacts,
-   not the incident cause. The incident started after deployment settled.
+   Transient errors that occur DURING the rollout and STOP once it settles are
+   artifacts. BUT do not over-apply this: a bad deployment is the most common real
+   root cause. If the symptom BEGAN at the deployment and PERSISTS, the change
+   itself is the prime suspect — the correct verdict is to find WHAT changed
+   (diff config against peers/prior intent), NOT to dismiss it as deployment
+   noise. Only dismiss errors that demonstrably ended when the rollout finished.
 
 3. DEPENDENCY COVERAGE TEST — For the operation the symptom describes, did any
    branch investigate each resource that operation depends on (its datastore,
@@ -1850,12 +2418,17 @@ def critique_node(state: GraphState) -> dict:
         f"looked at — anything the conclusion names that is NOT here is "
         f"fabricated):\n{inventory_text}"
     )
-    resp = bedrock.converse(
-        modelId=_CRITIC_MODEL,
-        system=_sys(_CRITIQUE_SYSTEM),
-        messages=[{"role": "user", "content": [{"text": user_content}]}],
-        inferenceConfig={"maxTokens": 600, "temperature": 0},
-    )
+    try:
+        resp = bedrock.converse(
+            modelId=_CRITIC_MODEL,
+            system=_sys(_CRITIQUE_SYSTEM),
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 600, "temperature": 0},
+        )
+    except Exception:  # noqa: BLE001
+        # A critique-call failure must not crash a completed run — ship the
+        # synthesized report unchanged (critique is a refinement layer).
+        return {"final_report": report, "critique_feedback": ""}
     text = resp["output"]["message"]["content"][0]["text"].strip()
     critique = _extract_json(text, "verdict")
 
@@ -1881,6 +2454,231 @@ def critique_node(state: GraphState) -> dict:
             }
 
     return {"final_report": report, "critique_feedback": ""}
+
+
+# ── Node 4b: falsify (Feature 4 — adversarial falsification gate) ─────────────
+#
+# Before the verdict ships, actively try to DISPROVE the leading root cause using
+# the SAME evidence. This is deliberately conservative — a genuine adversarial
+# pass that can pass OR fail, but never blindly flips the answer:
+#   survived            → verdict untouched (the common, correct outcome).
+#   not survived + budget→ ONE targeted reinvestigation on the specific
+#                          contradiction (shares critique's round bound — the
+#                          alternative only wins if that reinvestigation returns
+#                          CONFIRMED evidence and synthesize then picks it).
+#   not survived + none  → weaken confidence ONE step (never a hard cap) and
+#                          record the surviving doubt in alternatives_considered;
+#                          the original root cause STANDS.
+# Runs on the decorrelated _CRITIC_MODEL so it does not share the investigator's
+# blind spots, and fails open (any model error ⇒ treated as survived).
+
+_FALSIFICATION_SYSTEM = """\
+You are an adversarial reviewer performing a FALSIFICATION pass on an incident
+diagnosis before it ships. You did not run the investigation. Your job is NOT to
+confirm the conclusion — it is to genuinely try to DISPROVE it using ONLY the
+evidence already gathered.
+
+Ask two questions, answered strictly from the fetched evidence provided:
+  1. CONTRADICTION — Is there anything in the evidence INCONSISTENT with the
+     stated root cause: a measurement, log line, status, or timestamp the root
+     cause cannot explain, or something that should be present if the root cause
+     were true but is absent where it was actually checked?
+  2. BETTER FIT — Does the SAME evidence support a DIFFERENT explanation at
+     least as well as, or better than, the stated one?
+
+Rules that keep this honest:
+  - Argue only from evidence that is actually present. Do NOT invent data, and
+    do NOT speculate about signals nobody observed.
+  - "No contradicting evidence found" is a legitimate and COMMON result. If the
+    evidence is consistent with the root cause and no alternative fits better,
+    the diagnosis SURVIVES — say so plainly. Do NOT manufacture a doubt to seem
+    rigorous.
+  - A weaker or equally-weak alternative does NOT count. Surface an alternative
+    only if the evidence supports it AS WELL OR BETTER than the stated cause.
+  - Judge reasoning and fit, not vocabulary. Name no fix and no remediation.
+
+Respond ONLY with this JSON (no markdown, no extra text):
+{"survived": true | false,
+ "contradicting_evidence": ["a specific fact from the evidence the root cause cannot explain", ...],
+ "stronger_alternative": {"hypothesis": "the alternative the same evidence supports as well or better", "why": "one sentence grounded in the evidence"} | null,
+ "reasoning": "one or two sentences: why it survived, or exactly what it failed to withstand"}
+
+survived MUST be false if and only if you listed real contradicting_evidence OR a
+genuine stronger_alternative. If both are empty, survived MUST be true.
+"""
+
+
+def _run_falsification(state: GraphState, report: dict) -> dict:
+    """Decorrelated adversarial model call. Fails open: any error or unparseable
+    response is treated as 'survived' (inconclusive) so the gate never derails a
+    completed investigation."""
+    try:
+        bedrock = _make_bedrock(state["profile"], state["region"])
+        corpus = json.dumps(state.get("all_fetched") or {}, default=str)[:12000]
+        user_content = (
+            f"Symptom: {state.get('symptom', '')}\n\n"
+            f"Diagnosis under test:\n"
+            f"  root_cause: {report.get('root_cause', '')}\n"
+            f"  evidence: {json.dumps(report.get('evidence', []), default=str)}\n\n"
+            f"FETCHED EVIDENCE (the ONLY data you may argue from):\n{corpus}"
+        )
+        resp = bedrock.converse(
+            modelId=_CRITIC_MODEL,
+            system=_sys(_FALSIFICATION_SYSTEM),
+            messages=[{"role": "user", "content": [{"text": user_content}]}],
+            inferenceConfig={"maxTokens": 700, "temperature": 0},
+        )
+        text = resp["output"]["message"]["content"][0]["text"].strip()
+        parsed = _extract_json(text, "survived")
+        if isinstance(parsed, dict) and "survived" in parsed:
+            return parsed
+        # No parseable verdict — do NOT invent a failure; treat as survived.
+        return {"survived": True, "contradicting_evidence": [],
+                "stronger_alternative": None,
+                "reasoning": "falsification returned no parseable verdict; treated as survived",
+                "_inconclusive": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"survived": True, "contradicting_evidence": [],
+                "stronger_alternative": None,
+                "reasoning": f"falsification unavailable ({type(exc).__name__}); treated as survived",
+                "_error": True}
+
+
+def _weaken_confidence_one_step(report: dict, contradiction: list,
+                                alt: dict | None, reasoning: str) -> dict:
+    """Weaken confidence by exactly ONE step (HIGH→MEDIUM→LOW, never below LOW)
+    and record the surviving doubt in alternatives_considered. Matches the
+    weaken-not-cap philosophy of enforce_confidence — never a hard cap, never a
+    forced floor, and the root cause is left STANDING."""
+    _order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    _inv = {0: "LOW", 1: "MEDIUM", 2: "HIGH"}
+    out = dict(report)
+    cur = out.get("confidence", "LOW")
+    new = _inv[max(0, _order.get(cur, 0) - 1)]
+    if new != cur:
+        out["confidence"] = new
+        out["confidence_override_reason"] = (
+            f"Confidence weakened from {cur} to {new}: an adversarial "
+            f"falsification pass surfaced a doubt the reinvestigation budget "
+            f"could not resolve. The root cause STANDS; the doubt is recorded."
+        )
+    alts = list(out.get("alternatives_considered") or [])
+    if isinstance(alt, dict) and alt.get("hypothesis"):
+        alts.append({
+            "hypothesis": str(alt.get("hypothesis")),
+            "reason": str(alt.get("why") or reasoning or
+                          "surfaced by falsification; not confirmed"),
+            "verdict": "unresolved_falsification_doubt",
+        })
+    elif contradiction:
+        alts.append({
+            "hypothesis": "evidence inconsistent with the root cause remains unresolved",
+            "reason": "; ".join(str(c) for c in contradiction[:3]) or reasoning,
+            "verdict": "unresolved_falsification_doubt",
+        })
+    out["alternatives_considered"] = alts
+    out["_falsification"] = {
+        "survived": False,
+        "resolved": False,
+        "reasoning": str(reasoning)[:400],
+    }
+    return out
+
+
+def _falsification_focus(contradiction: list, alt: dict | None,
+                         reasoning: str) -> str:
+    """Build the targeted reinvestigation focus from what the falsification
+    surfaced. Echoes evidence-grounded text only — it introduces no service or
+    scenario knowledge of its own."""
+    parts: list[str] = []
+    if isinstance(alt, dict) and alt.get("hypothesis"):
+        why = str(alt.get("why") or "").strip()
+        parts.append(
+            f"The evidence may support a different cause: {alt.get('hypothesis')}."
+            + (f" {why}" if why else "")
+        )
+    if contradiction:
+        parts.append(
+            "Evidence the current root cause does not explain: "
+            + "; ".join(str(c) for c in contradiction[:3])
+        )
+    if not parts and reasoning:
+        parts.append(str(reasoning))
+    if not parts:
+        return ""
+    return (
+        "Resolve this contradiction to the current diagnosis. "
+        + " ".join(parts)
+        + " Gather the specific data that would CONFIRM or REFUTE it, and "
+          "determine which cause the evidence actually supports."
+    )
+
+
+def _falsification_outcome(report: dict, falsification: dict,
+                           critique_round: int, budget_bound: int = 1) -> dict:
+    """Pure, conservative wiring of a falsification verdict → GraphState updates.
+    Never flips root_cause; never hard-caps confidence. Testable without a model.
+
+    - survived (or inconclusive, or no substantive finding) → untouched.
+    - not survived + budget remains → ONE targeted reinvestigation (via the
+      SHARED critique_feedback channel and round bound — not a new loop).
+    - not survived + no budget → weaken one step + record doubt; root cause stands.
+    """
+    survived = falsification.get("survived", True)
+    if survived is None:
+        survived = True
+    contradiction = falsification.get("contradicting_evidence") or []
+    alt = falsification.get("stronger_alternative") or None
+    reasoning = falsification.get("reasoning", "")
+
+    # Conservative guard: a non-survival with NOTHING concrete behind it is
+    # treated as inconclusive-survive, so a vague or rubber-stamp "failure" can
+    # never over-correct a right answer.
+    substantive = bool(contradiction) or bool(
+        isinstance(alt, dict) and alt.get("hypothesis")
+    )
+    if survived or not substantive:
+        out = dict(report)
+        out["_falsification"] = {
+            "survived": True,
+            "reasoning": str(reasoning)[:400],
+        }
+        return {"final_report": out, "critique_feedback": ""}
+
+    # Not survived, with substance. Prefer to RESOLVE it if budget remains.
+    if critique_round < budget_bound:
+        focus = _falsification_focus(contradiction, alt, reasoning)
+        if focus:
+            out = dict(report)
+            out["_falsification"] = {
+                "survived": False,
+                "resolved": "pending_reinvestigation",
+                "reasoning": str(reasoning)[:400],
+            }
+            return {"final_report": out, "critique_feedback": focus}
+
+    # No budget (or nothing actionable to reinvestigate) → weaken + record.
+    weakened = _weaken_confidence_one_step(report, contradiction, alt, reasoning)
+    return {"final_report": weakened, "critique_feedback": ""}
+
+
+def falsify_node(state: GraphState) -> dict:
+    report = state.get("final_report") or {}
+
+    # Compose, don't fight: if critique already claimed the (single) round for a
+    # reinvestigation, defer entirely — its decision owns the budget this pass.
+    if state.get("critique_feedback"):
+        return {}
+
+    # Nothing to falsify: a degenerate/failed report or one with no evidence to
+    # argue from. Skip the call rather than manufacture a verdict.
+    if not (report.get("root_cause") or "").strip() or not report.get("evidence"):
+        return {}
+
+    falsification = _run_falsification(state, report)
+    return _falsification_outcome(
+        report, falsification, state.get("critique_round", 0)
+    )
 
 
 # ── Node 5: reinvestigate (Feature 1 — critique feedback loop) ────────────────
@@ -1913,7 +2711,8 @@ def reinvestigate_node(state: GraphState) -> dict:
             session_id=state["session_id"],
         )
         new_branches = list(state["branch_results"]) + [result.model_dump()]
-        new_fetched = {**state.get("all_fetched", {}), **result.all_fetched}
+        new_fetched = dict(state.get("all_fetched", {}))
+        _merge_fetched(new_fetched, result.all_fetched)
     except Exception:
         new_branches = list(state["branch_results"])
         new_fetched = dict(state.get("all_fetched", {}))
@@ -1928,8 +2727,10 @@ def reinvestigate_node(state: GraphState) -> dict:
 
 # ── Graph construction ─────────────────────────────────────────────────────────
 
-def _after_critique(state: GraphState) -> str:
-    """Route after critique: reinvestigate once if critique flagged insufficient evidence."""
+def _after_falsify(state: GraphState) -> str:
+    """Route after the critique→falsify gate. Reinvestigate at most once, whether
+    the trigger came from critique OR the falsification gate — they SHARE the
+    single-round budget (critique_round), so this bound cannot be doubled."""
     if state.get("critique_round", 0) >= 1:
         return END
     if state.get("critique_feedback", ""):
@@ -1954,6 +2755,7 @@ def _build_graph():
     workflow.add_node("clarify",           clarify_node)              # VERDICT HITL
     workflow.add_node("synthesize",        synthesize_node)
     workflow.add_node("critique",          critique_node)
+    workflow.add_node("falsify",           falsify_node)             # Feature 4
     workflow.add_node("reinvestigate",     reinvestigate_node)
 
     # Observe measures the symptom first; triage hypothesizes from measurement.
@@ -1975,8 +2777,13 @@ def _build_graph():
     workflow.add_edge("discriminate", "clarify")
     workflow.add_edge("clarify", "synthesize")
     workflow.add_edge("synthesize", "critique")
+    # Feature 4: critique → falsify (adversarial gate) → conditional reinvestigate.
+    # Falsify defers to critique when critique already asked to reinvestigate, so
+    # the two gates share ONE reinvestigation round (critique_round) rather than
+    # each opening a loop of their own.
+    workflow.add_edge("critique", "falsify")
     workflow.add_conditional_edges(
-        "critique", _after_critique,
+        "falsify", _after_falsify,
         {"reinvestigate": "reinvestigate", END: END},
     )
     workflow.add_edge("reinvestigate", "synthesize")
@@ -2029,7 +2836,9 @@ def debug_incident_graph(
     symptom: str,
     profile: str | None,
     region: str = "us-east-1",
-    minutes: int = 10,
+    minutes: int = 60,   # was 10 — a 10-min window made any incident older than
+                         # ~10 minutes invisible to logs/the survey (0 events →
+                         # "cannot reproduce" on a live, ongoing incident).
     max_turns: int = 24,  # kept for interface compatibility
 ) -> tuple[str, dict]:
     """
@@ -2112,16 +2921,22 @@ def debug_incident_graph(
         report from the last checkpoint rather than blocking or overspending.
         Per-call timeouts mean the abandoned worker thread finishes shortly."""
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
-            fut = _ex.submit(graph.invoke, arg, invoke_config)
-            try:
-                return fut.result(timeout=_ceiling_s)
-            except concurrent.futures.TimeoutError:
-                _stop_reason["why"] = f"exceeded the {_ceiling_s}s time ceiling"
-                return None
-            except BudgetExceededError as exc:
-                _stop_reason["why"] = str(exc)
-                return None
+        # Manually managed executor: a `with` block calls shutdown(wait=True) on
+        # exit, which JOINS the still-running graph worker and defeats the whole
+        # ceiling (the process blocks until the graph finishes anyway). Detach the
+        # worker on breach instead — per-call boto/Bedrock timeouts bound its life.
+        _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = _ex.submit(graph.invoke, arg, invoke_config)
+        try:
+            return fut.result(timeout=_ceiling_s)
+        except concurrent.futures.TimeoutError:
+            _stop_reason["why"] = f"exceeded the {_ceiling_s}s time ceiling"
+            return None
+        except BudgetExceededError as exc:
+            _stop_reason["why"] = str(exc)
+            return None
+        finally:
+            _ex.shutdown(wait=False, cancel_futures=True)
 
     final_state = _invoke_bounded(initial_state)
     if final_state is None:
@@ -2171,6 +2986,15 @@ def debug_incident_graph(
     parsed = final_state["final_report"]
     all_fetched = final_state.get("all_fetched", {})
 
+    # Fold the observe node's MEASUREMENTS into the grounding corpus. The observe
+    # node reads real metrics/logs but stored nothing in all_fetched, so a
+    # conclusion citing an onset/measurement seen only during observation failed
+    # the grounding/hallucination checks and was wrongly downgraded. Including it
+    # makes those facts traceable. (Kept under a clearly-marked key.)
+    _obs = final_state.get("observation") or {}
+    if _obs and isinstance(all_fetched, dict) and "_observation" not in all_fetched:
+        all_fetched = {**all_fetched, "_observation": _obs}
+
     # Diagnostics: record what the VERDICT/PRISM layers actually produced so a
     # silent no-op (empty observation / log_insights) is visible in results.
     parsed["_verdict_layers"] = {
@@ -2214,6 +3038,14 @@ def debug_incident_graph(
         except Exception:  # noqa: BLE001
             pass
 
+    # Rebuild the provenance trail against the FINAL report and corpus: the
+    # critique node may have revised root_cause/evidence after synthesis, and
+    # the observation measurements were only folded into the corpus above.
+    # Deterministic and cheap, so recomputing beats shipping a stale trail.
+    _prov, _unsourced = _build_report_provenance(parsed, all_fetched)
+    parsed["provenance"] = _prov
+    parsed["unsourced_claims"] = _unsourced
+
     hal_report = detect_hallucinations(parsed, all_fetched)
     parsed = enforce_confidence(parsed, all_fetched, hal_report)
     # Safety net: never let a "this alert is a false positive / not a real fault"
@@ -2237,6 +3069,14 @@ def debug_incident_graph(
             f"Confidence downgraded: conclusion references identifiers not found "
             f"in evidence — {grounding.reason}"
         )
+
+    # Observability gap (Feature 2 addendum): make the ABSENCE of tracing
+    # productive. When this is a latency/timeout/error-propagation-class symptom
+    # AND get_traces was queried but returned no data, append ONE generic
+    # observability recommendation to remediation. Remediation-only: it does not
+    # touch root_cause or confidence, and it never fires when traces were
+    # available or the symptom is a different class.
+    parsed = _maybe_add_tracing_recommendation(parsed, symptom, all_fetched)
 
     parsed = redact_output(parsed)
 

@@ -398,6 +398,14 @@ def query_metrics(
             if not pts:
                 return None
             values = [_v(p) for p in pts]
+            # Downsample a timestamped series (≤24 points) so a STEP-CHANGE and
+            # its ONSET time are visible — aggregates alone hide when a metric
+            # moved, yet the temporal rules downstream need onset. Bounded size.
+            step = max(1, len(pts) // 24)
+            series = [
+                {"t": p["Timestamp"].isoformat(), "v": _v(p)}
+                for p in pts[::step]
+            ][:24]
             return {
                 "unit":       pts[0].get("Unit", ""),
                 "datapoints": len(pts),
@@ -407,6 +415,9 @@ def query_metrics(
                 "min":        min(values),
                 "max":        max(values),
                 "avg":        sum(values) / len(values),
+                "first_time": pts[0]["Timestamp"].isoformat(),
+                "last_time":  pts[-1]["Timestamp"].isoformat(),
+                "series":     series,
             }
 
         now = _dt.datetime.now(_dt.timezone.utc)
@@ -439,7 +450,18 @@ def query_metrics(
                     out["avg_vs_baseline_delta"] = current["avg"] - baseline["avg"]
         return json.dumps(out, separators=(",", ":"))
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"query_metrics failed: {type(exc).__name__}"})
+        # Surface the AWS error CODE (AccessDenied vs ValidationError vs
+        # throttling), not just the Python exception type — the model cannot tell
+        # "no permission" from "wrong dimensions" from a bare "ClientError".
+        code = ""
+        try:
+            code = exc.response["Error"]["Code"]  # botocore ClientError
+        except Exception:  # noqa: BLE001
+            code = type(exc).__name__
+        return json.dumps({
+            "error": f"query_metrics failed: {code}",
+            "detail": str(exc)[:200],
+        })
 
 
 @recordable("get_service_config")
@@ -729,23 +751,126 @@ def _list_resources_for_type(fetcher, service_type: str) -> list[str]:
         return []
 
 
+def _enumerate_resources(session, max_total: int = 500) -> list[dict]:
+    """Enumerate deployed resources account-wide, GENERICALLY — no curated
+    service list. Same pattern get_dependency_graph uses:
+      (a) AWS Resource Explorer — one query returns resources across ALL types
+          (needs an index; skipped gracefully if none is configured).
+      (b) Resource Groups Tagging API — every taggable resource in the region.
+    Bounded (hard page/total caps) so it cannot hang. Returns
+    [{"arn","service","name"}, ...] deduplicated on (service, name)."""
+    resources: list[dict] = []
+    seen: set = set()
+
+    def _parse_arn(arn: str):
+        parts = arn.split(":", 5)
+        if len(parts) < 6:
+            return None
+        ns, rest = parts[2], parts[5]
+        name = rest.split("/")[-1] if "/" in rest else rest.split(":")[-1]
+        return ns, name
+
+    def _add(arn: str, ns: str, name: str) -> None:
+        if not name:
+            return
+        key = (ns, name)
+        if key in seen:
+            return
+        seen.add(key)
+        resources.append({"arn": arn, "service": ns, "name": name})
+
+    # (a) Resource Explorer (bounded pagination)
+    try:
+        rex = session.client("resource-explorer-2")
+        token = None
+        for _ in range(10):
+            kw = {"QueryString": "*", "MaxResults": 100}
+            if token:
+                kw["NextToken"] = token
+            resp = rex.search(**kw)
+            for r in resp.get("Resources", []):
+                pa = _parse_arn(r.get("Arn", ""))
+                if pa:
+                    _add(r["Arn"], *pa)
+            token = resp.get("NextToken")
+            if not token or len(resources) >= max_total:
+                break
+    except Exception:  # noqa: BLE001
+        pass   # no index / not enabled — fall back to tagging
+
+    # (b) Resource Groups Tagging API (bounded)
+    try:
+        tagging = session.client("resourcegroupstaggingapi")
+        paginator = tagging.get_paginator("get_resources")
+        for page in paginator.paginate(PaginationConfig={"MaxItems": max_total}):
+            for r in page.get("ResourceTagMappingList", []):
+                pa = _parse_arn(r.get("ResourceARN", ""))
+                if pa:
+                    _add(r["ResourceARN"], *pa)
+            if len(resources) >= max_total:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+
+    return resources
+
+
 @recordable("list_resources")
 def list_resources(
-    service_type: str,
-    profile: str | None,
-    region: str,
+    service_type: str = "",
+    profile: str | None = None,
+    region: str = "us-east-1",
 ) -> str:
-    """List resource names for a service type so users can find exact names."""
+    """Discover resource names GENERICALLY (Resource Explorer → Tagging API).
+
+    service_type, if given, is used only as a FILTER over the generic results
+    (matched against the resource's service namespace or name) — NOT as a router
+    to a per-service lister, so discovery is never bounded by a maintained list.
+    """
     session = _make_session(profile, region)
-    from cloudctl.debug.fetcher import DebugFetcher
-    fetcher = DebugFetcher(session)
-    names   = _list_resources_for_type(fetcher, service_type)
-    return json.dumps({
-        "service_type": service_type,
-        "region":       region,
-        "count":        len(names),
-        "resources":    names,
-    }, separators=(",", ":"))
+    resources = _enumerate_resources(session)
+
+    filt = (service_type or "").strip().lower()
+    if filt:
+        matched = [
+            r for r in resources
+            if filt in r["service"].lower() or filt in r["name"].lower()
+        ]
+    else:
+        matched = resources
+
+    # Resource NAMES are what get_service_config / aws_read consume; include a
+    # detailed view (service + arn) for disambiguation without breaking the
+    # names contract.
+    names = [r["name"] for r in matched]
+    detailed = [
+        {"service": r["service"], "name": r["name"], "arn": r["arn"]}
+        for r in matched
+    ]
+
+    out = {
+        "service_type":       service_type,
+        "region":             region,
+        "count":              len(names),
+        "resources":          names,
+        "resources_detailed": detailed,
+    }
+    if not resources:
+        # Never a silent empty — say WHY discovery found nothing so the model
+        # (and a human) can tell "no resources" from "enumeration failed".
+        out["note"] = (
+            "no resources discovered — AWS Resource Explorer has no index in this "
+            "region and the Resource Groups Tagging API returned nothing (only "
+            "tagged resources are visible to it). Use aws_read with a service's "
+            "own list/describe API to enumerate a specific service directly."
+        )
+    elif filt and not matched:
+        out["note"] = (
+            f"{len(resources)} resources discovered but none matched filter "
+            f"'{service_type}'. Retry without a filter to see everything, or use a "
+            f"different service namespace."
+        )
+    return json.dumps(out, separators=(",", ":"))
 
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -813,14 +938,18 @@ def tail_logs(
     profile: str | None,
     region: str,
     max_events: int,
+    filter_pattern: str = "",
 ) -> str:
     from cloudctl.debug.fetcher import DebugFetcher
 
     session = _make_session(profile, region)
     fetcher = DebugFetcher(session)
 
-    # Discover which log groups match
+    # Groups that matched and returned events
     discovered: list[str] = []
+    # Groups we know EXIST (even if the windowed/filtered fetch was empty) — used
+    # for the retry-without-filter and last-resort tail below.
+    existing:   list[str] = []
     # Fetch more events than we'll show so analytics has better signal
     logs: list[dict] = []
 
@@ -835,10 +964,14 @@ def tail_logs(
     ]
     for lg in candidates:
         try:
-            evts = fetcher.cloudwatch_logs(log_group=lg, minutes=minutes)
+            evts = fetcher.cloudwatch_logs(
+                log_group=lg, minutes=minutes,
+                filter_pattern=filter_pattern, max_events=max_events,
+            )
             if evts:
                 logs.extend(evts)
                 discovered.append(lg)
+                existing.append(lg)
                 break
         except Exception:  # noqa: BLE001
             pass
@@ -847,26 +980,53 @@ def tail_logs(
     if not logs:
         try:
             groups = fetcher.discover_log_groups(resource_hint)
+            existing.extend(groups[:5])
             for grp in groups[:5]:
-                evts = fetcher.cloudwatch_logs(log_group=grp, minutes=minutes)
+                evts = fetcher.cloudwatch_logs(
+                    log_group=grp, minutes=minutes,
+                    filter_pattern=filter_pattern, max_events=max_events,
+                )
                 if evts:
                     logs.extend(evts)
                     discovered.append(grp)
         except Exception:  # noqa: BLE001
             pass
 
-    # Last resort: tail_log_group (returns most recent lines regardless of filter)
-    if not logs and discovered:
-        for grp in discovered[:2]:
-            evts = fetcher.tail_log_group(grp)
-            logs.extend(evts)
+    # A filter that matched nothing must NOT be reported as "no logs": a stack
+    # trace or structured JSON log rarely contains the literal filter word. Retry
+    # the known groups WITHOUT the filter before concluding the logs are clean.
+    if not logs and filter_pattern and existing:
+        for grp in list(dict.fromkeys(existing))[:3]:
+            try:
+                evts = fetcher.cloudwatch_logs(
+                    log_group=grp, minutes=minutes, max_events=max_events,
+                )
+                if evts:
+                    logs.extend(evts)
+                    discovered.append(grp)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Last resort: tail the most recent stream directly (catches groups whose
+    # events fall just outside the window). Reachable now via `existing`, which
+    # is populated even when the windowed/filtered fetch returned nothing.
+    if not logs and existing:
+        for grp in list(dict.fromkeys(existing))[:2]:
+            try:
+                evts = fetcher.tail_log_group(grp)
+                if evts:
+                    logs.extend(evts)
+                    discovered.append(grp)
+            except Exception:  # noqa: BLE001
+                pass
 
     return json.dumps({
         "resource_hint":    resource_hint,
         "minutes":          minutes,
+        "filter_pattern":   filter_pattern,
         "event_count":      len(logs[:max_events]),
         "total_fetched":    len(logs),
-        "log_groups_found": discovered,
+        "log_groups_found": list(dict.fromkeys(discovered)),
         # Frequency view over ALL fetched lines (not just the shown sample) —
         # a template's count is a fact the line sample can miss.
         "log_templates":    _mine_log_templates(logs),
@@ -987,6 +1147,49 @@ def search_cloudtrail(
         "event_count":   len(events),
         "events":        _serialise(events),
     }, separators=(",", ":"))
+
+
+@recordable("get_traces")
+def get_traces(
+    profile:           str | None,
+    region:            str,
+    minutes:           int = 60,
+    resource_hint:     str | None = None,
+    filter_expression: str | None = None,
+) -> str:
+    """Fuse AWS X-Ray distributed traces into a compact structured signal.
+
+    Returns the service-dependency graph with per-edge latency/error/fault/
+    throttle rates (WHERE faults concentrate in the call graph) plus the top
+    slowest and top fault-bearing traces, each fault trace localized to the
+    specific segment (service + operation) carrying it. NO raw segment docs.
+
+    Graceful by design: most accounts have no X-Ray. When tracing is not
+    enabled, no traces fall in-window, or permission is denied, this returns a
+    clear structured "no trace data available" result — never an exception — so
+    incidents without tracing are completely unaffected.
+    """
+    from cloudctl.debug.fetcher import DebugFetcher  # noqa: PLC0415
+    try:
+        session = _make_session(profile, region)
+        fetcher = DebugFetcher(session)
+        result  = fetcher.xray_traces(
+            minutes=int(minutes or 60),
+            resource_hint=resource_hint or None,
+            filter_expression=filter_expression or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Any unexpected failure degrades to the same informative signal — a
+        # trace lookup must never derail an investigation.
+        result = {
+            "available": False,
+            "reason": f"no trace data available ({type(exc).__name__})",
+            "window_minutes": int(minutes or 60),
+            "service_graph_summary": [],
+            "top_slow_traces": [],
+            "top_fault_traces": [],
+        }
+    return json.dumps(_serialise(result), separators=(",", ":"))
 
 
 @recordable("get_deployment_info")
@@ -1412,8 +1615,10 @@ def get_dependency_graph(profile: str | None, region: str) -> str:
         except Exception:  # noqa: BLE001
             return res, None
 
+    # Cap at 100 (was 60) so larger apps aren't cut off before the true
+    # dependency is examined; still bounded + parallel so it can't hang.
     with ThreadPoolExecutor(max_workers=10) as _ex:
-        fetched_cfgs = list(_ex.map(_fetch_cfg, resources[:60]))
+        fetched_cfgs = list(_ex.map(_fetch_cfg, resources[:100]))
 
     for res, cfg in fetched_cfgs:
         if not cfg:
@@ -1426,9 +1631,20 @@ def get_dependency_graph(profile: str | None, region: str) -> str:
             dst_node = f"{other['service']}:{other['name']}"
             if dst_node == src_node:
                 continue
-            if other["arn"] in blob or (
-                len(other["name"]) >= 4 and other["name"] in blob
+            name = other["name"]
+            # ARN match is unambiguous. For NAME match, require length ≥6 AND a
+            # token boundary — a bare ">=4 char substring anywhere" produced false
+            # edges from common fragments ("prod", "main", "data") embedded in
+            # unrelated strings, corrupting the very graph triage relies on.
+            if other["arn"] and other["arn"] in blob:
+                matched = True
+            elif len(name) >= 6 and re.search(
+                r'(?<![A-Za-z0-9])' + re.escape(name) + r'(?![A-Za-z0-9])', blob
             ):
+                matched = True
+            else:
+                matched = False
+            if matched:
                 e = {"from": src_node, "to": dst_node, "via": "config_ref"}
                 if e not in edges:
                     edges.append(e)
@@ -1449,29 +1665,25 @@ _AGENT_TOOLS = [
         "toolSpec": {
             "name": "list_resources",
             "description": (
-                "List all resource names for a given AWS service type. "
-                "Call this first to find exact names before fetching config or logs. "
-                "Classic infra: ecs, lambda, rds, aurora, dynamodb, s3, sqs, sns, eks, "
-                "kinesis, elasticache, redshift, glue, api_gateway, secrets_manager, "
-                "stepfunctions, opensearch, eventbridge, cloudfront, alb, ssm, acm, "
-                "msk, ecr, route53, codepipeline. "
-                "AI/ML: sagemaker, bedrock_agent, bedrock_kb, agentcore."
+                "Discover deployed resources in the account/region GENERICALLY — "
+                "enumerated account-wide across ALL service types (via AWS Resource "
+                "Explorer, falling back to the Resource Groups Tagging API), with no "
+                "fixed service list, so any service is discoverable. Call this first "
+                "to find exact resource names before fetching config or logs. "
+                "Optionally pass service_type to FILTER the results to one service "
+                "(matched against the resource's service namespace or name); omit it "
+                "to list everything discoverable."
             ),
             "inputSchema": {"json": {
                 "type": "object",
                 "properties": {
                     "service_type": {
                         "type": "string",
-                        "enum": [
-                            "ecs","lambda","rds","aurora","dynamodb","s3","sqs","sns",
-                            "eks","kinesis","elasticache","redshift","glue","api_gateway",
-                            "secrets_manager","stepfunctions","opensearch","eventbridge",
-                            "cloudfront","alb","ssm","acm","msk","ecr","route53",
-                            "codepipeline","sagemaker","bedrock_agent","bedrock_kb","agentcore",
-                        ],
+                        "description": "Optional filter: an AWS service namespace or "
+                                       "name fragment (e.g. lambda, rds, dynamodb). "
+                                       "Omit to return all discovered resources.",
                     },
                 },
-                "required": ["service_type"],
             }},
         }
     },
@@ -1605,6 +1817,35 @@ _AGENT_TOOLS = [
                                       "description": "Lookback window in minutes (default 1440)"},
                 },
                 "required": ["resource_name"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "get_traces",
+            "description": (
+                "Fuse AWS X-Ray distributed traces into a compact signal. Returns "
+                "the service-dependency graph with per-edge latency, error, fault, "
+                "and throttle rates — showing exactly WHERE in the call graph time "
+                "and failures accumulate — plus the slowest and most fault-bearing "
+                "traces, each localized to the specific segment (service + "
+                "operation) carrying the fault. Traces are the richest signal for "
+                "latency/timeout/error-propagation incidents: reach for this to "
+                "pinpoint which hop in a multi-service call path is the culprit. "
+                "If X-Ray is not enabled or has no traces in the window, it returns "
+                "a clear 'no trace data available' result (available=false) — a "
+                "normal outcome, not an error."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "resource_hint":     {"type": "string",
+                                          "description": "Optional resource/service name to focus the trace search on"},
+                    "filter_expression": {"type": "string",
+                                          "description": "Optional raw X-Ray filter expression (advanced); omit to let resource_hint drive the search"},
+                    "minutes":           {"type": "integer",
+                                          "description": "Lookback window in minutes (default 60, max 360)"},
+                },
             }},
         }
     },
@@ -1751,39 +1992,47 @@ _MAX_TOOL_OUTPUT_CHARS        = 4500   # was 8000 — ~1100 tokens per tool resu
 
 
 def _truncate_tool_output(result: str, tool_name: str) -> str:
-    """Truncate large tool outputs to protect context window."""
+    """Truncate large tool outputs to protect context window.
+
+    Tool outputs are single-line compact JSON, so the old splitlines()-based
+    branches never fired and every large output fell through to a blind
+    middle byte-cut — which BOTH corrupted the JSON and dropped a random middle
+    slice of evidence. Instead, trim structurally: drop the OLDEST entries from
+    the largest list field (events/timeline/datapoints), keeping the recent,
+    high-signal tail, and leaving valid JSON. Only fall back to a head-preserving
+    cut (never a middle cut) if the payload isn't parseable JSON.
+    """
     if len(result) <= _MAX_TOOL_OUTPUT_CHARS:
         return result
 
-    if tool_name == "tail_logs":
-        lines = result.strip().splitlines()
-        if len(lines) > _MAX_LOG_LINES_IN_CONTEXT:
-            kept    = lines[-_MAX_LOG_LINES_IN_CONTEXT:]
-            omitted = len(lines) - _MAX_LOG_LINES_IN_CONTEXT
-            return (
-                f"[{omitted} older log lines omitted — "
-                f"showing most recent {_MAX_LOG_LINES_IN_CONTEXT}]\n"
-                + "\n".join(kept)
-            )
+    try:
+        data = json.loads(result)
+    except Exception:  # noqa: BLE001
+        data = None
 
-    if tool_name == "get_event_timeline":
-        lines = result.strip().splitlines()
-        if len(lines) > 60:
-            head    = lines[:20]
-            tail    = lines[-20:]
-            omitted = len(lines) - 40
-            return (
-                "\n".join(head)
-                + f"\n[... {omitted} events omitted ...]\n"
-                + "\n".join(tail)
-            )
+    if isinstance(data, dict):
+        list_keys = [k for k, v in data.items() if isinstance(v, list) and len(v) > 1]
+        # Trim the biggest list(s) first, keeping the most-recent tail (events are
+        # ordered oldest→newest, so the tail is the recent, relevant data).
+        list_keys.sort(key=lambda k: len(json.dumps(data[k], default=str)), reverse=True)
+        for k in list_keys:
+            guard = 0
+            while (len(json.dumps(data, default=str, separators=(",", ":"))) > _MAX_TOOL_OUTPUT_CHARS
+                   and len(data[k]) > 1 and guard < 32):
+                data[k] = data[k][len(data[k]) // 2:]   # drop oldest half
+                data[f"_{k}_truncated"] = "older entries dropped to fit context window"
+                guard += 1
+            if len(json.dumps(data, default=str, separators=(",", ":"))) <= _MAX_TOOL_OUTPUT_CHARS:
+                break
+        out = json.dumps(data, default=str, separators=(",", ":"))
+        if len(out) <= _MAX_TOOL_OUTPUT_CHARS:
+            return out
+        # Still too large after trimming lists — head-preserve (summary fields
+        # live at the front); never a middle cut.
+        return out[:_MAX_TOOL_OUTPUT_CHARS] + "\n[... truncated — output too large ...]"
 
-    half = _MAX_TOOL_OUTPUT_CHARS // 2
-    return (
-        result[:half]
-        + "\n[... truncated — output too large ...]\n"
-        + result[-half:]
-    )
+    # Non-JSON payload: keep the head + marker (no corrupting middle cut).
+    return result[:_MAX_TOOL_OUTPUT_CHARS] + "\n[... truncated — output too large ...]"
 
 
 def _get_account_id(profile: str | None, region: str) -> str:
@@ -1889,7 +2138,7 @@ def debug_incident_agent(
             return json.dumps({"error": tool_check.reason})
 
         if tool_name == "list_resources":
-            raw = list_resources(tool_input["service_type"], profile, region)
+            raw = list_resources(tool_input.get("service_type", ""), profile, region)
         elif tool_name == "get_service_config":
             raw = get_service_config(
                 tool_input["service_type"], tool_input["resource_name"], profile, region
@@ -1901,6 +2150,7 @@ def debug_incident_agent(
                 profile=profile,
                 region=region,
                 max_events=100,
+                filter_pattern=tool_input.get("filter_pattern", ""),
             )
         elif tool_name == "get_event_timeline":
             raw = get_event_timeline(tool_input["symptom"], profile, region, minutes)

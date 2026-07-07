@@ -254,10 +254,40 @@ def _render_agent_result(d: dict, account: Optional[str]) -> None:
         )
 
     evidence = d.get("evidence") or []
+    # Provenance trail: under each evidence line, show the fetched-corpus key
+    # (tool + identifying inputs) that sources it, so a human can trace the
+    # claim back to the raw tool call. Compact: first key + count of others.
+    prov_by_claim: dict = {}
+    for p in d.get("provenance") or []:
+        if isinstance(p, dict) and p.get("claim"):
+            prov_by_claim.setdefault(str(p["claim"]).strip(), p)
+    unsourced = [str(u).strip() for u in d.get("unsourced_claims") or []]
     if evidence:
+        lines = []
+        for e in evidence:
+            e_str = str(e).strip()
+            lines.append(f"- {e_str}")
+            keys = [str(k) for k in (prov_by_claim.get(e_str) or {}).get("evidence_keys", []) if k]
+            if keys:
+                shown = keys[0] if len(keys[0]) <= 64 else keys[0][:61] + "..."
+                more = f" (+{len(keys) - 1} more)" if len(keys) > 1 else ""
+                lines.append(f"  - `src: {shown}`{more}")
+            elif e_str in unsourced:
+                lines.append("  - `src: none — not traceable to fetched data`")
         t.add_row(
             Text("EVIDENCE"),
-            Markdown("\n".join(f"- {e}" for e in evidence)),
+            Markdown("\n".join(lines)),
+            end_section=True,
+        )
+
+    # Unsourced claims that are not evidence items (root-cause sentences with
+    # specifics that traced to no fetched source) get their own row.
+    uns_extra = [u for u in unsourced
+                 if u not in {str(e).strip() for e in evidence}]
+    if uns_extra:
+        t.add_row(
+            Text("UNSOURCED", style="bold yellow"),
+            Text("\n".join(f"- {u[:120]}" for u in uns_extra), style="yellow"),
             end_section=True,
         )
 

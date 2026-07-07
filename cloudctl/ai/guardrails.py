@@ -41,7 +41,11 @@ _OFF_TOPIC_PATTERNS = [
     r"\b(track someone|spy on|surveillance|stalk|personal information of|"
     r"find address|find phone number|dox)\b",
     r"\b(porn|pornography|nude|sexual content|nsfw)\b",
-    r"\b(stock price|crypto|bitcoin|nft|trading|investment advice)\b",
+    # Target advice-SEEKING, not service names: bare "trading"/"crypto"/"stock"
+    # collide with legitimate infra symptoms ("trading-engine consumer lag",
+    # "crypto-wallet service 5xx") and were wrongly rejecting them.
+    r"\b(investment advice|stock (tip|pick|market tip)|price prediction|"
+    r"should i (buy|sell|invest))\b",
 ]
 
 _INJECTION_PATTERNS = [
@@ -49,7 +53,10 @@ _INJECTION_PATTERNS = [
     r"forget (all |your |the |previous )?instructions",
     r"new (system |)prompt",
     r"you are now",
-    r"act as (a |an |)",
+    # Narrowed from bare "act as (a|an)" — that matched benign infra descriptions
+    # ("a proxy that should act as a gateway"). Target jailbreak personas only.
+    r"act as (an? )?(dan\b|jailbroken|unrestricted|uncensored|evil|"
+    r"the (system|developer|admin)|a different (ai|model|assistant))",
     r"pretend (you are|to be)",
     r"disregard (all |your |previous |the )?",
     r"override (safety|guardrail|instruction|rule)",
@@ -153,7 +160,26 @@ def validate_query(query: str) -> GuardrailResult:
 #
 # Patterns are applied in order — more specific patterns first.
 
-_SECRET_PATTERNS: list[tuple[str, str]] = [
+# Internal / non-routable IPv4 (RFC1918 private ranges, loopback, link-local) and
+# the special 0.0.0.0 / 255.255.255.255 are NETWORK CONFIGURATION — the CIDRs in
+# security-group rules, NACLs, and route tables that connectivity diagnosis turns
+# on — not PII. Redacting them all to one identical token made a mismatch (SG
+# allows 10.0.1.0/24 while the client sits at 10.0.2.5) literally unobservable.
+# Preserve these; still redact routable PUBLIC IPv4 (which can be a personal
+# address). Applied via a callable replacement below.
+_PRIVATE_IP_RE = re.compile(
+    r'^(0\.0\.0\.0|255\.255\.255\.255|10\.|127\.|169\.254\.|192\.168\.'
+    r'|172\.(?:1[6-9]|2\d|3[01])\.)'
+)
+
+
+def _redact_ipv4(m) -> str:
+    ip = m.group(0)
+    return ip if _PRIVATE_IP_RE.match(ip) else "[REDACTED:IP_ADDRESS]"
+
+
+# Entries may be (regex, replacement_str) OR (regex, replacement_callable).
+_SECRET_PATTERNS: list = [
     # ── AWS ───────────────────────────────────────────────────────────────────
     (r'AKIA[0-9A-Z]{16}',                                        "[REDACTED:AWS_ACCESS_KEY]"),
     (r'ASIA[0-9A-Z]{16}',                                        "[REDACTED:AWS_SESSION_KEY]"),
@@ -238,7 +264,8 @@ _SECRET_PATTERNS: list[tuple[str, str]] = [
     (r'\b(\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b', "[REDACTED:PHONE]"),
 
     # ── HIPAA §15 / GDPR: IP addresses ───────────────────────────────────────
-    (r'\b(?:\d{1,3}\.){3}\d{1,3}\b',                             "[REDACTED:IP_ADDRESS]"),
+    # Public IPv4 only — private/internal CIDRs are preserved (network evidence).
+    (r'\b(?:\d{1,3}\.){3}\d{1,3}\b',                             _redact_ipv4),
     # IPv6
     (r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b',           "[REDACTED:IPv6_ADDRESS]"),
 ]
@@ -378,6 +405,7 @@ _ALLOWED_TOOLS = {
     "query_metrics",
     "get_deployment_info",
     "search_cloudtrail",
+    "get_traces",
     "probe_permission",
     "get_dependency_graph",
     "aws_read",
@@ -447,21 +475,35 @@ def validate_tool_call(
 # unless you actually inspected the alerting system and found a concrete defect
 # in it. It fires only on dismissal language, so it never touches a genuine
 # fault diagnosis (which asserts a real cause).
-_DISMISSAL_MARKERS = (
+# STRONG markers: unambiguous "the alert/symptom is not real" language. Checked
+# in BOTH root_cause and evidence.
+_DISMISSAL_MARKERS_STRONG = (
     "false positive", "false-positive", "false alarm", "spurious",
     "not a real fault", "no real fault", "no actual fault", "not an actual fault",
-    "not a genuine", "monitoring artifact", "alert is a false",
-    "is fully operational", "is actually healthy", "no real issue",
+    "monitoring artifact", "alert is a false",
 )
+# SOFT markers: "healthy / operational" phrasing that ALSO appears legitimately
+# in a REAL diagnosis when describing a RULED-OUT component ("RDS is actually
+# healthy; the fault is the Lambda connection leak"). Checked only in root_cause,
+# where it speaks to the overall verdict — NOT in evidence, where it describes a
+# sub-component and was wrongly capping correct diagnoses.
+_DISMISSAL_MARKERS_SOFT = (
+    "not a genuine", "is fully operational", "is actually healthy", "no real issue",
+)
+# Back-compat alias (some callers/tests may import the old name).
+_DISMISSAL_MARKERS = _DISMISSAL_MARKERS_STRONG + _DISMISSAL_MARKERS_SOFT
 
 
 def is_symptom_dismissal(agent_output: dict) -> bool:
     """True when a verdict dismisses the reported symptom as not a real fault."""
-    text = (
-        str(agent_output.get("root_cause", "")) + " "
-        + " ".join(str(e) for e in agent_output.get("evidence", []))
-    ).lower()
-    return any(m in text for m in _DISMISSAL_MARKERS)
+    root = str(agent_output.get("root_cause", "")).lower()
+    evidence = " ".join(str(e) for e in agent_output.get("evidence", [])).lower()
+    if any(m in root for m in _DISMISSAL_MARKERS_STRONG) or \
+       any(m in root for m in _DISMISSAL_MARKERS_SOFT):
+        return True
+    # In evidence, only STRONG markers count — soft "healthy" language there
+    # normally describes a ruled-out component, not a dismissal of the incident.
+    return any(m in evidence for m in _DISMISSAL_MARKERS_STRONG)
 
 
 # Concrete defects IN the alerting/monitoring system itself. When a "false
@@ -561,6 +603,27 @@ def enforce_confidence(
             f"only {sources} data sources, {len(evidence)} evidence items."
         )
         return output
+
+    # Provenance wiring: unsourced SPECIFIC claims — claims carrying verifiable
+    # facts (identifiers/values) that traced to ZERO fetched sources in the
+    # provenance pass — WEAKEN confidence by exactly one step when they make up
+    # a meaningful share of the report's specific claims. This is a weight, not
+    # a cap: a fully-sourced report is untouched at ANY level (HIGH included),
+    # and the downgrade is relative to the claimed level, never a forced floor.
+    unsourced = [u for u in (output.get("unsourced_claims") or [])
+                 if isinstance(u, str)]
+    cited = output.get("provenance") or []
+    if unsourced and claimed in ("HIGH", "MEDIUM"):
+        total = len(unsourced) + len(cited)
+        rate = len(unsourced) / total if total else 0.0
+        if rate >= 0.25:
+            output["confidence"] = {"HIGH": "MEDIUM", "MEDIUM": "LOW"}[claimed]
+            output["confidence_override_reason"] = (
+                f"Confidence weakened from {claimed} to {output['confidence']}: "
+                f"{len(unsourced)} of {total} specific claim(s) could not be "
+                "traced to any fetched data source (see unsourced_claims)."
+            )
+            return output
 
     return output
 
@@ -1001,9 +1064,21 @@ def detect_hallucinations(
                  if w not in {"found", "shows", "indicates", "suggest", "based"}]
         if not words:
             continue
-        # Item is supported if at least 2 of its key words appear in corpus
         matches = sum(1 for w in words if w in corpus)
-        if matches < 2:
+        # Also credit DISTINCTIVE facts (numeric values, error codes, hyphen/colon
+        # identifiers) that trace to the corpus: a legitimately PARAPHRASED
+        # observation ("connections exhausted") over raw data ("Available:0")
+        # shares its FACTS even when its prose words differ verbatim.
+        distinctive = re.findall(
+            r'\b[a-z0-9]*\d[a-z0-9]*\b|\b[a-z0-9]+[-:_/][a-z0-9\-:_/]+\b',
+            item.lower(),
+        )
+        matches += sum(1 for t in distinctive if len(t) >= 3 and t in corpus)
+        # An item is unsupported only when it has enough content to judge (≥3 key
+        # words) yet too few tokens trace, OR it is terse AND shares nothing at
+        # all with the corpus (wholly fabricated). This stops terse, correctly
+        # paraphrased items from being flagged while still catching invented ones.
+        if (len(words) >= 3 and matches < 2) or (len(words) < 3 and matches == 0):
             unsupported.append(item)
 
     rate = len(unsupported) / len(evidence_items) if evidence_items else 0.0
