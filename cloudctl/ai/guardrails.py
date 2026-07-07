@@ -489,6 +489,15 @@ _DISMISSAL_MARKERS_STRONG = (
 # sub-component and was wrongly capping correct diagnoses.
 _DISMISSAL_MARKERS_SOFT = (
     "not a genuine", "is fully operational", "is actually healthy", "no real issue",
+    # "the symptom is illusory / nothing is actually wrong" framings that a real
+    # fault diagnosis never uses about the WHOLE stack (a real diagnosis names a
+    # fault). These slipped the original markers on a live miss where the agent
+    # declared a genuine incident a false alarm ("making the stack appear
+    # unhealthy … all components are fully healthy").
+    "appear unhealthy", "appears unhealthy", "only appears", "merely appears",
+    "no fault found", "found no fault", "no genuine fault", "no actual problem",
+    "everything is healthy", "everything is working", "all components are healthy",
+    "all components are fully healthy", "stack is healthy",
 )
 # Back-compat alias (some callers/tests may import the old name).
 _DISMISSAL_MARKERS = _DISMISSAL_MARKERS_STRONG + _DISMISSAL_MARKERS_SOFT
@@ -535,14 +544,35 @@ def _grounded_alerting_defect(text: str, fetched_data: dict | None) -> bool:
     return has_alarm and has_threshold
 
 
+def _has_positive_success_reproduction(fetched_data: dict | None) -> bool:
+    """True only when the fetched data shows the failing path was POSITIVELY
+    exercised and SUCCEEDED — e.g. a reproduction probe returned a 2xx on the
+    user-facing path. Absence of errors in metrics/logs is NOT proof of health
+    (silent faults reject requests with no error metric); only a demonstrated
+    success verifies the path actually works. Conservative by design: if no
+    concrete success is found, a "healthy/false-alarm" verdict is NOT exempted."""
+    if not fetched_data:
+        return False
+    corpus = json.dumps(fetched_data, default=str).lower()
+    # A reproduction probe (probe_http) that returned a 2xx status on the path.
+    if re.search(r'"status(?:_code)?"\s*:\s*2\d\d', corpus):
+        return True
+    if re.search(r'\bhttp[_\s]?2\d\d\b', corpus):
+        return True
+    return False
+
+
 def cap_speculative_dismissal(agent_output: dict, fetched_data: dict | None = None) -> dict:
     """Cap confidence to LOW on a verdict that dismisses the reported symptom as
-    not a real fault. A live alert cannot be confidently declared spurious
-    without a concrete, inspected defect in the alerting system — that is a
-    human-review event, not a confident auto-diagnosis. EXEMPTION: when the
-    dismissal IS backed by a concrete, grounded alerting-system defect (a real
-    misconfigured alarm found in the fetched data), it is a valid diagnosis and
-    is left alone — honoring the "unless backed by an inspected defect" clause."""
+    not a real fault. A live alert cannot be confidently declared spurious unless
+    the failing path was POSITIVELY verified to work, or a concrete alerting-system
+    defect was inspected — otherwise it is a human-review event, not a confident
+    auto-diagnosis. EXEMPTIONS (verdict left alone): (a) the dismissal is backed by
+    a concrete, grounded misconfigured-alarm found in fetched data; OR (b) the
+    fetched data shows a positive success reproduction of the failing path (the
+    path demonstrably works, so 'spurious alert' is evidenced). Absence of errors
+    alone never exempts — that is exactly how a silent fault gets rationalized
+    away."""
     claimed = agent_output.get("confidence", "MEDIUM")
     if claimed == "LOW" or not is_symptom_dismissal(agent_output):
         return agent_output
@@ -550,15 +580,17 @@ def cap_speculative_dismissal(agent_output: dict, fetched_data: dict | None = No
         str(agent_output.get("root_cause", "")) + " "
         + " ".join(str(e) for e in agent_output.get("evidence", []))
     ).lower()
-    if _grounded_alerting_defect(text, fetched_data):
-        return agent_output   # valid, evidenced misconfigured-alarm diagnosis
+    if _grounded_alerting_defect(text, fetched_data) or \
+       _has_positive_success_reproduction(fetched_data):
+        return agent_output   # evidenced: real misconfigured alarm, or path proven healthy
     output = copy.deepcopy(agent_output)
     output["confidence"] = "LOW"
+    output["unverified_healthy_dismissal"] = True
     output["confidence_override_reason"] = (
-        f"Confidence capped from {claimed} to LOW: the verdict dismisses the "
-        "reported symptom as not a real fault. A live alert cannot be confidently "
-        "declared spurious without a concrete, inspected defect in the alerting "
-        "system — this is a human-review event, not a confident auto-diagnosis."
+        f"Confidence capped from {claimed} to LOW: the verdict dismisses a reported "
+        "failure as not a real fault, but the failing path was never positively "
+        "verified to work (absence of errors is not proof of health — silent faults "
+        "reject requests with no error metric). This is a human-review event."
     )
     return output
 

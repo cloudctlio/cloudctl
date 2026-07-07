@@ -1704,10 +1704,28 @@ VERDICT rules (binding):
      directly observed data. If no hypothesis meets this bar, say exactly that:
      root_cause = what was ruled out and what observation is still needed,
      confidence = LOW. An honest "not proven" beats a constructed narrative.
-  3. If the measured observation says symptom_observable_now=false, state that
-     the reported symptom could not be reproduced in current data and anchor
-     the report on that fact.
-  4. Root-cause events must precede the measured onset. Events from our own
+  3. symptom_observable_now=false means the symptom was not visible in the
+     metrics/logs sampled — it does NOT mean the stack is healthy or the alert is
+     a false alarm. Many real faults are SILENT: a config that rejects requests,
+     a removed auth flow, a wrong identifier, a denied permission — these fail the
+     user with ZERO error metric or log on the failing component. You may declare
+     the reported symptom a false alarm / the stack healthy / "nothing wrong" ONLY
+     if you POSITIVELY exercised the reported failing path and observed it SUCCEED
+     (e.g. probe_http returned success on the user-facing path, or an operation
+     you ran completed). Absence of errors is NOT evidence of health. If you can
+     neither localize a fault NOR demonstrate the failing path succeeds, the
+     correct verdict is: root_cause = "fault not localized; failing path not
+     verified healthy — needs deeper investigation", confidence = LOW. NEVER a
+     confident all-clear on a reported failure.
+  4. A resource that does NOT currently exist cannot be the primary root cause of
+     a currently-FAILING live stack. If your leading cause cites a resource that
+     a live read returns as NotFound/absent, either it was recreated (re-read the
+     CURRENT resource by name and diagnose that) or it is a stale audit-trail
+     artifact from an earlier teardown — in both cases prefer a fault you can
+     verify in the stack's CURRENT state, on the path the symptom describes. A
+     directly-observed current-state fault on the failing path OUTRANKS a
+     change-event narrative about a resource that is gone.
+  5. Root-cause events must precede the measured onset. Events from our own
      deployment activity before onset are not causes.
 
 Select the hypothesis with the strongest direct evidence from real AWS data.
