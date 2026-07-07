@@ -1526,6 +1526,18 @@ Rule -1 — Prediction test (a veto, apply first):
   if the branch did not frame it as a formal "prediction" entry — do not
   discount a directly observed structural fault merely because predictions_tested
   is empty.
+  ATTRIBUTION vs EXISTENCE — a REFUTED prediction eliminates a hypothesis ONLY
+  when it bears on the fault's EXISTENCE or MECHANISM (whether the misconfig /
+  denial / breakage is really present, and whether it explains the symptom). A
+  prediction about ATTRIBUTION — WHEN or HOW the fault was introduced, e.g. "a
+  change-event for this appears in the audit trail (CloudTrail) at onset" —
+  being refuted does NOT eliminate a hypothesis whose fault is DIRECTLY OBSERVED
+  in current state (a live misconfiguration read now, or a permission the policy
+  simulator returns as denied now). Audit trails have gaps (console actions,
+  other principals, retention/lookback windows): a missing change-event revises
+  WHEN/HOW the fault arose, never WHETHER it exists. Treat such a refutation as
+  "weakens attribution", and still weigh the directly observed fault — which, if
+  it explains the symptom, can be the root cause even without a traced change.
   A CONFIRMED prediction only counts if it is CAUSALLY RELEVANT:
     - A permanent property of the system — one that was equally true while
       the system was working — cannot be the cause of a new incident. If the
@@ -1681,7 +1693,13 @@ of the same incident. Each branch investigated a different potential root cause.
 {discrimination_constraint}
 
 VERDICT rules (binding):
-  1. A hypothesis with a REFUTED prediction cannot be the root cause.
+  1. A hypothesis with a REFUTED prediction cannot be the root cause — UNLESS the
+     only refuted prediction is about ATTRIBUTION (when/how the fault was
+     introduced, e.g. a change-event expected in CloudTrail at onset) while the
+     fault itself is DIRECTLY OBSERVED in current state (a live misconfiguration
+     or a permission the policy simulator denies now). A missing change-event
+     revises when/how the fault arose, never whether it exists; do not discard a
+     directly observed, symptom-explaining fault for lack of an audit-trail entry.
   2. The root cause must have at least one CONFIRMED prediction backed by
      directly observed data. If no hypothesis meets this bar, say exactly that:
      root_cause = what was ruled out and what observation is still needed,

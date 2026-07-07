@@ -1251,12 +1251,27 @@ def check_evidence_grounding(
         "well-supported", "well-evidenced", "non-primary", "read-write",
     }
 
+    def _looks_like_infra_identifier(tok: str) -> bool:
+        # A real resource/ARN/name identifier — NOT ordinary hyphenated English
+        # prose ("hard-coded", "sign-ins", "env-var", "fast-fails"), which the
+        # hyphen-matching regex also catches and which then drove false
+        # under-confidence downgrades. Require a signal prose lacks: a digit, an
+        # underscore/colon, 3+ segments, or a long (>=7) segment. Real names
+        # (cognito-auth-users, us-east-1, arn:...:key, wrong-client-id-x) pass;
+        # two-segment short lowercase compounds do not.
+        if any(ch.isdigit() for ch in tok) or ":" in tok or "_" in tok:
+            return True
+        segs = re.split(r'[-:]', tok)
+        return len(segs) >= 3 or any(len(s) >= 7 for s in segs)
+
+    # Only real infra identifiers are grounding-checkable; hyphenated prose is
+    # not an identifier and must never drive a confidence downgrade.
+    identifiers = [c for c in candidates
+                   if c.lower() not in _SKIP and len(c) >= 6
+                   and _looks_like_infra_identifier(c)]
+
     ungrounded = []
-    for claim in candidates:
-        if claim.lower() in _SKIP:
-            continue
-        if len(claim) < 6:
-            continue
+    for claim in identifiers:
         if claim.lower() in combined:
             continue
         # Also accept if any segment of the identifier appears (e.g. "billing"
@@ -1269,7 +1284,7 @@ def check_evidence_grounding(
     if not ungrounded:
         return GroundingResult(grounded=True, ungrounded_claims=[], reason="")
 
-    rate = len(ungrounded) / max(len(candidates), 1)
+    rate = len(ungrounded) / max(len(identifiers), 1)
     if rate > 0.25:
         sample = ", ".join(ungrounded[:3])
         return GroundingResult(
