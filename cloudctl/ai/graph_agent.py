@@ -1728,6 +1728,27 @@ VERDICT rules (binding):
   5. Root-cause events must precede the measured onset. Events from our own
      deployment activity before onset are not causes.
 
+MECHANISM & FRONTIER (the honesty test — apply to your chosen cause before shipping):
+  Trace the causal chain from your root cause to the REPORTED symptom, link by
+  link, and label each link OBSERVED (you have direct data for it) or ASSUMED
+  (you inferred it). A confident verdict requires that every LOAD-BEARING link is
+  OBSERVED — including the link that the cause actually produces the symptom's
+  failure. A directly-observed misconfiguration whose mechanical effect you can
+  show (a filter that cannot match, a flow that is absent, a permission the
+  simulator denies) is OBSERVED even if it emitted no error — silent faults are
+  real. But an ASSUMED link — "this component must use this value", "this is
+  probably the failing path" — that you did not verify is NOT grounding.
+  If a load-bearing link is ASSUMED, or you never observed the reported failure
+  and cannot show the mechanism produces it, you are at the FRONTIER of what you
+  can prove. Do NOT fabricate a cause to fill the gap. Emit the honest verdict:
+    root_cause = "Localized to <the furthest point you verified>. Could not
+    verify <the specific unobserved link>; the reported failure was not observed
+    directly. To confirm: <reproduce the operation / instrument the path / read
+    the component's code>.", confidence = LOW.
+  An honest frontier verdict that tells the operator where you got to and what is
+  needed is worth far more than a confident guess that sends them down a dead end
+  — and it is the ONLY safe output on a system whose internals you cannot see.
+
 Select the hypothesis with the strongest direct evidence from real AWS data.
 If multiple branches found real issues, list them all in evidence.
 Treat unconfirmed or low-confidence branches as ruled-out alternatives.
@@ -2888,6 +2909,7 @@ def debug_incident_graph(
         verify_cited_values, redact_output,
         audit_log_agent_call, new_session_id,
         check_evidence_grounding, cap_speculative_dismissal,
+        annotate_failure_grounding,
     )
 
     rate_check = check_rate_limit()
@@ -3089,6 +3111,13 @@ def debug_incident_graph(
     # on dismissal language; exempts a grounded misconfigured-alarm diagnosis
     # (needs all_fetched to verify the alarm is real, not invented).
     parsed = cap_speculative_dismissal(parsed, all_fetched)
+
+    # Frontier-honest core: surface whether a failure was actually OBSERVED, or
+    # the verdict rests on configuration inference (where the engine hallucinates
+    # on an unfamiliar workload). Honest metadata only — the reasoning pass owns
+    # any confidence change, since a silent fault can be correctly diagnosed with
+    # no observed signal.
+    parsed = annotate_failure_grounding(parsed, all_fetched)
 
     # Feature 3: Evidence-conclusion grounding check
     # Downgrades confidence when the conclusion names specific resources or

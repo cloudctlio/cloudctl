@@ -595,6 +595,64 @@ def cap_speculative_dismissal(agent_output: dict, fetched_data: dict | None = No
     return output
 
 
+@dataclass
+class FailureGroundingResult:
+    """Did the investigation actually OBSERVE a failure, or only read configuration
+    it inferred was wrong? Service-agnostic — keys off universal failure signals,
+    never off any service's 'correct config'."""
+    observed_failure: bool
+    signals: list          # names of the signal classes found (for the report)
+
+
+# Universal, service-agnostic OBSERVED-failure signals: evidence that an
+# operation or component is actually failing NOW. Each excludes the benign
+# zero-valued form ("Errors: 0" is not a failure). This is NOT a cap — a real
+# fault can be SILENT (a pattern that never matches, a removed auth flow) and
+# emit none of these while still being correctly diagnosable. It is honest
+# metadata: a verdict with observed_failure=False rests on configuration
+# inference, which is exactly where the engine hallucinates on an unfamiliar
+# workload — so the reasoning pass must then either show a VERIFIED mechanism or
+# report the honest frontier.
+_FAILURE_SIGNAL_PATTERNS = (
+    ("permission_denied",     re.compile(r'\b(implicit|explicit)deny\b', re.I)),
+    ("permission_denied",     re.compile(r'"?decision"?\s*[:=]\s*"?\w*denied', re.I)),
+    ("http_error_status",     re.compile(r'"?status(?:_?code)?"?\s*[:=]\s*"?[45]\d\d\b')),
+    ("nonzero_error_metric",  re.compile(r'"(errors?|faults?|throttl\w*|[45]xxerror\w*)"\s*:\s*[1-9]', re.I)),
+    ("failed_state",          re.compile(r'"?(status|state|health\w*)"?\s*[:=]\s*"?(failed|failing|unhealthy|impaired|critical)\b', re.I)),
+    ("aws_error_code",        re.compile(r'\b(accessdenied\w*|throttlingexception|serviceunavailable|provisionedthroughputexceeded|resourcenotfound\w*exception|timeout\w*exception)\b', re.I)),
+    ("error_log_event",       re.compile(r'\b(traceback|exception:|\bfatal\b|panic:|segfault|oomkill\w*)\b', re.I)),
+)
+
+
+def assess_observed_failure_grounding(fetched_data: dict | None) -> FailureGroundingResult:
+    """Return which universal failure signals (if any) appear in the fetched
+    corpus. Pure/deterministic. observed_failure=False means no failure was
+    captured — the diagnosis rests on configuration inference."""
+    if not fetched_data:
+        return FailureGroundingResult(False, [])
+    corpus = json.dumps(fetched_data, default=str)
+    signals: list = []
+    for name, pat in _FAILURE_SIGNAL_PATTERNS:
+        if name not in signals and pat.search(corpus):
+            signals.append(name)
+    return FailureGroundingResult(bool(signals), signals)
+
+
+def annotate_failure_grounding(agent_output: dict, fetched_data: dict | None = None) -> dict:
+    """Attach honest frontier metadata to the verdict: whether a failure was
+    actually observed, and which signals. Does NOT cap confidence (a silent fault
+    can be correctly diagnosed with no signal) — capping is the reasoning pass's
+    job, which can tell a VERIFIED mechanism from an ASSUMED one. This only makes
+    the grounding transparent on every verdict."""
+    grounding = assess_observed_failure_grounding(fetched_data)
+    output = copy.deepcopy(agent_output)
+    output["failure_grounding"] = {
+        "observed_failure": grounding.observed_failure,
+        "signals": grounding.signals,
+    }
+    return output
+
+
 def enforce_confidence(
     agent_output: dict,
     fetched_data: dict,
