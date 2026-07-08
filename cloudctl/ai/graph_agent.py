@@ -118,6 +118,7 @@ class GraphState(TypedDict):
     log_insights: dict     # PRISM: Haiku log analysis (runs parallel with investigate)
     discrimination: dict   # PRISM: causal category verdict before synthesis
     observation: dict      # VERDICT: measured symptom (onset, observable-now, scope)
+    failure_map: list      # LOCALIZE: components observed emitting failures now
 
 
 # ── Shared Bedrock client factory ──────────────────────────────────────────────
@@ -1437,7 +1438,20 @@ def log_intelligence_node(state: GraphState) -> dict:
             f"count={t['count']} :: {t['template'][:160]}"
             for t in _mine_log_templates(raw_events)
         ]
-        return {"events": events_out, "groups": grps, "templates": templates, "error": err}
+        # LOCALIZE pillar: from the SAME fetched events, determine which components
+        # are actually EMITTING failures now (service-agnostic — reports what is
+        # failing, never judges config). This anchors the diagnosis on the emitting
+        # component instead of a quiet one that merely looks unusual.
+        from cloudctl.debug.localize import localize_failures
+        comp_logs: dict = {}
+        for evt in raw_events:
+            g = evt.get("_group", "")
+            m = (evt.get("event", "") or "").strip()
+            if g and m:
+                comp_logs.setdefault(g, []).append(m)
+        failure_map = localize_failures(comp_logs)
+        return {"events": events_out, "groups": grps, "templates": templates,
+                "error": err, "failure_map": failure_map}
 
     survey = recorded("log_survey", {"minutes": state["minutes"]}, _survey)
     if not isinstance(survey, dict):
@@ -1445,6 +1459,7 @@ def log_intelligence_node(state: GraphState) -> dict:
     all_events = survey.get("events", [])
     groups = survey.get("groups", [])
     survey_error = survey.get("error", "")
+    failure_map = survey.get("failure_map", []) if isinstance(survey, dict) else []
 
     if not all_events:
         # Explain the empty result — an unexplained {} hid the survey bug for runs.
@@ -1453,7 +1468,7 @@ def log_intelligence_node(state: GraphState) -> dict:
                 f"no log events in window; {len(groups)} recently-active "
                 f"log groups found: {groups[:8]}"
             ),
-        }}
+        }, "failure_map": failure_map}
 
     log_text = "\n".join(all_events[:80])
     template_text = "\n".join(survey.get("templates", [])[:12])
@@ -1493,7 +1508,7 @@ def log_intelligence_node(state: GraphState) -> dict:
     except Exception as exc:
         insights = {"_error": f"{type(exc).__name__}: {exc}"[:300]}
 
-    return {"log_insights": insights}
+    return {"log_insights": insights, "failure_map": failure_map}
 
 
 # ── PRISM Node B: discriminate (causal discrimination before synthesis) ─────────
@@ -2190,6 +2205,25 @@ def synthesize_node(state: GraphState) -> dict:
             )
     else:
         discrimination_block = ""
+
+    # LOCALIZE pillar: tell synthesis which components are ACTUALLY emitting
+    # failures now, so it anchors the root cause on an emitting component instead
+    # of building a story around a quiet one that merely looks unusual.
+    _fmap = state.get("failure_map") or []
+    if _fmap:
+        _emitting = "; ".join(
+            f"{e.get('component')} (errors={e.get('error_count')}): {str(e.get('sample',''))[:140]}"
+            for e in _fmap[:5]
+        )
+        discrimination_block = (
+            "OBSERVED FAILURE MAP — components actually EMITTING failures right now "
+            "(the failure is localized HERE, not on a quiet component):\n"
+            f"{_emitting}\n"
+            "Anchor your root cause on one of these emitting components and diagnose "
+            "from ITS own logs/config. If your leading cause is a component that is "
+            "NOT in this list, you are mis-localized — inspect the emitting component "
+            "first before concluding.\n\n"
+        ) + discrimination_block
 
     system = _SYNTHESIZE_PROMPT.format(
         n=len(all_branch_results),
@@ -3118,6 +3152,12 @@ def debug_incident_graph(
     # the prompt-level discipline alone did not hold. Silent-fault diagnoses assert
     # no such signal and are untouched.
     parsed = enforce_failure_grounding(parsed, all_fetched)
+
+    # LOCALIZE pillar: if components were observed emitting failures but the verdict
+    # blames one that was NOT, it is mis-localized — cap it and surface where the
+    # failures actually are. No-op when the failure map is empty (silent fault).
+    from cloudctl.debug.localize import enforce_localization_anchor
+    parsed = enforce_localization_anchor(parsed, final_state.get("failure_map") or [])
 
     # Feature 3: Evidence-conclusion grounding check
     # Downgrades confidence when the conclusion names specific resources or
