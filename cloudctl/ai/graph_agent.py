@@ -1777,6 +1777,15 @@ fault with its evidence, so a real cascade or coincident-failure incident is
 not silently reduced to a single cause. Only genuinely CONFIRMED, non-
 overlapping faults qualify; a weakly-supported second branch stays a ruled-out
 alternative.
+  BAR FOR A SECONDARY / ADDITIONAL CAUSE (apply the SAME standard you apply to
+  the primary): it must INDEPENDENTLY explain part of the REPORTED symptom and be
+  tied to an OBSERVED failure of a path that is actually exercised. A mere
+  configuration DIFFERENCE is not a fault: a permission a component never uses, a
+  value that is absent but unread, a setting that differs from a sibling but
+  breaks nothing — none of these are "confirmed faults", and appending them as
+  additional/secondary causes is noise that misleads the operator. State ONE
+  primary cause; add a secondary ONLY when the reported symptom would still occur
+  because of it. Do not pad the diagnosis with incidental observations.
 
 REQUIRED: You MUST populate alternatives_considered with every hypothesis that was
 investigated but ruled out. Each entry MUST have both a "hypothesis" and "reason" field
