@@ -640,16 +640,71 @@ def assess_observed_failure_grounding(fetched_data: dict | None) -> FailureGroun
 
 def annotate_failure_grounding(agent_output: dict, fetched_data: dict | None = None) -> dict:
     """Attach honest frontier metadata to the verdict: whether a failure was
-    actually observed, and which signals. Does NOT cap confidence (a silent fault
-    can be correctly diagnosed with no signal) — capping is the reasoning pass's
-    job, which can tell a VERIFIED mechanism from an ASSUMED one. This only makes
-    the grounding transparent on every verdict."""
+    actually observed, and which signals. Does NOT cap confidence."""
     grounding = assess_observed_failure_grounding(fetched_data)
     output = copy.deepcopy(agent_output)
     output["failure_grounding"] = {
         "observed_failure": grounding.observed_failure,
         "signals": grounding.signals,
     }
+    return output
+
+
+# A verdict that ASSERTS one of these runtime failures is claiming something that,
+# if real, WOULD have left an observed signal (a denial, an error, a non-2xx).
+# When the corpus contains no observed failure at all, such a claim is fabricated
+# — the failure was inferred, not seen. Deliberately specific (not bare "error",
+# which appears in benign contexts): only claims that imply a captured runtime
+# event. Silent-fault diagnoses ("the filter cannot match", "the flow is absent")
+# assert none of these, so they are never touched.
+_CLAIMED_RUNTIME_FAILURE_TERMS = (
+    "accessdenied", "access denied", "access is denied", "access to kms",
+    "not authorized to", "unauthorized", "permission denied", "is denied",
+    "throttl", "timeout", "timed out", "connection refused", "connection reset",
+    " 429", " 500", " 502", " 503", " 504", "5xx", "returned an error",
+    "threw an exception", "raised an exception", "accessdeniedexception",
+)
+
+
+def enforce_failure_grounding(agent_output: dict, fetched_data: dict | None = None) -> dict:
+    """Frontier-honest ENFORCEMENT (deterministic — the prompt alone did not hold).
+    Attach observed-failure metadata, and when the verdict CLAIMS a runtime failure
+    (an access denial, throttle, timeout, 5xx) that was NEVER observed in the
+    evidence, cap confidence to LOW and mark it a frontier verdict: the agent
+    inferred/fabricated the failure rather than observing it. Safe for silent
+    faults — a correctly diagnosed silent fault does not assert a runtime failure
+    signal, so it is left untouched."""
+    grounding = assess_observed_failure_grounding(fetched_data)
+    output = copy.deepcopy(agent_output)
+    output["failure_grounding"] = {
+        "observed_failure": grounding.observed_failure,
+        "signals": grounding.signals,
+    }
+    if grounding.observed_failure:
+        return output   # a real failure WAS observed — nothing fabricated
+    claimed_conf = output.get("confidence", "MEDIUM")
+    if claimed_conf == "LOW":
+        return output
+    root = str(agent_output.get("root_cause", "")).lower()
+    claimed = [t.strip() for t in _CLAIMED_RUNTIME_FAILURE_TERMS if t in root]
+    if not claimed:
+        return output   # no runtime-failure claim (e.g. a silent-fault diagnosis)
+    output["confidence"] = "LOW"
+    output["frontier"] = {
+        "observed_failure": False,
+        "claimed_but_unobserved": claimed[:3],
+        "note": ("The verdict asserts a runtime failure (" + ", ".join(claimed[:3])
+                 + ") that appears nowhere in the collected evidence — the failure "
+                 "was inferred, not observed. On a system whose internals you cannot "
+                 "see, this is exactly where a cause gets fabricated."),
+        "to_confirm": ("Reproduce the reported operation so the failure emits a real "
+                       "signal (a denial, an error, a non-2xx), then trace from it."),
+    }
+    output["confidence_override_reason"] = (
+        f"Confidence capped from {claimed_conf} to LOW (frontier): the root cause "
+        f"claims a runtime failure ({', '.join(claimed[:2])}) that was never observed "
+        "in the evidence. Reproduce the failing path to confirm before acting."
+    )
     return output
 
 

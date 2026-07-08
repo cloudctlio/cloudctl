@@ -2909,7 +2909,7 @@ def debug_incident_graph(
         verify_cited_values, redact_output,
         audit_log_agent_call, new_session_id,
         check_evidence_grounding, cap_speculative_dismissal,
-        annotate_failure_grounding,
+        enforce_failure_grounding,
     )
 
     rate_check = check_rate_limit()
@@ -3112,12 +3112,12 @@ def debug_incident_graph(
     # (needs all_fetched to verify the alarm is real, not invented).
     parsed = cap_speculative_dismissal(parsed, all_fetched)
 
-    # Frontier-honest core: surface whether a failure was actually OBSERVED, or
-    # the verdict rests on configuration inference (where the engine hallucinates
-    # on an unfamiliar workload). Honest metadata only — the reasoning pass owns
-    # any confidence change, since a silent fault can be correctly diagnosed with
-    # no observed signal.
-    parsed = annotate_failure_grounding(parsed, all_fetched)
+    # Frontier-honest core (ENFORCED): surface whether a failure was actually
+    # OBSERVED; and when the verdict CLAIMS a runtime failure (denial/throttle/
+    # timeout/5xx) that was never observed, cap it to an honest frontier verdict —
+    # the prompt-level discipline alone did not hold. Silent-fault diagnoses assert
+    # no such signal and are untouched.
+    parsed = enforce_failure_grounding(parsed, all_fetched)
 
     # Feature 3: Evidence-conclusion grounding check
     # Downgrades confidence when the conclusion names specific resources or
