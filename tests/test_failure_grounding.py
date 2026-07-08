@@ -62,8 +62,7 @@ def test_claimed_but_unobserved_denial_is_capped_to_frontier():
     enforced = enforce_failure_grounding(out, fetched)
     assert enforced["confidence"] == "LOW"
     assert enforced["frontier"]["observed_failure"] is False
-    assert any("access denied" in c or "accessdenied" in c
-               for c in enforced["frontier"]["claimed_but_unobserved"])
+    assert "runtime failure" in enforced["confidence_override_reason"]
 
 
 def test_claimed_denial_that_WAS_observed_is_not_capped():
@@ -75,6 +74,33 @@ def test_claimed_denial_that_WAS_observed_is_not_capped():
     enforced = enforce_failure_grounding(out, fetched)
     assert enforced["confidence"] == "HIGH"          # observed -> not capped
     assert "frontier" not in enforced
+
+
+def test_irrelevant_observed_failure_is_capped_to_frontier():
+    # rotation_not_enabled shape: a denial is present in the corpus (tangential),
+    # but the stated cause is a benign no-op stub — the denial does not correspond
+    # to that cause, so the verdict must not ride its confidence.
+    out = {"root_cause": "The rotator Lambda is a no-op stub that never writes rotated "
+                         "credentials to the backing store; rotation appears complete "
+                         "but the credential is never updated.",
+           "evidence": ["setSecret: no-op (no real database)"],
+           "confidence": "HIGH"}
+    fetched = {"probe_permission:tangential": {"decision": "implicitDeny"},
+               "get_service_config:rotator": {"Handler": "index.handler"}}
+    enforced = enforce_failure_grounding(out, fetched)
+    assert enforced["failure_grounding"]["observed_failure"] is True
+    assert enforced["confidence"] == "LOW"           # coincidental signal -> capped
+    assert "frontier" in enforced
+
+
+def test_relevant_observed_failure_survives():
+    # Same denial, but the cause IS about the denial -> relevant -> not capped.
+    out = {"root_cause": "The rotator role is denied kms:Decrypt (access denied), so "
+                         "rotation cannot decrypt the secret.",
+           "evidence": ["probe_permission kms:Decrypt -> implicitDeny"],
+           "confidence": "HIGH"}
+    fetched = {"probe_permission:kms": {"decision": "implicitDeny"}}
+    assert enforce_failure_grounding(out, fetched)["confidence"] == "HIGH"
 
 
 def test_annotate_is_metadata_only():

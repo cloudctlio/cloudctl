@@ -2225,6 +2225,21 @@ def synthesize_node(state: GraphState) -> dict:
             "first before concluding.\n\n"
         ) + discrimination_block
 
+    # ABSENCE reasoning (no hardcoded field names — the model reads the config it
+    # already fetched and reasons): a fault can be an ABSENCE — expected behaviour
+    # that simply never happens, which emits no error to localize to. This rule
+    # names no service and no field; it tells the model to consider the shape.
+    discrimination_block = (
+        "ABSENCE CHECK — before blaming a component that is merely logging, ask "
+        "whether the reported failure is that something EXPECTED never HAPPENS (a "
+        "process that never runs, a result that never appears, a step that is "
+        "skipped). If so, the fault is usually that the mechanism which SHOULD "
+        "produce it is turned off, not connected, or never invoked — verify from "
+        "the fetched configuration that the expected mechanism is actually enabled "
+        "and wired end-to-end. An absent/disabled mechanism explains a "
+        "nothing-happens symptom better than a component's benign normal activity.\n\n"
+    ) + discrimination_block
+
     system = _SYNTHESIZE_PROMPT.format(
         n=len(all_branch_results),
         discrimination_constraint=discrimination_block,

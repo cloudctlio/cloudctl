@@ -668,42 +668,71 @@ _CLAIMED_RUNTIME_FAILURE_TERMS = (
 
 def enforce_failure_grounding(agent_output: dict, fetched_data: dict | None = None) -> dict:
     """Frontier-honest ENFORCEMENT (deterministic — the prompt alone did not hold).
-    Attach observed-failure metadata, and when the verdict CLAIMS a runtime failure
-    (an access denial, throttle, timeout, 5xx) that was NEVER observed in the
-    evidence, cap confidence to LOW and mark it a frontier verdict: the agent
-    inferred/fabricated the failure rather than observing it. Safe for silent
-    faults — a correctly diagnosed silent fault does not assert a runtime failure
-    signal, so it is left untouched."""
+    A confident verdict must be grounded in an observed failure that is RELEVANT to
+    its stated cause. Two ways it fails, both capped to a LOW frontier verdict:
+
+      1. No failure observed, yet the verdict CLAIMS a runtime failure (denial /
+         throttle / timeout / 5xx) — fabricated.
+      2. A failure WAS observed, but its type does not correspond to the stated
+         cause (a denial in the corpus while the cause is a benign no-op) — the
+         signal is coincidental, so the verdict is really config-inferred and may
+         not borrow that failure's confidence.
+
+    Silent-fault diagnoses (no runtime-failure claim, no observed failure) are left
+    untouched. All checks use universal failure vocabulary, never service fields."""
     grounding = assess_observed_failure_grounding(fetched_data)
     output = copy.deepcopy(agent_output)
     output["failure_grounding"] = {
         "observed_failure": grounding.observed_failure,
         "signals": grounding.signals,
     }
-    if grounding.observed_failure:
-        return output   # a real failure WAS observed — nothing fabricated
     claimed_conf = output.get("confidence", "MEDIUM")
     if claimed_conf == "LOW":
         return output
     root = str(agent_output.get("root_cause", "")).lower()
-    claimed = [t.strip() for t in _CLAIMED_RUNTIME_FAILURE_TERMS if t in root]
-    if not claimed:
-        return output   # no runtime-failure claim (e.g. a silent-fault diagnosis)
+
+    if grounding.observed_failure:
+        # RELEVANCE (source-based — no vocabulary list): the verdict must actually
+        # be REASONING from an observed failure, i.e. its OWN cited evidence must
+        # contain a failure signal. A failure sitting elsewhere in the corpus that
+        # the verdict never cites is coincidental — the diagnosis is really inferred
+        # from configuration and may not borrow that failure's confidence. This
+        # reuses the universal failure detector on the evidence; it names no service
+        # and no field.
+        evidence_grounding = assess_observed_failure_grounding(
+            {"_evidence": list(agent_output.get("evidence") or [])})
+        if evidence_grounding.observed_failure:
+            return output   # the verdict cites an observed failure — grounded
+        cap_reason = (
+            "a failure is present in the evidence corpus (" + ", ".join(grounding.signals[:3])
+            + ") but the verdict's own cited evidence references none of it — the "
+            "signal is coincidental and the diagnosis is really inferred from configuration")
+        note = ("A failure was observed in the corpus but the verdict does not cite it — "
+                "the diagnosis is inferred from configuration, not grounded in an "
+                "observed failure it actually reasoned from.")
+    else:
+        # No failure observed. A runtime-failure CLAIM is fabricated; a silent-fault
+        # diagnosis (no such claim) is legitimate and left alone.
+        claimed = [t.strip() for t in _CLAIMED_RUNTIME_FAILURE_TERMS if t in root]
+        if not claimed:
+            return output
+        cap_reason = (
+            "the root cause claims a runtime failure (" + ", ".join(claimed[:2])
+            + ") that was never observed in the evidence")
+        note = ("The verdict asserts a runtime failure that appears nowhere in the "
+                "collected evidence — inferred, not observed.")
+
     output["confidence"] = "LOW"
     output["frontier"] = {
-        "observed_failure": False,
-        "claimed_but_unobserved": claimed[:3],
-        "note": ("The verdict asserts a runtime failure (" + ", ".join(claimed[:3])
-                 + ") that appears nowhere in the collected evidence — the failure "
-                 "was inferred, not observed. On a system whose internals you cannot "
-                 "see, this is exactly where a cause gets fabricated."),
-        "to_confirm": ("Reproduce the reported operation so the failure emits a real "
-                       "signal (a denial, an error, a non-2xx), then trace from it."),
+        "observed_failure": grounding.observed_failure,
+        "note": note,
+        "to_confirm": ("Reproduce the reported operation, or verify the expected "
+                       "mechanism, so a signal that MATCHES the cause is observed; "
+                       "then trace from it."),
     }
     output["confidence_override_reason"] = (
-        f"Confidence capped from {claimed_conf} to LOW (frontier): the root cause "
-        f"claims a runtime failure ({', '.join(claimed[:2])}) that was never observed "
-        "in the evidence. Reproduce the failing path to confirm before acting."
+        f"Confidence capped from {claimed_conf} to LOW (frontier): {cap_reason}. "
+        "Confirm against a signal that matches the cause before acting."
     )
     return output
 
