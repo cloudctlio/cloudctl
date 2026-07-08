@@ -409,6 +409,11 @@ _ALLOWED_TOOLS = {
     "probe_permission",
     "get_dependency_graph",
     "aws_read",
+    # Active reproduction (probe.py): opt-in (CLOUDCTL_ENABLE_PROBES), consent-
+    # gated per probe, and read-only by code (safe methods / provably non-
+    # mutating query payloads only, SSRF-guarded, budgeted). Without this entry
+    # scope enforcement silently blocked every reproduction the model requested.
+    "probe_http",
 }
 
 

@@ -27,6 +27,8 @@ def _probe_consent(plan: dict) -> dict:
     console.print()
     console.print("[bold yellow]⚠  Active reproduction requested[/bold yellow]")
     console.print(f"    [bold]{plan['method']}[/bold] {plan['url']}")
+    if plan.get("body"):
+        console.print(f"    body:   {plan['body']}")
     console.print(f"    why:    {plan['reason']}")
     console.print(f"    safety: [dim]{plan['safety']}[/dim]")
     if not _sys.stdin.isatty():
@@ -45,7 +47,11 @@ def _probe_consent(plan: dict) -> dict:
     if ans in ("p", "paste"):
         console.print("    Run this from anywhere that can reach it, then paste "
                       "the response body (end with an empty line):")
-        console.print(f"      [dim]curl -s -X {plan['method']} '{plan['url']}'[/dim]")
+        curl_cmd = f"curl -s -X {plan['method']} '{plan['url']}'"
+        if plan.get("body"):
+            curl_cmd += (" -H 'content-type: application/json' "
+                         f"-d '{plan['body']}'")
+        console.print(f"      [dim]{curl_cmd}[/dim]")
         lines: list[str] = []
         while True:
             try:
@@ -72,7 +78,8 @@ def _enable_active_reproduction() -> None:
     console.print(
         "\n[bold]Active reproduction is ON.[/bold] When passive telemetry can't "
         "settle the diagnosis, the agent may propose a [bold]read-only[/bold] "
-        "HTTP probe (a single GET/HEAD) to see what the service actually returns."
+        "HTTP probe (a single GET/HEAD, or a provably non-mutating query "
+        "request) to see what the service actually returns."
         "\n  • Every probe is shown to you first — nothing runs without approval."
         "\n  • Approve to have cloudctl run it, or run it yourself and paste the "
         "response (useful when the endpoint isn't reachable from here), or skip."

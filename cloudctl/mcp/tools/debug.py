@@ -1917,8 +1917,16 @@ _AGENT_TOOLS = [
                 "fault may live only in the response itself (a success status "
                 "carrying wrong data, one broken path); telemetry cannot show that "
                 "and reading more of it will not help — you must exercise the "
-                "system once and look. Strictly read-only (GET/HEAD only, "
-                "mutations blocked in code), budget-limited. "
+                "system once and look. The observed response (status, body, "
+                "timing) is ground truth for the failure MECHANISM: reason from "
+                "what it actually returned, never from what it 'should' return. "
+                "Strictly read-only (GET/HEAD always; POST admitted ONLY when "
+                "`body` is a provably non-mutating query document — anything "
+                "mutating is blocked in code), budget-limited. Use only "
+                "credentials discoverable from the environment (e.g. a key "
+                "already configured on the resource); never invent one — if no "
+                "credential is available, the response will say auth_sent=false "
+                "and an auth rejection is then inconclusive. "
                 "NOTE: each probe is shown to a human operator for approval before "
                 "it runs, so state a clear, specific reason; the operator may run "
                 "it for you and paste back the response, or decline. If declined, "
@@ -1930,9 +1938,16 @@ _AGENT_TOOLS = [
                     "url":     {"type": "string",
                                 "description": "endpoint URL discovered from config"},
                     "method":  {"type": "string",
-                                "description": "GET or HEAD (read-only only)"},
+                                "description": "GET or HEAD (read-only); POST only "
+                                "together with a read-only query `body`"},
                     "headers": {"type": "object",
                                 "description": "optional auth headers from config"},
+                    "body":    {"type": "string",
+                                "description": "optional payload for a query POST: "
+                                "a JSON object like {\"query\": \"...\"} whose "
+                                "document is a READ-ONLY query. Mutation/"
+                                "subscription payloads are rejected in code — "
+                                "never attempt one"},
                     "reason":  {"type": "string",
                                 "description": "one line: what you expect to learn "
                                 "and why passive evidence can't settle it (shown "

@@ -336,16 +336,77 @@ Conclude with ONLY this JSON:
 }
 """
 
+# Reproduce-first addendum — appended to the observe prompt ONLY when active
+# reproduction is enabled (--reproduce). Service-agnostic by design: it is
+# keyed on the INTERACTION PATTERN (a user-facing operation with an
+# HTTP-reachable entry point), names no service, and prescribes no expected
+# response content. When probing is off, the observe prompt and toolset are
+# byte-identical to before, so passive-only investigations are unaffected.
+_OBSERVE_REPRODUCE_ADDENDUM = """\
+
+REPRODUCE FIRST — the strongest possible measurement of a user-facing symptom
+is the operation's own CONCRETE response, not telemetry about it. If the
+reported symptom concerns an operation a user invokes and that operation has an
+HTTP-reachable entry point:
+  a. Discover the entry point's URL — and any probing credential already
+     configured on the resource and intended for callers (e.g. an existing
+     key) — using list_resources and read-only aws_read calls. Use ONLY
+     credentials you actually discovered; NEVER invent, guess, or mint one.
+  b. Exercise the operation ONCE with probe_http, the way the user would
+     (same path, same operation). Send only a safe request: a plain GET, or a
+     read-only query payload via `body`. Never anything that could mutate
+     state (mutating requests are also blocked in code).
+  c. Record the CONCRETE response — status code, body, timing — verbatim in
+     your measurements. What the operation actually returned outranks every
+     other reading.
+If reproduction is not possible (no HTTP entry point, endpoint unreachable,
+no discoverable credential, probe declined, non-HTTP operation), record that
+plainly and measure passively instead. NEVER guess or invent what the response
+would have been — an unreproduced response is unknown.
+When you attempted reproduction, ALSO include in the concluding JSON:
+  "reproduction": "concrete observed response (status/body/timing), or 'not possible: <reason>'"
+You may use up to 7 tool calls total when reproducing.
+"""
+
 
 def observe_node(state: GraphState) -> dict:
     from cloudctl.mcp.tools.debug import (
         _AGENT_TOOLS, _truncate_tool_output,
         list_resources, tail_logs, query_metrics, get_event_timeline,
+        aws_read,
     )
+    from cloudctl.mcp.tools.probe import _probes_enabled
     from cloudctl.ai.guardrails import validate_tool_call, audit_log_tool_call
 
     bedrock = _make_bedrock(state["profile"], state["region"])
     allowed = {"list_resources", "tail_logs", "query_metrics", "get_event_timeline"}
+    # Reproduce-first (opt-in): when active reproduction is enabled, observe may
+    # also DISCOVER the symptom's entry point (aws_read, read-only) and EXERCISE
+    # it once (probe_http, consent-gated) so the concrete response — not a
+    # narrative about it — is the primary measurement. When probing is off the
+    # toolset and prompt are unchanged, so existing investigations are untouched.
+    reproduce_enabled = _probes_enabled()
+    if reproduce_enabled:
+        allowed |= {"aws_read", "probe_http"}
+
+    # Deterministic capture of every reproduction attempt: the concrete response
+    # is carried into the observation verbatim (bounded), independent of how the
+    # model chooses to summarize it — so synthesis sees what ACTUALLY happened.
+    reproductions: list = []
+
+    def _capture_reproduction(tool_input: dict, raw: str) -> None:
+        try:
+            resp = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            resp = {"raw": str(raw)[:800]}
+        if isinstance(resp, dict) and isinstance(resp.get("body"), str) \
+                and len(resp["body"]) > 1500:
+            resp = {**resp, "body": resp["body"][:1500] + "…[truncated]"}
+        reproductions.append({
+            "url": str(tool_input.get("url", "")),
+            "method": str(tool_input.get("method") or "GET").upper(),
+            "response": resp,
+        })
 
     def _dispatch(tool_name: str, tool_input: dict) -> str:
         tc = validate_tool_call(
@@ -387,6 +448,23 @@ def observe_node(state: GraphState) -> dict:
                 raw = get_event_timeline(tool_input["symptom"],
                                          state["profile"], state["region"],
                                          state["minutes"])
+            elif tool_name == "aws_read":
+                raw = aws_read(
+                    service=tool_input["service"],
+                    operation=tool_input["operation"],
+                    params=tool_input.get("params") or {},
+                    profile=state["profile"], region=state["region"],
+                )
+            elif tool_name == "probe_http":
+                from cloudctl.mcp.tools.probe import probe_http_gated
+                raw = probe_http_gated(
+                    url=tool_input["url"],
+                    method=tool_input.get("method", "GET"),
+                    headers=tool_input.get("headers") or {},
+                    reason=tool_input.get("reason", ""),
+                    body=tool_input.get("body") or None,
+                )
+                _capture_reproduction(tool_input, raw)
             else:
                 return json.dumps({"error": f"tool not allowed here: {tool_name}"})
         except Exception as exc:
@@ -394,19 +472,23 @@ def observe_node(state: GraphState) -> dict:
         return _truncate_tool_output(raw, tool_name)
 
     tools = [t for t in _AGENT_TOOLS if t["toolSpec"]["name"] in allowed]
+    system_text = _OBSERVE_SYSTEM + (
+        _OBSERVE_REPRODUCE_ADDENDUM if reproduce_enabled else ""
+    )
     msgs = [{"role": "user", "content": [{"text": (
         f"Reported symptom: {state['symptom']}\n\n"
         f"Measure this symptom in real data now."
     )}]}]
     observation: dict = {}
-    for _ in range(8):
+    for _ in range(10 if reproduce_enabled else 8):
         try:
             resp = bedrock.converse(
                 modelId=_MODEL,
-                system=_sys(_OBSERVE_SYSTEM),
+                system=_sys(system_text),
                 messages=_conv(msgs),
                 toolConfig=_cached_tools(tools),
-                inferenceConfig={"maxTokens": 700, "temperature": 0},
+                inferenceConfig={"maxTokens": 900 if reproduce_enabled else 700,
+                                 "temperature": 0},
             )
         except Exception as exc:
             # Never fail silently — an empty observation that hides its cause
@@ -440,6 +522,15 @@ def observe_node(state: GraphState) -> dict:
                     })
             if tool_results:
                 msgs.append({"role": "user", "content": tool_results})
+
+    # First-class reproduction evidence: attach the CONCRETE responses verbatim
+    # (deterministically captured above) so downstream nodes and the grounding
+    # corpus see exactly what the exercised operation returned — never only the
+    # model's paraphrase of it. No-op when no reproduction was attempted.
+    if reproductions:
+        if not isinstance(observation, dict):
+            observation = {}
+        observation["reproduction_observed"] = reproductions
 
     return {"observation": observation}
 
@@ -1029,6 +1120,7 @@ def _run_branch(
                 method=tool_input.get("method", "GET"),
                 headers=tool_input.get("headers") or {},
                 reason=tool_input.get("reason", ""),
+                body=tool_input.get("body") or None,
             )
         else:
             return json.dumps({"error": f"unknown tool: {tool_name}"})
@@ -1598,6 +1690,11 @@ Rule 2 — Evidence quality test:
   Prefer evidence from direct observation (log line content, metric value)
   over inferences. "The data shows X" is observation; "X COULD mean Y" is
   inference — an inference never outweighs a direct observation.
+  A REPRODUCED response (the failing operation actually exercised, its concrete
+  status/body/timing captured, e.g. under reproduction_observed) is the
+  strongest direct observation of the symptom itself: weigh it above telemetry
+  ABOUT the operation, and treat a proposed mechanism that would have produced
+  a DIFFERENT concrete response as contradicted by the reproduction.
 
 Rule 3 — Parsimony:
   The simplest explanation consistent with ALL observations is preferred.
@@ -1763,6 +1860,28 @@ MECHANISM & FRONTIER (the honesty test — apply to your chosen cause before shi
   An honest frontier verdict that tells the operator where you got to and what is
   needed is worth far more than a confident guess that sends them down a dead end
   — and it is the ONLY safe output on a system whose internals you cannot see.
+
+REPRODUCED RESPONSE CONSISTENCY (binding whenever the operation was actually
+exercised): if the investigation REPRODUCED the failing operation — a probe or
+reproduction result with a concrete observed response (status, body, timing) —
+that concrete response is the primary ground truth for the failure MECHANISM,
+and the specific cause you assert must be CONSISTENT with it:
+  - a response that SUCCEEDED but carried wrong, empty, or missing payload
+    points at whatever PRODUCES the payload (data, mapping, transformation,
+    logic) — it RULES OUT latency, timeout, reachability, and availability
+    mechanisms for that operation;
+  - an authentication/authorization rejection points at the credential or the
+    auth configuration handshake between caller and entry point (but if the
+    probe carried NO credential — auth_sent=false — the rejection may only
+    reflect the missing credential and is inconclusive);
+  - a server-side error status points at the component behind the entry point;
+  - only an actually observed timeout or connection failure supports a latency
+    or reachability mechanism.
+Never assert a specific mechanism that would have produced a DIFFERENT concrete
+response than the one observed. If reproduction was attempted but not possible
+(unreachable, no credential, declined, non-HTTP), the response-level mechanism
+is at the FRONTIER: apply the rule above — do not invent what the response
+"would have been".
 
 Select the hypothesis with the strongest direct evidence from real AWS data.
 If multiple branches found real issues, list them all in evidence.
