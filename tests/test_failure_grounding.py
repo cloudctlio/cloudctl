@@ -76,31 +76,40 @@ def test_claimed_denial_that_WAS_observed_is_not_capped():
     assert "frontier" not in enforced
 
 
-def test_irrelevant_observed_failure_is_capped_to_frontier():
-    # rotation_not_enabled shape: a denial is present in the corpus (tangential),
-    # but the stated cause is a benign no-op stub — the denial does not correspond
-    # to that cause, so the verdict must not ride its confidence.
-    out = {"root_cause": "The rotator Lambda is a no-op stub that never writes rotated "
-                         "credentials to the backing store; rotation appears complete "
-                         "but the credential is never updated.",
-           "evidence": ["setSecret: no-op (no real database)"],
+def test_absence_diagnosis_not_capped_by_tangential_failure():
+    # rotation_not_enabled shape (CORRECT diagnosis): the cause is an absence —
+    # rotation is disabled — grounded in a state the verdict directly read, not an
+    # error. A tangential denial elsewhere in the corpus must NOT cap it; an absence
+    # diagnosis does not claim a runtime failure, so it keeps its confidence.
+    out = {"root_cause": "RotationEnabled is false and no rotation schedule is bound, "
+                         "so the scheduler never fires and rotation never runs.",
+           "evidence": ["describe_secret: RotationEnabled=false",
+                        "RotationAttempted metric: 0 datapoints"],
            "confidence": "HIGH"}
-    fetched = {"probe_permission:tangential": {"decision": "implicitDeny"},
-               "get_service_config:rotator": {"Handler": "index.handler"}}
+    fetched = {"probe_permission:tangential": {"decision": "implicitDeny"}}
     enforced = enforce_failure_grounding(out, fetched)
-    assert enforced["failure_grounding"]["observed_failure"] is True
-    assert enforced["confidence"] == "LOW"           # coincidental signal -> capped
-    assert "frontier" in enforced
+    assert enforced["confidence"] == "HIGH"          # absence diagnosis -> not capped
+    assert "frontier" not in enforced
 
 
-def test_relevant_observed_failure_survives():
-    # Same denial, but the cause IS about the denial -> relevant -> not capped.
+def test_claimed_failure_that_cites_its_denial_survives():
+    # Claims a denial AND cites the observed denial in its evidence -> grounded.
     out = {"root_cause": "The rotator role is denied kms:Decrypt (access denied), so "
                          "rotation cannot decrypt the secret.",
            "evidence": ["probe_permission kms:Decrypt -> implicitDeny"],
            "confidence": "HIGH"}
     fetched = {"probe_permission:kms": {"decision": "implicitDeny"}}
     assert enforce_failure_grounding(out, fetched)["confidence"] == "HIGH"
+
+
+def test_claimed_failure_citing_no_observed_failure_is_capped():
+    # Claims a denial but its evidence cites none observed -> fabricated/coincidental.
+    out = {"root_cause": "AccessDenied blocked every invocation of the rotator.",
+           "evidence": ["the handler is a no-op stub"],
+           "confidence": "HIGH"}
+    fetched = {"probe_permission:x": {"decision": "allowed"}}
+    enforced = enforce_failure_grounding(out, fetched)
+    assert enforced["confidence"] == "LOW" and "frontier" in enforced
 
 
 def test_annotate_is_metadata_only():
