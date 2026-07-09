@@ -1959,6 +1959,51 @@ _AGENT_TOOLS = [
     },
     {
         "toolSpec": {
+            "name": "native_reproduce",
+            "description": (
+                "NATIVE-FIRST reproduction: exercise a discovered operation "
+                "SERVER-SIDE through the AWS control plane using cloudctl's own "
+                "IAM role — no network path to the endpoint and no separate "
+                "auth, so it reproduces operations the HTTP probe cannot reach "
+                "(e.g. one behind an identity provider). PREFER this over "
+                "probe_http whenever it is available for the resource type. It "
+                "uses ONLY pure evaluation / documented test APIs that AWS runs "
+                "without touching the deployed stage (side-effect-free — never a "
+                "live invoke or mutation). It returns the RAW produced result "
+                "(evaluation output, or test status+body+logs); reason from what "
+                "it actually produced, never from what it 'should' produce. "
+                "Supply service_type (from list_resources) and the identifiers/"
+                "inputs the primitive needs in params — e.g. for a resolver, the "
+                "response mapping 'template' (or 'code') you READ plus a sample "
+                "'context'; for an API method, rest_api_id + resource_id + a "
+                "read-only http_method + path. If it returns "
+                "native_reproduction=unavailable (no primitive for the type, "
+                "access denied, or missing inputs), FALL BACK to probe_http, "
+                "then to the frontier-honest verdict — never fabricate the "
+                "result."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "service_type": {"type": "string",
+                                     "description": "resource/service type to "
+                                     "reproduce (e.g. the namespace from "
+                                     "list_resources)"},
+                    "params":       {"type": "object",
+                                     "description": "identifiers + inputs the "
+                                     "primitive needs (e.g. template/code+context, "
+                                     "or rest_api_id+resource_id+http_method+path). "
+                                     "All READ from config; no expected values"},
+                    "reason":       {"type": "string",
+                                     "description": "one line: what you expect to "
+                                     "learn (shown to the operator who approves)"},
+                },
+                "required": ["service_type", "reason"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
             "name": "get_dependency_graph",
             "description": (
                 "Build the REAL dependency graph of the deployed application: "

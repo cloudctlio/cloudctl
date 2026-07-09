@@ -414,6 +414,10 @@ _ALLOWED_TOOLS = {
     # mutating query payloads only, SSRF-guarded, budgeted). Without this entry
     # scope enforcement silently blocked every reproduction the model requested.
     "probe_http",
+    # Native-first reproduction (probe.py): control-plane pure evaluation /
+    # documented test APIs via cloudctl's own IAM role — side-effect-free,
+    # opt-in, consent-gated, budgeted. Same governance as probe_http.
+    "native_reproduce",
 }
 
 

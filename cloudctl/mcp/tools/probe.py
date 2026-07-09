@@ -357,3 +357,262 @@ def probe_http(url: str, method: str = "GET", headers: dict | None = None,
                     elapsed_ms=_elapsed_ms(),
                     timed_out=timed_out,
                     probes_used=_PROBE_STATS["used"])
+
+
+# ── Native reproduction primitives (control-plane, NATIVE-FIRST) ──────────────
+# A native primitive reproduces an operation THROUGH THE AWS CONTROL PLANE using
+# cloudctl's own IAM role — no network path to the endpoint, no separate auth,
+# and it reaches cases the HTTP path cannot (an operation behind an identity
+# provider). It is keyed by RESOURCE/SERVICE TYPE: this is HOW to exercise a
+# type, exactly like the per-service config FETCHERS elsewhere in cloudctl —
+# a capability map, not incident knowledge. A primitive returns the RAW produced
+# result and encodes NO expected value, NO scenario/incident name, and makes NO
+# judgement about whether the result is "correct": the model reasons over the
+# raw output.
+#
+# SAFE-EVAL-ONLY (this increment): every primitive here uses a PURE EVALUATION
+# or a DOCUMENTED TEST API that AWS runs without touching the deployed stage.
+# No primitive calls an execute/mutate API (no lambda:Invoke, no live request).
+# When a test API can drive an underlying integration, the primitive is further
+# restricted to READ-ONLY inputs (safe HTTP methods only) so it can never
+# trigger a mutating integration.
+_MAX_NATIVE_INPUT_BYTES = 32 * 1024
+
+
+def _native_result(primitive: str, **fields) -> dict:
+    out = {"reproduced_via": primitive, "side_effect_free": True}
+    out.update(fields)
+    return out
+
+
+def _native_reason(reason: str, **extra) -> dict:
+    """A structured 'could not reproduce natively' — never an exception, so the
+    caller falls back (native → HTTP probe → paste-back → frontier-honest)."""
+    return {"native_reproduction": "unavailable", "reason": reason, **extra}
+
+
+def _is_access_denied(exc) -> bool:
+    code = ""
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        code = str(resp.get("Error", {}).get("Code", ""))
+    blob = f"{code} {exc}".lower()
+    return any(w in blob for w in ("accessdenied", "unauthorized", "forbidden",
+                                   "not authorized"))
+
+
+def _bounded_str(value, limit: int = _MAX_BODY_BYTES) -> str:
+    s = "" if value is None else str(value)
+    return s if len(s) <= limit else s[:limit] + "…[truncated]"
+
+
+def _native_appsync(session, params: dict) -> dict:
+    """Reproduce a resolver's mapping/code SERVER-SIDE via a PURE evaluation API
+    (EvaluateMappingTemplate for VTL, EvaluateCode for JS). AWS evaluates the
+    supplied template against the supplied context and returns the RAW output —
+    no data source is touched and nothing downstream executes, so it is
+    side-effect-free and works even when the operation sits behind an identity
+    provider. The template/context are whatever the model discovered via
+    read-only reads; this primitive supplies no template and asserts nothing
+    about what the produced output ought to contain."""
+    template = params.get("template")
+    code = params.get("code")
+    context = params.get("context")
+    if not context:
+        return _native_reason(
+            "appsync evaluation needs a sample 'context' (JSON string) to "
+            "evaluate the mapping against — discover/construct one and retry")
+    if isinstance(context, (dict, list)):
+        context = json.dumps(context)
+    for name, val in (("template", template), ("code", code), ("context", context)):
+        if isinstance(val, str) and len(val.encode("utf-8", "replace")) > _MAX_NATIVE_INPUT_BYTES:
+            return _native_reason(f"'{name}' exceeds the {_MAX_NATIVE_INPUT_BYTES}B input cap")
+    if not code and not template:
+        return _native_reason(
+            "provide the resolver 'template' (VTL) or 'code' (JS) to evaluate — "
+            "read it with a read-only API first")
+    via = "appsync:EvaluateCode" if code else "appsync:EvaluateMappingTemplate"
+    try:
+        client = session.client("appsync")
+    except Exception as exc:  # noqa: BLE001
+        return _native_reason(f"could not create appsync client: {type(exc).__name__}")
+    try:
+        if code:
+            runtime = params.get("runtime") or {"name": "APPSYNC_JS",
+                                                "runtimeVersion": "1.0.0"}
+            function = params.get("function") or "request"
+            resp = client.evaluate_code(runtime=runtime, code=code,
+                                        context=context, function=function)
+        else:
+            resp = client.evaluate_mapping_template(template=template,
+                                                    context=context)
+    except Exception as exc:  # noqa: BLE001
+        if _is_access_denied(exc):
+            return _native_reason(
+                f"could not reproduce (access denied to {via}): "
+                f"{type(exc).__name__} — the IAM role cloudctl uses lacks the "
+                "evaluate permission; falling back",
+                access_denied=True)
+        return _native_reason(f"native appsync evaluation failed: "
+                              f"{type(exc).__name__}: {str(exc)[:200]}")
+    # RAW result verbatim — evaluationResult is the produced payload; error/logs
+    # are AWS's own, not our judgement.
+    return _native_result(
+        via,
+        evaluation_result=_bounded_str(resp.get("evaluationResult")),
+        error=resp.get("error"),
+        logs=resp.get("logs"),
+    )
+
+
+def _native_apigateway(session, params: dict) -> dict:
+    """Reproduce an API method SERVER-SIDE via the documented test-invoke API
+    (apigateway:TestInvokeMethod). AWS runs the method through the control plane
+    and returns the RAW status, body, headers, latency, and execution log —
+    without deploying or hitting the live stage. RESTRICTED to read-only HTTP
+    methods so a test-invoke can never drive a mutating integration."""
+    rest_api_id = params.get("rest_api_id") or params.get("restApiId")
+    resource_id = params.get("resource_id") or params.get("resourceId")
+    http_method = (params.get("http_method") or params.get("httpMethod")
+                   or "GET").upper()
+    if http_method not in _SAFE_METHODS:
+        return _native_reason(
+            f"test-invoke restricted to read-only methods {sorted(_SAFE_METHODS)}; "
+            f"'{http_method}' could drive a mutating integration — refused",
+            unsafe_method=True)
+    if not rest_api_id or not resource_id:
+        return _native_reason(
+            "provide rest_api_id and resource_id (discover them with a read-only "
+            "get-resources / get-rest-apis call) to test-invoke a method")
+    path = params.get("path") or params.get("pathWithQueryString") or "/"
+    try:
+        client = session.client("apigateway")
+    except Exception as exc:  # noqa: BLE001
+        return _native_reason(f"could not create apigateway client: {type(exc).__name__}")
+    try:
+        resp = client.test_invoke_method(
+            restApiId=rest_api_id,
+            resourceId=resource_id,
+            httpMethod=http_method,
+            pathWithQueryString=path,
+            body=params.get("body") or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_access_denied(exc):
+            return _native_reason(
+                "could not reproduce (access denied to "
+                "apigateway:TestInvokeMethod): the IAM role cloudctl uses lacks "
+                "the test-invoke permission; falling back", access_denied=True)
+        return _native_reason(f"native apigateway test-invoke failed: "
+                              f"{type(exc).__name__}: {str(exc)[:200]}")
+    return _native_result(
+        "apigateway:test-invoke-method",
+        status=resp.get("status"),
+        body=_bounded_str(resp.get("body")),
+        headers=resp.get("headers"),
+        latency_ms=resp.get("latency"),
+        log=_bounded_str(resp.get("log")),
+    )
+
+
+# Capability map: resource/service type → the side-effect-free primitive that
+# exercises it. Keys are the ARN service namespaces list_resources already emits
+# (e.g. "appsync", "apigateway"). Adding a type is adding a HOW, never a hint.
+_NATIVE_PRIMITIVES = {
+    "appsync":       _native_appsync,
+    "apigateway":    _native_apigateway,
+    "api-gateway":   _native_apigateway,
+    "execute-api":   _native_apigateway,
+}
+
+
+def native_primitive_available(service_type: str) -> bool:
+    return _select_native_primitive(service_type) is not None
+
+
+def _select_native_primitive(service_type: str):
+    """Route a service/resource type to its primitive. Matches on the type token
+    generically (namespace or a hyphen/colon-delimited segment of it), so an ARN
+    namespace or a plain type name both resolve — with no case-specific logic."""
+    t = (service_type or "").strip().lower()
+    if not t:
+        return None
+    if t in _NATIVE_PRIMITIVES:
+        return _NATIVE_PRIMITIVES[t]
+    # tolerate composite identifiers (e.g. "aws:appsync", "appsync/graphql")
+    for token in re.split(r"[:/\s]+", t):
+        if token in _NATIVE_PRIMITIVES:
+            return _NATIVE_PRIMITIVES[token]
+    return None
+
+
+def native_reproduce_gated(service_type: str, params: dict | None,
+                           profile: str | None, region: str,
+                           reason: str = "") -> str:
+    """NATIVE-FIRST reproduction entry point. Prefers the control-plane test/
+    evaluate primitive for the resource type; on no-primitive / access-denied /
+    any error it returns a structured 'unavailable' signal so the caller falls
+    back (native → HTTP probe → paste-back → frontier-honest). Consent-gated and
+    budget-counted, exactly like the HTTP probe — the operator still sees what
+    will run, but there is no network path or separate credential involved."""
+    if not _probes_enabled():
+        return _err("reproduction disabled — enable with --reproduce "
+                    "(or CLOUDCTL_ENABLE_PROBES=1) to allow consent-gated, "
+                    "read-only reproduction")
+
+    primitive = _select_native_primitive(service_type)
+    if primitive is None:
+        return json.dumps(_native_reason(
+            f"no side-effect-free test/evaluate primitive for resource type "
+            f"'{service_type}' — fall back to probe_http (HTTP reproduction) or, "
+            f"if unreachable, the frontier-honest verdict"))
+
+    if _PROBE_STATS["used"] >= _MAX_PROBES_PER_INVESTIGATION:
+        return _err(f"probe budget exhausted ({_MAX_PROBES_PER_INVESTIGATION} "
+                    "per investigation)")
+
+    plan = {
+        "action": "reproduce-native",
+        "method": "CONTROL-PLANE",
+        "service_type": service_type,
+        "url": f"aws:{service_type} (server-side test/evaluate)",
+        "reason": reason or "(no reason given)",
+        "safety": ("server-side pure evaluation / documented test API via "
+                   "cloudctl's own IAM role — no network path, no separate "
+                   "auth, side-effect-free (no live invoke/mutation)"),
+    }
+
+    with _CONSENT_LOCK:
+        decision = _resolve_decision(plan)
+        choice = (decision.get("decision") or "skip").lower()
+        if choice not in ("approve", "a", "yes", "y"):
+            return json.dumps({
+                "probe_declined": True,
+                "note": ("operator declined native reproduction. Do NOT claim "
+                         "the operation's result was verified; reason only from "
+                         "passive evidence and say so if the fault may be "
+                         "runtime-only and thus unverified."),
+                "reason": decision.get("reason", "operator skipped"),
+            })
+        # Admitted: count against the shared reproduction budget.
+        _PROBE_STATS["used"] += 1
+        try:
+            session = _native_session(profile, region)
+            result = primitive(session, params or {})
+        except Exception as exc:  # noqa: BLE001
+            # Graceful: any unexpected failure is a structured signal, never an
+            # exception that derails the investigation.
+            result = _native_reason(f"native reproduction error: "
+                                    f"{type(exc).__name__}: {str(exc)[:200]}")
+        if isinstance(result, dict):
+            result.setdefault("_reproduction", "cloudctl-executed (control-plane, operator approved)")
+            result["probes_used"] = _PROBE_STATS["used"]
+        return json.dumps(result, default=str)
+
+
+def _native_session(profile: str | None, region: str):
+    """Boto session for native primitives — reuses the bounded, validated
+    session factory the rest of the tools use (timeouts, profile/region
+    validation), so native reproduction inherits the same guarantees."""
+    from cloudctl.mcp.tools.debug import _make_session
+    return _make_session(profile, region)

@@ -23,6 +23,7 @@ def _probe_consent(plan: dict) -> dict:
     """Interactive consent gate for one reproduction probe. Shows the operator
     exactly what will run and why, then returns their decision. Runs under the
     probe module's lock, so prompts never overlap across parallel branches."""
+    import os as _os  # noqa: PLC0415
     import sys as _sys  # noqa: PLC0415
     console.print()
     console.print("[bold yellow]⚠  Active reproduction requested[/bold yellow]")
@@ -31,6 +32,14 @@ def _probe_consent(plan: dict) -> dict:
         console.print(f"    body:   {plan['body']}")
     console.print(f"    why:    {plan['reason']}")
     console.print(f"    safety: [dim]{plan['safety']}[/dim]")
+    # Explicit unattended auto-approve (CI / replay / batch) must be honored even
+    # though the interactive handler is registered — otherwise the non-TTY branch
+    # below silently declines and CLOUDCTL_PROBE_AUTO can never take effect. Safe
+    # default is unchanged: absent this explicit opt-in, a non-TTY session still
+    # declines.
+    if _os.environ.get("CLOUDCTL_PROBE_AUTO", "").lower() in ("approve", "yes", "y"):
+        console.print("[dim]    CLOUDCTL_PROBE_AUTO=approve — auto-approving[/dim]")
+        return {"decision": "approve"}
     if not _sys.stdin.isatty():
         console.print("[dim]    non-interactive session — declining probe[/dim]")
         return {"decision": "skip", "reason": "non-interactive session"}
