@@ -25,6 +25,18 @@ def test_http_5xx_and_nonzero_errors_are_observed_failures():
         {"query_metrics:x": {"Errors": 7}}).observed_failure
 
 
+def test_camelcase_status_code_is_an_observed_failure():
+    # Regression: AWS/AppSync/API-Gateway/Lambda all render this field as
+    # "statusCode" (camelCase). The http_error_status pattern was missing
+    # re.I, so camelCase-only evidence silently failed to ground a correct
+    # verdict, capping it to LOW even when a real 401/5xx was directly quoted.
+    assert assess_observed_failure_grounding(
+        {"_evidence": ["response statusCode=401 UnauthorizedException"]}
+    ).observed_failure
+    assert assess_observed_failure_grounding(
+        {"tail_logs:x": {"statusCode": 500}}).observed_failure
+
+
 def test_zero_errors_is_not_an_observed_failure():
     r = assess_observed_failure_grounding({"query_metrics:x": {"Errors": 0, "Invocations": 0}})
     assert not r.observed_failure and r.signals == []

@@ -633,7 +633,7 @@ class FailureGroundingResult:
 _FAILURE_SIGNAL_PATTERNS = (
     ("permission_denied",     re.compile(r'\b(implicit|explicit)deny\b', re.I)),
     ("permission_denied",     re.compile(r'"?decision"?\s*[:=]\s*"?\w*denied', re.I)),
-    ("http_error_status",     re.compile(r'"?status(?:_?code)?"?\s*[:=]\s*"?[45]\d\d\b')),
+    ("http_error_status",     re.compile(r'"?status(?:_?code)?"?\s*[:=]\s*"?[45]\d\d\b', re.I)),
     ("nonzero_error_metric",  re.compile(r'"(errors?|faults?|throttl\w*|[45]xxerror\w*)"\s*:\s*[1-9]', re.I)),
     ("failed_state",          re.compile(r'"?(status|state|health\w*)"?\s*[:=]\s*"?(failed|failing|unhealthy|impaired|critical)\b', re.I)),
     ("aws_error_code",        re.compile(r'\b(accessdenied\w*|throttlingexception|serviceunavailable|provisionedthroughputexceeded|resourcenotfound\w*exception|timeout\w*exception)\b', re.I)),
