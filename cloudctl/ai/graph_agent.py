@@ -918,6 +918,16 @@ failing path is suspect and you cannot tell whether it is wrong by itself:
 Cite the old→new or peer-vs-peer values VERBATIM as evidence. A diff alone is
 not proof — the changed/divergent field must still explain the observed failure.
 
+ANCHOR-FIRST rule — when you differential-compare or reproduce, run it FIRST on
+the resource where the failure was actually, specifically observed (the
+component emitting the failure — or, when nothing downstream shows any
+activity, the resource you tested/probed the symptom against), BEFORE widening
+to resources further away in the dependency graph. A coincidental change found
+on an unrelated resource you merely happened to be inspecting is the classic
+wrong turn. The causal_search tool does this ordering for you: it identifies
+the anchor, differential-checks it, then widens outward ring by ring,
+returning the ranked trail as evidence.
+
 CALL-GRAPH rule — for any latency, timeout, or error-that-propagates-across-
 services symptom, get_traces is the richest single signal: it returns the
 service-dependency graph with per-edge latency/error/fault/throttle rates and
@@ -1051,6 +1061,7 @@ def _run_branch(
     region: str,
     minutes: int,
     session_id: str,
+    failure_map: list | None = None,
 ) -> BranchResult:
     from cloudctl.mcp.tools.debug import (
         _AGENT_TOOLS, _truncate_tool_output,
@@ -1182,6 +1193,21 @@ def _run_branch(
                 peer_names=tool_input.get("peer_names") or None,
                 configs=tool_input.get("configs") or None,
             )
+        elif tool_name == "causal_search":
+            # Anchored ring search: anchor identification uses only generic
+            # signals — the observed-emitting component (failure_map) or the
+            # reproduction/probe target already recorded in THIS branch's
+            # evidence store. Bounded and read-only; degrades to a structured
+            # available=false result.
+            from cloudctl.debug.causal_search_aws import causal_search_aws
+            raw = json.dumps(causal_search_aws(
+                profile=profile, region=region,
+                failure_map=failure_map,
+                evidence_store=branch_fetched,
+                anchor_hint=tool_input.get("anchor_hint") or None,
+                minutes=int(tool_input.get("minutes") or 10080),
+                max_rings=int(tool_input.get("max_rings") or 3),
+            ), default=str)
         else:
             return json.dumps({"error": f"unknown tool: {tool_name}"})
 
@@ -1450,6 +1476,7 @@ def investigate_node(state: GraphState) -> dict:
                 _run_branch,
                 h, state["symptom"], state["profile"],
                 state["region"], state["minutes"], state["session_id"],
+                state.get("failure_map"),
             ): h
             for h in state["hypotheses"]
         }
@@ -2358,6 +2385,7 @@ def synthesize_node(state: GraphState) -> dict:
                 state["region"],
                 state["minutes"],
                 state["session_id"],
+                failure_map=state.get("failure_map"),
             )
             all_branch_results.append(arb_result.model_dump())
             _merge_fetched(all_fetched_merged, arb_result.all_fetched)
@@ -3014,6 +3042,7 @@ def reinvestigate_node(state: GraphState) -> dict:
             region=state["region"],
             minutes=state["minutes"],
             session_id=state["session_id"],
+            failure_map=state.get("failure_map"),
         )
         new_branches = list(state["branch_results"]) + [result.model_dump()]
         new_fetched = dict(state.get("all_fetched", {}))
@@ -3372,6 +3401,14 @@ def debug_incident_graph(
     # failures actually are. No-op when the failure map is empty (silent fault).
     from cloudctl.debug.localize import enforce_localization_anchor
     parsed = enforce_localization_anchor(parsed, final_state.get("failure_map") or [])
+
+    # ANCHORED CAUSAL SEARCH pillar: when ring-ordered anchor evidence exists but
+    # the verdict names a cause at ring distance > 0 while the anchor itself was
+    # never differential-checked, soft-cap confidence ONE step with a structured
+    # note (same shape/discipline as the frontier and localization enforcers —
+    # never a hard block). No-op when no causal_search evidence was gathered.
+    from cloudctl.debug.causal_search_aws import enforce_causal_anchor
+    parsed = enforce_causal_anchor(parsed, all_fetched)
 
     # Feature 3: Evidence-conclusion grounding check
     # Downgrades confidence when the conclusion names specific resources or

@@ -422,6 +422,10 @@ _ALLOWED_TOOLS = {
     # version-history + CloudTrail reconstruction and sibling-config diffs.
     "get_prior_config",
     "compare_peers",
+    # Anchored causal search (debug/causal_search*.py): read-only, bounded
+    # ring-ordered differential sweep outward from the failure anchor —
+    # composes only already-allowed differential reads.
+    "causal_search",
 }
 
 
@@ -453,7 +457,7 @@ def validate_tool_call(
         )
 
     # Validate all resource identifier fields (resource_name, resource_hint, symptom)
-    for field in ("resource_name", "resource_hint"):
+    for field in ("resource_name", "resource_hint", "anchor_hint"):
         value = tool_input.get(field, "")
         if value and not _is_safe_resource_name(value):
             return GuardrailResult(

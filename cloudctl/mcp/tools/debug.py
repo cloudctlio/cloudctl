@@ -2146,6 +2146,40 @@ _AGENT_TOOLS = [
             }},
         }
     },
+    {
+        "toolSpec": {
+            "name": "causal_search",
+            "description": (
+                "ANCHORED differential search: identifies the failure ANCHOR — "
+                "the component observed emitting the failure, or, when nothing "
+                "downstream shows any activity, the resource your reproduction/"
+                "probe was run against — then differential-checks (prior config "
+                "+ peer comparison) the anchor FIRST and widens outward ring by "
+                "ring over the dependency graph, returning the ring-ordered "
+                "trail of diffs as evidence. Use this INSTEAD of pointing "
+                "get_prior_config/compare_peers at whatever resource you happen "
+                "to be inspecting: a coincidental change on a distant resource "
+                "is the classic wrong turn. Optionally pass anchor_hint (a "
+                "resource name) — used only when no observed-failure or "
+                "reproduction signal identifies the anchor. Read-only and "
+                "bounded; degrades to a structured available=false result "
+                "(no graph / no anchor), which is a normal outcome, not an "
+                "error."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "anchor_hint": {"type": "string",
+                                    "description": "optional: resource name to "
+                                    "anchor on if no observed signal identifies "
+                                    "the failure point"},
+                    "max_rings":   {"type": "integer",
+                                    "description": "optional: how many rings to "
+                                    "widen beyond the anchor (default 3, max 4)"},
+                },
+            }},
+        }
+    },
 ]
 
 _AGENT_SYSTEM = """\
