@@ -1149,6 +1149,64 @@ def search_cloudtrail(
     }, separators=(",", ":"))
 
 
+@recordable("get_prior_config")
+def get_prior_config(
+    resource_name: str,
+    service_type:  str,
+    profile:       str | None,
+    region:        str,
+    minutes:       int = 10080,
+) -> str:
+    """TEMPORAL baseline: what did this resource's config look like BEFORE?
+
+    Real retained version history where AWS keeps it, plus a CloudTrail
+    reconstruction (config-writing events' request parameters carry the values
+    that were written), returned as structured before→after diffs. Raw facts
+    only — never judges which value is correct. Read-only; degrades to a
+    structured 'unavailable' result on denial/absence."""
+    from cloudctl.debug.baseline import prior_config  # noqa: PLC0415
+    try:
+        session = _make_session(profile, region)
+        result = prior_config(session, resource_name, service_type,
+                              minutes=int(minutes or 10080))
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "resource_name": resource_name,
+            "baseline_unavailable": True,
+            "error": type(exc).__name__,   # marks transient failure: not cached
+            "reason": f"baseline unavailable ({type(exc).__name__})",
+        }
+    return json.dumps(_serialise(result), separators=(",", ":"))
+
+
+@recordable("compare_peers")
+def compare_peers(
+    resource_name: str,
+    service_type:  str,
+    profile:       str | None,
+    region:        str,
+    peer_names:    list | None = None,
+    configs:       dict | None = None,
+) -> str:
+    """PEER baseline: which config fields differ between a resource and its
+    sibling resources of the same type. Raw differences only; identity-only
+    differences are suppressed-but-listed. Read-only; degrades to a structured
+    'unavailable' result when there is nothing to compare."""
+    from cloudctl.debug.baseline import peer_comparison  # noqa: PLC0415
+    try:
+        session = _make_session(profile, region)
+        result = peer_comparison(session, resource_name, service_type,
+                                 peer_names=peer_names, configs=configs)
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "resource_name": resource_name,
+            "peers_unavailable": True,
+            "error": type(exc).__name__,   # marks transient failure: not cached
+            "reason": f"peer baseline unavailable ({type(exc).__name__})",
+        }
+    return json.dumps(_serialise(result), separators=(",", ":"))
+
+
 @recordable("get_traces")
 def get_traces(
     profile:           str | None,
@@ -1817,6 +1875,76 @@ _AGENT_TOOLS = [
                                       "description": "Lookback window in minutes (default 1440)"},
                 },
                 "required": ["resource_name"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "get_prior_config",
+            "description": (
+                "DIFFERENTIAL (temporal baseline): what did this resource's "
+                "configuration look like BEFORE? Returns structured before→after "
+                "diffs (changed keys with old→new values, when changed) from real "
+                "retained version history where AWS keeps it, plus a CloudTrail "
+                "reconstruction — config-writing events' request parameters carry "
+                "the values that were written, so consecutive writes diff into "
+                "before→after even where no version history exists. An incident "
+                "is usually a CHANGE: a value that looks plausible on its own is "
+                "often obviously wrong as a DIFFERENCE, and a field that changed "
+                "at/near the measured onset on the failing path is a prime "
+                "suspect. Cite the old→new values verbatim. The diff is raw "
+                "evidence, not a verdict — the changed field must still explain "
+                "the observed failure."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "resource_name": {"type": "string",
+                                      "description": "resource name to fetch history for"},
+                    "service_type":  {"type": "string",
+                                      "description": "resource/service type (namespace "
+                                      "from list_resources)"},
+                    "minutes":       {"type": "integer",
+                                      "description": "CloudTrail lookback window "
+                                      "(default 10080 = 7 days)"},
+                },
+                "required": ["resource_name", "service_type"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "compare_peers",
+            "description": (
+                "DIFFERENTIAL (peer baseline): which configuration fields DIFFER "
+                "between a resource and its sibling resources of the same type "
+                "(siblings discovered generically by type + shared name prefix, "
+                "or pass peer_names). A field where the failing resource diverges "
+                "from otherwise-identical peers is a prime suspect — cite the "
+                "differing values verbatim. Differences that are only the "
+                "resources' own identities are suppressed but still listed. If "
+                "the siblings are NESTED resources you already fetched with "
+                "aws_read (e.g. two children of the same parent), pass their raw "
+                "configs via 'configs' to get the structural diff directly with "
+                "no re-fetch. Raw differences only — a difference is evidence to "
+                "weigh, never proof by itself."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "resource_name": {"type": "string",
+                                      "description": "the resource under suspicion"},
+                    "service_type":  {"type": "string",
+                                      "description": "resource/service type"},
+                    "peer_names":    {"type": "array", "items": {"type": "string"},
+                                      "description": "optional: sibling resource "
+                                      "names you already identified"},
+                    "configs":       {"type": "object",
+                                      "description": "optional: {name: config} dicts "
+                                      "you already fetched — pure structural diff, "
+                                      "no AWS calls"},
+                },
+                "required": ["resource_name", "service_type"],
             }},
         }
     },

@@ -418,6 +418,10 @@ _ALLOWED_TOOLS = {
     # documented test APIs via cloudctl's own IAM role — side-effect-free,
     # opt-in, consent-gated, budgeted. Same governance as probe_http.
     "native_reproduce",
+    # Differential / baseline comparison (debug/baseline.py): read-only
+    # version-history + CloudTrail reconstruction and sibling-config diffs.
+    "get_prior_config",
+    "compare_peers",
 }
 
 

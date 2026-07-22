@@ -906,6 +906,18 @@ is a LEAD to examine WHAT it changed (diff the new configuration against its
 peers or prior intent), NOT a licence to attribute the incident to "deployment
 churn". The churn is a symptom of the change; find the change.
 
+DIFFERENTIAL rule — "wrong" is often invisible in the absolute (a config value
+looks plausible on its own) but obvious as a DIFFERENCE. When a value on the
+failing path is suspect and you cannot tell whether it is wrong by itself:
+  - get_prior_config shows what it looked like BEFORE (retained versions +
+    CloudTrail-reconstructed before→after). A field that CHANGED at/near the
+    measured onset on the failing path is a prime suspect.
+  - compare_peers shows how it differs from SIBLING resources of the same type
+    (or diff nested siblings by passing their configs). A field where the
+    failing resource diverges from otherwise-identical peers is a prime suspect.
+Cite the old→new or peer-vs-peer values VERBATIM as evidence. A diff alone is
+not proof — the changed/divergent field must still explain the observed failure.
+
 CALL-GRAPH rule — for any latency, timeout, or error-that-propagates-across-
 services symptom, get_traces is the richest single signal: it returns the
 service-dependency graph with per-edge latency/error/fault/throttle rates and
@@ -1045,7 +1057,7 @@ def _run_branch(
         list_resources, get_service_config, tail_logs,
         query_metrics, search_cloudtrail, get_event_timeline,
         get_deployment_info, probe_permission, get_dependency_graph, aws_read,
-        get_traces,
+        get_traces, get_prior_config, compare_peers,
     )
     from cloudctl.ai.guardrails import (
         sanitise_fetched_data, validate_tool_call, audit_log_tool_call,
@@ -1154,6 +1166,21 @@ def _run_branch(
                 params=tool_input.get("params") or {},
                 profile=profile, region=region,
                 reason=tool_input.get("reason", ""),
+            )
+        elif tool_name == "get_prior_config":
+            raw = get_prior_config(
+                resource_name=tool_input["resource_name"],
+                service_type=tool_input.get("service_type", ""),
+                profile=profile, region=region,
+                minutes=int(tool_input.get("minutes") or 10080),
+            )
+        elif tool_name == "compare_peers":
+            raw = compare_peers(
+                resource_name=tool_input["resource_name"],
+                service_type=tool_input.get("service_type", ""),
+                profile=profile, region=region,
+                peer_names=tool_input.get("peer_names") or None,
+                configs=tool_input.get("configs") or None,
             )
         else:
             return json.dumps({"error": f"unknown tool: {tool_name}"})
@@ -1918,6 +1945,14 @@ response than the one observed. If reproduction was attempted but not possible
 (unreachable, no credential, declined, non-HTTP), the response-level mechanism
 is at the FRONTIER: apply the rule above — do not invent what the response
 "would have been".
+
+DIFFERENTIAL EVIDENCE (when present): a configuration field that CHANGED at or
+near the measured onset on the failing path, or a field where the failing
+resource DIFFERS from otherwise-identical sibling resources, is a prime suspect
+— cite the old→new (or peer-vs-peer) values verbatim in evidence. A diff alone
+is NOT proof: the changed/divergent value must still explain the observed
+failure under the MECHANISM and REPRODUCED-RESPONSE rules above. A diff that
+cannot produce the observed symptom is context, not cause.
 
 Select the hypothesis with the strongest direct evidence from real AWS data.
 If multiple branches found real issues, list them all in evidence.
