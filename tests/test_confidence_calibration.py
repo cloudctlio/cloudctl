@@ -99,6 +99,39 @@ def test_confirmed_winner_keeps_high():
     assert conf == "HIGH"
 
 
+# ── elimination is not confirmation ─────────────────────────────────────────
+# A hypothesis that "wins" only because rivals were refuted/ruled out, with
+# neither a confirmed NOR a refuted prediction of its own (an untested
+# assumption), must not keep high confidence when a DIFFERENT branch actually
+# confirmed a prediction. Surviving elimination is not the same as being
+# verified — this is the mirror case of the existing "raise if under-rated"
+# check, for the over-rated direction.
+
+def test_untested_winner_capped_when_rival_confirmed():
+    # Only the winner is branch-level "confirmed" (so it alone is the standing
+    # candidate — two confirmed branches would instead hit the earlier
+    # unresolved-contest check). The rival is not branch-level confirmed, but DID
+    # verify one of its own predictions — that is what must trigger the cap.
+    branches = [
+        _branch(evidence=["e1", "e2", "e3"], confirmed=True, preds=[]),  # winner: untested
+        _branch(evidence=["e1"], confirmed=False, preds=[_pred("CONFIRMED")]),  # rival: verified
+    ]
+    conf, note = _calibrate_confidence(branches, agent_conf="HIGH")
+    assert conf == "LOW"
+    assert "no confirmed prediction" in note
+
+
+def test_untested_winner_with_no_verified_rival_is_unaffected():
+    # Same shape, but nothing else is confirmed either — the new check must not
+    # fire just because the winner is untested; it needs a verified alternative.
+    branches = [
+        _branch(evidence=["e1", "e2", "e3"], confirmed=True, preds=[]),
+        _branch(evidence=["e1"], confirmed=False, preds=[]),
+    ]
+    conf, _ = _calibrate_confidence(branches, agent_conf="HIGH")
+    assert conf == "HIGH"
+
+
 # ── two verified, contradicting causes → genuinely ambiguous ──────────────────
 def test_two_confirmed_contradicting_is_medium():
     branches = [

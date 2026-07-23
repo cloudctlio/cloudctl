@@ -586,6 +586,26 @@ they name no service and map no symptom to any cause:
 
 # ── Node 1: triage (agentic resource discovery) ───────────────────────────────
 
+# ANCHOR-ON-SELF rule (triage). Generic by design: it names no service, field,
+# or mechanism — it is about WHERE hypotheses point (the failing component
+# itself vs the layers around it), never what any specific fault looks like.
+# Kept as its own constant so tests can verify presence and hint-freeness.
+_ANCHOR_ON_SELF_RULE = """\
+  6. ANCHOR-ON-SELF rule — when the symptom or the measured observation
+     localizes the failure to a specific component (the resource that is
+     itself failing, not merely a neighbor of the failure), at least ONE
+     hypothesis must target that component's OWN configuration: the values
+     the failing resource itself is deployed with, read directly off that
+     resource. A configured value on the failing component that interacts
+     with the observed failure mode — e.g. a numeric value whose magnitude
+     is significant relative to a limit the component operates under — is a
+     first-class candidate root cause, not a side note. Hypotheses about the
+     layers AROUND the failing component (its permissions, its network path,
+     the services it calls or is triggered by) all silently ASSUME the
+     component's own configuration is sound; one branch must TEST that
+     assumption instead of sharing it.
+"""
+
 _TRIAGE_SYSTEM = """\
 You are an AWS incident triage specialist. Your job is to:
   1. Use list_resources to discover what is actually deployed in this account/region.
@@ -624,6 +644,7 @@ Hypothesis rules:
      rejected at its source runs no downstream code, so it can leave no logs
      and no metrics anywhere; reading configuration is the only way to observe
      that class of fault.
+""" + _ANCHOR_ON_SELF_RULE + """\
 
 Falsifiability rule (mandatory):
   Every hypothesis must include 1-2 PREDICTIONS: concrete observations that MUST
@@ -647,6 +668,137 @@ After your tool calls, respond with ONLY a JSON array of exactly 3 objects:
 ]
 No markdown fences, no extra text outside the JSON array.
 """
+
+
+# ── ANCHOR-ON-SELF deterministic backstop (mirrors triage rule 6) ─────────────
+#
+# Failure mode this closes: the measurement localizes the failure to ONE
+# component, yet every triage hypothesis targets the layers AROUND it (its
+# permissions, its dependencies, the services adjacent to it) and no branch is
+# anchored on the failing component itself — so a causal value sitting in that
+# component's own configuration is never framed as a candidate root cause and
+# ends up, at best, a footnote. Generic by construction: the anchor is found by
+# intersecting LIVE-DISCOVERED resource names with the measurement's
+# affected/unaffected split, and the supplemental hypothesis says only "read
+# the failing component's own configuration" — no service, field, or scenario
+# vocabulary anywhere. Soft and additive: model hypotheses are never removed,
+# replaced, or reordered.
+
+_IDENT_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.\-:/]*")
+
+
+def _discovered_names(discovered: dict) -> list[str]:
+    """All resource names triage's discovery actually returned (deduplicated,
+    order-preserving). Internal '_'-prefixed entries are not resources."""
+    names: list[str] = []
+    for k, parsed in (discovered or {}).items():
+        if str(k).startswith("_") or not isinstance(parsed, dict):
+            continue
+        for n in parsed.get("resources") or []:
+            if isinstance(n, str) and len(n) >= 3:
+                names.append(n)
+    return list(dict.fromkeys(names))
+
+
+def _anchor_component(observation: dict, discovered: dict) -> str:
+    """The component the measured observation localizes the failure to, found
+    purely structurally: a discovered resource name that appears in the
+    observation's AFFECTED text (affected_scope + measurements) and not in its
+    UNAFFECTED text. Returns "" when no unambiguous anchor exists (no
+    observation, no discovery, no match, or the name also reads as healthy).
+    A candidate that is a strict substring of another candidate owes its
+    mentions to the longer, more specific name and is dropped."""
+    if not isinstance(observation, dict) or not observation:
+        return ""
+    affected = " ".join(
+        [str(observation.get("affected_scope", ""))]
+        + [str(m) for m in (observation.get("measurements") or [])]
+    ).lower()
+    if not affected.strip():
+        return ""
+    unaffected = str(observation.get("unaffected_scope", "")).lower()
+    cands: list[tuple[int, int, str]] = []
+    for name in _discovered_names(discovered):
+        low = name.lower()
+        if low in affected and low not in unaffected:
+            cands.append((affected.count(low), len(low), name))
+    lows = [c[2].lower() for c in cands]
+    cands = [
+        c for c in cands
+        if not any(c[2].lower() != o and c[2].lower() in o for o in lows)
+    ]
+    if not cands:
+        return ""
+    cands.sort(key=lambda c: (-c[0], -c[1], c[2]))
+    return cands[0][2]
+
+
+def _hypotheses_cover_anchor(hypotheses: list[dict], anchor: str) -> bool:
+    """True when some hypothesis is anchored ON the failing component itself:
+    its focus (the field that names the branch's primary resource) carries the
+    anchor as an exact identifier token. Exactness matters — a branch on an
+    ADJACENT resource whose name merely embeds the anchor's name (a binding,
+    helper, or sibling named after it) is not anchored on the component, and
+    that near-miss is precisely the gap this backstop exists to catch."""
+    a = (anchor or "").lower()
+    if not a:
+        return True
+    for h in hypotheses or []:
+        toks = _IDENT_TOKEN_RE.findall(str((h or {}).get("focus", "")).lower())
+        if a in toks:
+            return True
+    return False
+
+
+def _self_config_hypothesis(anchor: str, discovered: dict) -> dict:
+    """Neutral supplemental hypothesis anchored on the failing component's own
+    configuration. Phrased entirely in terms of the component and the observed
+    failure — no mechanism, field, or service vocabulary. The service field is
+    resolved from discovery when possible, else the anchor name itself."""
+    svc = ""
+    a = anchor.lower()
+    for k, parsed in (discovered or {}).items():
+        if str(k).startswith("_") or not isinstance(parsed, dict):
+            continue
+        for r in parsed.get("resources_detailed") or []:
+            if isinstance(r, dict) and str(r.get("name", "")).lower() == a:
+                svc = str(r.get("service") or k)
+                break
+        if svc:
+            break
+    return {
+        "service": svc or anchor,
+        "reason": (
+            "the measured observation localizes the failure to this component, "
+            "but no hypothesis was anchored on the component itself — its OWN "
+            "configuration (the values it is deployed with) may interact with "
+            "the observed failure and must be tested, not assumed sound"
+        ),
+        "focus": (
+            f"{anchor} — read this component's own configuration and evaluate "
+            f"each configured value against the observed failure mode and any "
+            f"limit the component operates under"
+        ),
+        "predictions": [],
+    }
+
+
+def _ensure_anchor_hypothesis(
+    hypotheses: list[dict], observation: dict, discovered: dict
+) -> list[dict]:
+    """Deterministic ANCHOR-ON-SELF backstop. When the measurement localizes
+    the failure to a discovered component and no hypothesis is anchored on
+    that component itself, append ONE neutral own-configuration hypothesis.
+    Conservative: any doubt (no anchor identifiable, already covered, or an
+    unexpected error) leaves the hypotheses exactly as the model produced
+    them."""
+    try:
+        anchor = _anchor_component(observation, discovered)
+        if anchor and not _hypotheses_cover_anchor(hypotheses, anchor):
+            return list(hypotheses) + [_self_config_hypothesis(anchor, discovered)]
+    except Exception:  # noqa: BLE001
+        pass
+    return hypotheses
 
 
 def triage_node(state: GraphState) -> dict:
@@ -783,6 +935,14 @@ def triage_node(state: GraphState) -> dict:
                 "focus": "enumerate the resources the symptom implicates, then inspect their config and logs",
                 "predictions": [],
             }]
+
+    # ANCHOR-ON-SELF backstop (deterministic mirror of triage rule 6): if the
+    # measurement localizes the failure to a discovered component and no
+    # hypothesis is anchored on that component itself, append one neutral
+    # branch that reads the failing component's OWN configuration — otherwise
+    # every branch investigates AROUND the failing component while sharing the
+    # untested assumption that its own configuration is sound.
+    hypotheses = _ensure_anchor_hypothesis(hypotheses, obs, discovered)
 
     return {
         "hypotheses": hypotheses,
@@ -1698,6 +1858,72 @@ def log_intelligence_node(state: GraphState) -> dict:
 # follow. This prevents the most common reasoning error: attributing uniform
 # application-code behavior to an AWS infrastructure cause.
 
+# UNCONFIRMED-INTERACTION rule (discrimination + synthesis). Generic by design:
+# it names no service, field, or mechanism — it is purely epistemic, about the
+# DIFFERENCE between observing that an interaction between two components
+# occurs and merely inferring it (from naming, adjacency, wiring), and about
+# what evidence on a FACET of an inferred interaction can and cannot confirm.
+# Kept as its own constant so tests can verify presence and hint-freeness.
+_INFERRED_INTERACTION_RULE = """\
+  UNCONFIRMED-INTERACTION test (apply before promoting any cause whose
+  mechanism runs THROUGH an interaction between components):
+  When a hypothesis's causal mechanism depends on component X actually
+  invoking, calling, or otherwise interacting with component Y, first classify
+  how the interaction's OCCURRENCE is known:
+    - DIRECTLY OBSERVED: a record of the interaction itself exists — a log
+      line showing the call, a trace spanning both components, a metric that
+      moves with it, or an audit/call record attributing the interaction to X.
+    - INFERRED ONLY: deduced from naming similarity, graph adjacency, shared
+      wiring/references, or "X plausibly would call Y" reasoning — with no
+      record of the interaction itself.
+  Evidence about a FACET of the interaction (a permission it would require, a
+  setting it would read, a quota it would consume) — however solidly that
+  facet is verified — confirms only the facet, NEVER that the interaction
+  occurs. A verified facet of an INFERRED-ONLY interaction leaves the
+  hypothesis UNTESTED at its load-bearing link: the interaction's occurrence
+  must be independently confirmed before facet evidence can support it as the
+  primary cause. And if the observation window holds NO record of the
+  interaction ever occurring (zero attributed events anywhere such records
+  would be kept), treat that absence as evidence AGAINST the interaction
+  happening at all — the parsimonious reading is "X never performs this
+  interaction", not "the interaction is being silently prevented". Prefer a
+  cause whose mechanism runs entirely through directly observed behavior of
+  the failing component.
+"""
+
+# IAM-DENIAL semantics rule (discrimination + synthesis). This states GENERAL
+# AWS platform behavior — how IAM authorization and request auditing work for
+# direct synchronous API calls, true for every service and every incident — it
+# is baseline platform competence, not scenario knowledge. It deliberately
+# names only platform-level concepts (IAM, CloudTrail, SDK, synchronous API,
+# authorization) and no specific service, resource, or incident mechanism.
+# Kept as its own constant so tests can verify presence and generality.
+_IAM_DENIAL_SEMANTICS_RULE = """\
+  IAM-DENIAL SEMANTICS (general AWS platform behavior — apply to any claim
+  that an authorization denial causes blocking or hanging):
+  A direct, synchronous AWS API call denied by IAM (implicit or explicit deny)
+  FAILS FAST: the SDK immediately raises an authorization error
+  (AccessDenied-class) — the deny never manifests as a hang, a stall, or an
+  indefinite wait. A denied call also still REACHES the service endpoint and
+  is still recorded by AWS request auditing (CloudTrail) with an error field —
+  denial does not make the attempt invisible. Consequences:
+    - "An IAM deny on a direct synchronous API call makes the caller hang
+      until its own timeout" contradicts platform behavior — strongly
+      disfavor it: had the call been made and denied, there would be a fast,
+      visible authorization error AND an audit record of the denied attempt.
+    - Zero audit records of a given API call across the observation window is
+      evidence the caller never makes that call at all — NOT evidence the
+      call is being silently blocked.
+  IAM-related blocking WITHOUT a request-level error is possible only through
+  identifiably different mechanisms — name which one applies before blaming a
+  hang on authorization: (a) a protocol-level authentication handshake that
+  uses IAM-based auth inside a persistent connection (a failed handshake can
+  surface as connection stalls and client retries), or (b) the caller's OWN
+  retry/backoff loop wrapping a fast authorization error in repeated attempts
+  (visible as repeated error entries, not silence). If neither mechanism is
+  evidenced, an "authorization denial causes the hang" theory is unsupported.
+"""
+
 _DISCRIMINATE_SYSTEM = """\
 You are a causal reasoning specialist for AWS incident diagnosis. You receive:
   1. Three parallel investigation branches, each examining a different hypothesis
@@ -1740,6 +1966,22 @@ Rule -1 — Prediction test (a veto, apply first):
     - A missing capability matters only if the failing operation actually
       exercises it. Verify the failing path uses what is missing before
       treating its absence as the cause.
+  ELIMINATION IS NOT CONFIRMATION — if hypotheses A and B are refuted or ruled
+  out, hypothesis C does not thereby become the answer merely for being the one
+  left. C still needs its OWN confirmed (not merely untested-and-not-yet-refuted)
+  prediction to be the primary cause. If C rests on an assumption you have not
+  actually checked (e.g., "this permission is likely missing" without running the
+  simulator), do not promote it over a DIFFERENT branch whose central claim WAS
+  directly confirmed by reading the resource's own current state — even from a
+  different hypothesis/service — and which independently accounts for the full
+  observed symptom. Prefer the directly-confirmed finding; if you cannot, report
+  the untested theory as exactly that: untested, not the confident answer.
+
+""" + _INFERRED_INTERACTION_RULE + """\
+  Report your classification of the chosen cause's load-bearing interaction in
+  the interaction_dependency output field.
+
+""" + _IAM_DENIAL_SEMANTICS_RULE + """\
 
 Rule 0 — Temporal filtering (apply before all other rules):
   A MEASURED OBSERVATION may be provided with an onset_estimate for when the
@@ -1786,12 +2028,17 @@ Rule 2 — Evidence quality test:
 Rule 3 — Parsimony:
   The simplest explanation consistent with ALL observations is preferred.
 
-Return ONLY this JSON. Emit the three decision fields FIRST so they survive
+Return ONLY this JSON. Emit the decision fields FIRST so they survive
 even if the response is truncated; the classifications array comes last:
 {
   "cause_category": "application_code | infrastructure | configuration | dependency",
   "cause_category_confidence": "LOW | MEDIUM | HIGH",
   "investigation_constraint": "One binding sentence for synthesis, e.g.: The anomaly is uniform across all replicas with identical infrastructure — the root cause is application code behavior, not an AWS service failure.",
+  "interaction_dependency": {
+    "depends_on_interaction": "true only if the chosen cause's mechanism runs through one component invoking/interacting with another; else false",
+    "interaction": "componentX -> componentY, or empty string",
+    "occurrence": "observed (a record of the interaction itself exists: log line, trace, correlated metric, attributed audit/call record) | inferred_only (deduced from naming, adjacency, or wiring — no record of the interaction itself)"
+  },
   "evidence_classifications": [
     {
       "evidence": "quote from branch result or log analysis",
@@ -1802,6 +2049,63 @@ even if the response is truncated; the classifications array comes last:
   ]
 }
 """
+
+
+# ── UNCONFIRMED-INTERACTION deterministic guard (mirrors the prompt rule) ─────
+#
+# Failure mode this closes: the model INFERS that component X interacts with
+# component Y (from naming or graph adjacency), verifies a FACET of that
+# interaction (a permission, a setting), and then ships "the interaction is
+# failing" as a confirmed causal mechanism — promoting facet evidence into
+# occurrence evidence. The discriminate schema asks the model to self-classify
+# whether its chosen cause depends on an interaction and how that interaction's
+# occurrence is known. This guard is purely structural: it reads ONLY those
+# self-labels (no service or scenario vocabulary anywhere), and when the
+# load-bearing interaction is labeled inferred-only it (a) caps the category
+# call's confidence at LOW — so a constraint built on an unconfirmed
+# interaction reaches synthesis as ADVISORY, not binding — and (b) appends a
+# neutral epistemic note to the constraint. Soft and additive: nothing is
+# removed or reordered, and a missing/malformed self-label is a no-op.
+
+_UNCONFIRMED_INTERACTION_NOTE = (
+    "NOTE: the proposed mechanism depends on an interaction whose occurrence "
+    "was inferred (from naming/adjacency/wiring), not directly observed; "
+    "evidence about facets of that interaction does not confirm it occurs. "
+    "Treat the mechanism as unconfirmed and prefer a cause grounded in "
+    "directly observed behavior of the failing component."
+)
+
+
+def _apply_interaction_guard(discrimination: dict) -> dict:
+    """Soft deterministic backstop for the UNCONFIRMED-INTERACTION rule.
+
+    Acts only on the model's OWN self-classification (interaction_dependency):
+    when the chosen cause's mechanism depends on an interaction whose
+    occurrence the model itself labels as inferred-only, cap the category
+    confidence at LOW and append the epistemic note to the constraint. Pure
+    function so the policy is unit-testable without a live model; any missing,
+    malformed, or 'observed'-labeled field is a no-op.
+    """
+    if not isinstance(discrimination, dict):
+        return discrimination
+    dep = discrimination.get("interaction_dependency")
+    if not isinstance(dep, dict):
+        return discrimination
+    raw = dep.get("depends_on_interaction")
+    depends = raw is True or str(raw).strip().lower() == "true"
+    if not depends:
+        return discrimination
+    occurrence = str(dep.get("occurrence", "")).strip().lower()
+    if not occurrence.startswith("inferred"):
+        return discrimination
+    out = dict(discrimination)
+    out["cause_category_confidence"] = "LOW"
+    constraint = str(out.get("investigation_constraint") or "").strip()
+    if _UNCONFIRMED_INTERACTION_NOTE not in constraint:
+        out["investigation_constraint"] = (
+            (constraint + " " if constraint else "") + _UNCONFIRMED_INTERACTION_NOTE
+        )
+    return out
 
 
 def discriminate_node(state: GraphState) -> dict:
@@ -1845,7 +2149,7 @@ def discriminate_node(state: GraphState) -> dict:
     except Exception as exc:
         discrimination = {"_error": f"{type(exc).__name__}: {exc}"[:300]}
 
-    return {"discrimination": discrimination}
+    return {"discrimination": _apply_interaction_guard(discrimination)}
 
 
 # ── VERDICT Node: clarify (human-in-the-loop, only when evidence dead-ends) ────
@@ -1926,6 +2230,10 @@ VERDICT rules (binding):
      change-event narrative about a resource that is gone.
   5. Root-cause events must precede the measured onset. Events from our own
      deployment activity before onset are not causes.
+
+""" + _INFERRED_INTERACTION_RULE + """\
+
+""" + _IAM_DENIAL_SEMANTICS_RULE + """\
 
 MECHANISM & FRONTIER (the honesty test — apply to your chosen cause before shipping):
   Trace the causal chain from your root cause to the REPORTED symptom, link by
@@ -2330,6 +2638,18 @@ def _calibrate_confidence(all_branch_results: list[dict],
     if n_conf >= 1 and not alt_verified and _order.get(agent_conf, 0) < _order["HIGH"]:
         return "HIGH", ("raised: winning hypothesis has a confirmed prediction and "
                         "no alternative was verified")
+
+    # Elimination is not confirmation: the winner survived only because rival
+    # hypotheses were refuted or ruled out — it has NEITHER a confirmed NOR a
+    # refuted prediction of its own (its central claim rests on an assumption
+    # never actually checked). If a DIFFERENT branch DID achieve a confirmed
+    # prediction, the chosen cause is less-verified than an available rival: an
+    # untested "last theory standing" is not thereby the answer. Cap — this
+    # mirrors the refuted-own-prediction veto above, for the untested case.
+    if n_conf == 0 and alt_verified:
+        return "LOW", ("winning hypothesis has no confirmed prediction of its own "
+                       "while a different branch DID confirm one — surviving "
+                       "elimination is not the same as being confirmed")
 
     # Otherwise confidence follows the analysis — the dominant, self-consistent
     # branch keeps the level its reasoning earned, HIGH included.

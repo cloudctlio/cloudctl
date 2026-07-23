@@ -37,6 +37,32 @@ def test_camelcase_status_code_is_an_observed_failure():
         {"tail_logs:x": {"statusCode": 500}}).observed_failure
 
 
+def test_timeout_status_is_an_observed_failure():
+    # Regression: a terminal status of "timeout"/"timed_out" is the standard way
+    # runtimes report an operation that hit its time limit and did not complete —
+    # exactly as terminal as "failed". The failed_state pattern only accepted
+    # failed/failing/unhealthy/impaired/critical, and the error-code pattern only
+    # the compound "*TimeoutException", so evidence directly quoting
+    # "Status=timeout" was not recognized as an observed failure and a correct,
+    # fully-cited verdict got capped to LOW.
+    assert assess_observed_failure_grounding(
+        {"_evidence": ["Every REPORT line: Duration=30000.00ms, Status=timeout"]}
+    ).observed_failure
+    assert assess_observed_failure_grounding(
+        {"_evidence": ["execution Status: timeout after hitting the limit"]}
+    ).observed_failure
+    assert assess_observed_failure_grounding(
+        {"describe_run:x": {"status": "TIMED_OUT"}}).observed_failure
+
+
+def test_configured_timeout_value_is_not_an_observed_failure():
+    # A CONFIGURED timeout value ("Timeout": 30) is a setting, not an observed
+    # outcome — only a status/state FIELD reporting a timeout may trigger.
+    r = assess_observed_failure_grounding(
+        {"get_service_config:x": {"Timeout": 30, "MemorySize": 128}})
+    assert not r.observed_failure and r.signals == []
+
+
 def test_zero_errors_is_not_an_observed_failure():
     r = assess_observed_failure_grounding({"query_metrics:x": {"Errors": 0, "Invocations": 0}})
     assert not r.observed_failure and r.signals == []
