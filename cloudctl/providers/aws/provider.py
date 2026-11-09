@@ -1602,7 +1602,8 @@ class AWSProvider(CloudProvider):
 
         # ── Audit logs first — resource names seed log discovery ──────────────
         if "audit_logs" in sources:
-            evts = fetcher.cloudtrail(minutes=minutes)
+            # Write events only: read calls crowd out the change that broke things
+            evts = fetcher.cloudtrail(minutes=max(minutes, 360), writes_only=True, max_events=100)
             if evts:
                 context["audit_logs"] = evts
                 # Extract function/DB names from CloudTrail resources
@@ -1656,8 +1657,9 @@ class AWSProvider(CloudProvider):
                         continue
                     seen_lgs.add(lg)
                     evts = fetcher.cloudwatch_logs(
-                        log_group=lg, filter_pattern="?ERROR ?WARN ?error ?warn",
-                        minutes=minutes,
+                        log_group=lg,
+                        filter_pattern="?ERROR ?WARN ?error ?warn ?Exception ?Traceback ?timeout",
+                        minutes=minutes, max_events=50, max_pages=5,
                     )
                     if not evts:
                         evts = fetcher.tail_log_group(lg, lines=50)
@@ -1669,8 +1671,9 @@ class AWSProvider(CloudProvider):
                         continue
                     seen_lgs.add(lg)
                     evts = fetcher.cloudwatch_logs(
-                        log_group=lg, filter_pattern="?ERROR ?WARN ?error ?warn",
-                        minutes=minutes,
+                        log_group=lg,
+                        filter_pattern="?ERROR ?WARN ?error ?warn ?Exception ?Traceback ?timeout",
+                        minutes=minutes, max_events=50, max_pages=5,
                     )
                     service_logs.extend(evts)
             if service_logs:

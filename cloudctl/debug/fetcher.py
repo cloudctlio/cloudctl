@@ -84,7 +84,9 @@ class DebugFetcher:
         filter_pattern: str = "",
         minutes: int = 60,
         max_events: int = 100,
+        max_pages: int = 5,
     ) -> list[dict]:
+        """Matching log events, oldest first, keeping the newest max_events."""
         if not self._session:
             self._mark("cloudwatch_logs", False)
             return []
@@ -96,7 +98,7 @@ class DebugFetcher:
                 logGroupName=log_group,
                 startTime=start,
                 endTime=end,
-                limit=100,
+                limit=min(max_events, 10_000),
             )
             if filter_pattern:
                 kwargs["filterPattern"] = filter_pattern
@@ -107,7 +109,7 @@ class DebugFetcher:
             # hanging or over-fetching.
             raw: list[dict] = []
             token = None
-            for _ in range(5):   # ≤5 pages / ≤500 events
+            for _ in range(max(1, max_pages)):   # bounded pages / ≤500 events
                 if token:
                     kwargs["nextToken"] = token
                 resp  = logs.filter_log_events(**kwargs)
@@ -138,7 +140,16 @@ class DebugFetcher:
         minutes: int = 120,
         resource_name: Optional[str] = None,
         error_only: bool = False,
+        writes_only: bool = False,
+        max_events: int = 50,
     ) -> list[dict]:
+        """CloudTrail management events, newest first.
+
+        writes_only asks CloudTrail for ReadOnly=false events only: in a busy
+        account the read calls (Describe*, Get*, List*) fill every page and
+        push out the change that caused the incident. LookupEvents takes one
+        lookup attribute, so with resource_name set the name is matched here.
+        """
         if not self._session:
             self._mark("cloudtrail", False)
             return []
@@ -149,20 +160,43 @@ class DebugFetcher:
             kwargs: dict = {
                 "StartTime": start,
                 "EndTime":   end,
-                "MaxResults": 50,
+                "MaxResults": min(max_events, 50),
             }
+            name_filter = ""
             if error_only:
                 kwargs["LookupAttributes"] = [
                     {"AttributeKey": "EventName", "AttributeValue": "AccessDenied"}
                 ]
+            elif writes_only:
+                kwargs["LookupAttributes"] = [
+                    {"AttributeKey": "ReadOnly", "AttributeValue": "false"}
+                ]
+                name_filter = (resource_name or "").lower()
             elif resource_name:
                 kwargs["LookupAttributes"] = [
                     {"AttributeKey": "ResourceName", "AttributeValue": resource_name}
                 ]
 
-            resp = ct.lookup_events(**kwargs)
+            raw: list[dict] = []
+            # LookupEvents pages hold at most 50 events. Callers that ask for
+            # neither more events nor writes only get the old single call.
+            max_pages = 10 if (writes_only or max_events > 50) else 1
+            for _ in range(max_pages):
+                resp = ct.lookup_events(**kwargs)
+                for e in resp.get("Events", []):
+                    if name_filter:
+                        names = " ".join(
+                            r.get("ResourceName", "") for r in e.get("Resources", [])
+                        ).lower()
+                        if name_filter not in names:
+                            continue
+                    raw.append(e)
+                token = resp.get("NextToken")
+                if len(raw) >= max_events or not token:
+                    break
+                kwargs["NextToken"] = token
             events = []
-            for e in resp.get("Events", []):
+            for e in raw[:max_events]:
                 events.append({
                     "time":       e["EventTime"].strftime(_TS_FMT),
                     "source":     "CloudTrail",

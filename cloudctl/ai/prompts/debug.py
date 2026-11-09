@@ -25,8 +25,24 @@ DEBUG_SYSTEM = (
 )
 
 
-def debug_prompt(symptom: str, context: dict, deploy_method: str = "unknown") -> str:
-    """Build a debug prompt with real cloud context."""
+def debug_prompt(
+    symptom: str,
+    context: dict | str,
+    deploy_method: str = "unknown",
+    budget_notes: list[str] | None = None,
+) -> str:
+    """Build a debug prompt with real cloud context.
+
+    context may be a dict, or JSON already serialized by the caller (so the
+    size budget is measured on exactly what the model sees).
+    """
+    data = context if isinstance(context, str) else json.dumps(context, indent=2, default=str)
+    budget_note = ""
+    if budget_notes:
+        budget_note = (
+            "\nDATA LEFT OUT TO FIT THE SIZE LIMIT (absence below is not evidence):\n"
+            + "\n".join(f"- {n}" for n in budget_notes) + "\n"
+        )
     deploy_note = ""
     if deploy_method and deploy_method != "unknown":
         _apply_cmd = {
@@ -45,7 +61,8 @@ def debug_prompt(symptom: str, context: dict, deploy_method: str = "unknown") ->
             f"'Apply all changes: {_apply_cmd}'.\n"
         )
     return (
-        f"REAL CLOUD DATA:\n{json.dumps(context, indent=2, default=str)}\n\n"
+        f"REAL CLOUD DATA:\n{data}\n\n"
+        f"{budget_note}"
         f"SYMPTOM: {symptom}\n"
         f"{deploy_note}\n"
         "Diagnose the root cause. Return JSON only — no text outside the JSON object. "

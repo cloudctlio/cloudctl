@@ -2213,6 +2213,34 @@ _MAX_LOG_LINES_IN_CONTEXT     = 35     # was 50 — enough for pattern detection
 _MAX_TOOL_OUTPUT_CHARS        = 4500   # was 8000 — ~1100 tokens per tool result
 
 
+def _fetched_key(tool_name: str, tool_input: dict) -> str:
+    """Key for one tool result in the fetched-data corpus.
+
+    The corpus is what the grounding checks search, so every distinct call
+    needs its own key. Keying on resource_name alone gave every
+    query_metrics, tail_logs, aws_read, probe_permission and
+    get_event_timeline call the same key ("query_metrics:"), so each call
+    overwrote the one before it and the checks lost the earlier data.
+    Calls that take only resource_name/service_type keep their old key.
+    """
+    import hashlib  # noqa: PLC0415
+    resource = (
+        tool_input.get("resource_name")
+        or tool_input.get("service_type")
+        or tool_input.get("resource_hint")
+        or tool_input.get("metric_name")
+        or tool_input.get("operation")
+        or tool_input.get("role")
+        or ""
+    )
+    if set(tool_input) <= {"resource_name", "service_type"}:
+        return f"{tool_name}:{resource}"
+    digest = hashlib.sha256(
+        json.dumps(tool_input, sort_keys=True, default=str).encode()
+    ).hexdigest()[:8]
+    return f"{tool_name}:{resource}#{digest}"
+
+
 def _truncate_tool_output(result: str, tool_name: str) -> str:
     """Truncate large tool outputs to protect context window.
 
@@ -2400,7 +2428,7 @@ def debug_incident_agent(
         try:
             parsed = json.loads(raw)
             sanitised = sanitise_fetched_data(parsed) if isinstance(parsed, dict) else parsed
-            key = f"{tool_name}:{resource_name}"
+            key = _fetched_key(tool_name, tool_input)
             # Data minimisation: only store if under the cumulative size cap
             current_size = len(json.dumps(all_fetched, default=str))
             entry_size   = len(json.dumps(sanitised, default=str))
