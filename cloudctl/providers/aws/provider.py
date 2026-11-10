@@ -1602,8 +1602,14 @@ class AWSProvider(CloudProvider):
 
         # ── Audit logs first — resource names seed log discovery ──────────────
         if "audit_logs" in sources:
-            # Write events only: read calls crowd out the change that broke things
-            evts = fetcher.cloudtrail(minutes=max(minutes, 360), writes_only=True, max_events=100)
+            # Writes first: in a busy account read calls (Describe*, Get*,
+            # List*) fill every page and push out the change that broke
+            # things. One unfiltered page is added so failed reads, such as
+            # an AccessDenied on GetSecretValue, still reach the model.
+            evts = _merge_audit_events(
+                fetcher.cloudtrail(minutes=minutes, writes_only=True, max_events=100),
+                fetcher.cloudtrail(minutes=minutes, max_events=50),
+            )
             if evts:
                 context["audit_logs"] = evts
                 # Extract function/DB names from CloudTrail resources
@@ -1678,6 +1684,12 @@ class AWSProvider(CloudProvider):
                     service_logs.extend(evts)
             if service_logs:
                 context["service_logs"] = service_logs
+
+        # ── Fetch problems — so missing data isn't read as "nothing happened" ─
+        if fetcher.errors:
+            context["source_errors"] = [
+                f"{src}: {err}" for src, err in sorted(fetcher.errors.items())
+            ][:10]
 
         # ── ACM — always fetch ────────────────────────────────────────────────
         acm = fetcher.acm_certificates()
@@ -1864,3 +1876,21 @@ class AWSProvider(CloudProvider):
             tags=tags,
             launched_at=launched.isoformat() if launched else None,
         )
+
+
+def _merge_audit_events(writes: list[dict], recent: list[dict]) -> list[dict]:
+    """Write events plus the failed calls from an unfiltered page, newest first.
+
+    Reads that succeeded are left out of ``recent`` on purpose; they are the
+    noise the write filter exists to remove.
+    """
+    seen: set = set()
+    merged: list[dict] = []
+    for ev in list(writes) + [e for e in recent if e.get("error_code")]:
+        key = (ev.get("time"), ev.get("event"), ev.get("principal"), ev.get("resource"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(ev)
+    merged.sort(key=lambda e: e.get("time", ""), reverse=True)
+    return merged

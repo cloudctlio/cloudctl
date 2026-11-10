@@ -166,6 +166,43 @@ def _temperature_kwargs(temperature: float | None) -> dict:
     return {} if temperature is None else {"temperature": temperature}
 
 
+# Claude models that return a 400 for a non-default temperature: Opus 4.7 and
+# later reject the field outright; Sonnet 5 / 5.5 and Haiku 5.5 reject any
+# value but the default. Matches Bedrock, Vertex, Azure and direct API ids.
+_NO_TEMPERATURE_MODELS = re.compile(
+    r"opus-4-[7-9]|opus-[5-9]|sonnet-[5-9]|haiku-[5-9]|fable|mythos", re.IGNORECASE
+)
+
+
+def _claude_accepts_temperature(model: str | None) -> bool:
+    return not _NO_TEMPERATURE_MODELS.search(model or "")
+
+
+def _anthropic_sdk_major() -> int:
+    try:
+        from importlib.metadata import version  # noqa: PLC0415
+        return int(version("anthropic").split(".")[0])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _claude_sdk_temperature_kwargs(temperature: float | None, model: str | None) -> dict:
+    """Temperature for an anthropic-SDK call, only where it will be accepted.
+
+    - Models that reject it get nothing (the request would 400).
+    - anthropic 1.x removed the ``temperature`` keyword (a TypeError), but
+      still sends API version 2023-06-01, where the field is valid, so it
+      goes in ``extra_body``. 0.x accepts ``extra_body`` too.
+    - anthropic 2.x sends API version 2026-10-21, which rejects the field on
+      every model, so nothing is sent.
+    """
+    if temperature is None or not _claude_accepts_temperature(model):
+        return {}
+    if _anthropic_sdk_major() >= 2:
+        return {}
+    return {"extra_body": {"temperature": temperature}}
+
+
 # ── AWS Bedrock ────────────────────────────────────────────────────────────────
 
 class BedrockAI(BaseAI):
@@ -194,7 +231,7 @@ class BedrockAI(BaseAI):
             "system": system or _SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}],
         }
-        if temperature is not None:
+        if temperature is not None and _claude_accepts_temperature(self._model):
             payload["temperature"] = temperature
         body = json.dumps(payload)
         resp = client.invoke_model(modelId=self._model, body=body)
@@ -249,7 +286,7 @@ class AzureFoundryAI(BaseAI):
             max_tokens=4096,
             system=system or _SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
-            **_temperature_kwargs(temperature),
+            **_claude_sdk_temperature_kwargs(temperature, self._model),
         )
         return msg.content[0].text
 
@@ -290,7 +327,7 @@ class VertexAI(BaseAI):
             max_tokens=4096,
             system=system or _SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
-            **_temperature_kwargs(temperature),
+            **_claude_sdk_temperature_kwargs(temperature, self._model),
         )
         return msg.content[0].text
 
@@ -324,7 +361,7 @@ class AnthropicAI(BaseAI):
             model=self._model, max_tokens=4096,
             system=system or _SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
-            **_temperature_kwargs(temperature),
+            **_claude_sdk_temperature_kwargs(temperature, self._model),
         )
         return msg.content[0].text
 

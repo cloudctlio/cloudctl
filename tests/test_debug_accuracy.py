@@ -102,7 +102,7 @@ class TestBudget:
         ]
         size_without_inventory = len(context_shaper.serialize({**ctx, "aws": {}}))
         notes = context_shaper.fit_to_budget(ctx, max_chars=size_without_inventory + 500)
-        assert any(n.startswith("aws:") for n in notes)
+        assert any(n.startswith("aws.prod.compute:") for n in notes)
         assert len(ctx["service_logs"]) == 30
         assert len(ctx["audit_logs"]) == 4
 
@@ -163,12 +163,15 @@ class TestProviders:
         return obj
 
     def test_anthropic_style_providers(self):
-        from cloudctl.ai.factory import AnthropicAI, VertexAI
-        for cls in (AnthropicAI, VertexAI):
+        from cloudctl.ai.factory import AnthropicAI, AzureFoundryAI, VertexAI
+        for cls in (AnthropicAI, VertexAI, AzureFoundryAI):
             obj = self._anthropic_like(cls)
-            assert obj._invoke("p", system="S", temperature=0) == "ok"
+            with patch("cloudctl.ai.factory._anthropic_sdk_major", return_value=0):
+                assert obj._invoke("p", system="S", temperature=0) == "ok"
             kw = obj._client.messages.create.call_args.kwargs
-            assert kw["system"] == "S" and kw["temperature"] == 0
+            # extra_body, not the keyword: anthropic 1.x removed the keyword
+            assert kw["system"] == "S" and kw["extra_body"] == {"temperature": 0}
+            assert "temperature" not in kw
 
     def test_default_call_leaves_provider_defaults(self):
         from cloudctl.ai.factory import _SYSTEM_PROMPT, AnthropicAI
@@ -223,7 +226,10 @@ class TestFetcher:
         from cloudctl.debug.fetcher import DebugFetcher
         session = MagicMock()
         session.client.return_value = client
-        return DebugFetcher(session)
+        f = DebugFetcher(session)
+        f._CT_PAGE_DELAY = 0
+        f._BACKOFF_BASE = 0
+        return f
 
     def test_cloudtrail_default_is_one_call_of_50(self):
         ct = MagicMock()
@@ -247,21 +253,108 @@ class TestFetcher:
         assert ct.lookup_events.call_args_list[1].kwargs["NextToken"] == "t1"
         assert [e["event"] for e in evts] == ["PutRolePolicy", "UpdateFunctionConfiguration"]
 
-    def test_cloudwatch_logs_default_single_page(self):
+    def test_cloudwatch_logs_single_page_reads_whole_window(self):
         logs = MagicMock()
         logs.filter_log_events.return_value = {"events": [{"timestamp": 0, "message": "a"}], "nextToken": "t"}
-        self._fetcher(logs).cloudwatch_logs("lg")
+        self._fetcher(logs).cloudwatch_logs("lg", minutes=60, max_pages=1)
         assert logs.filter_log_events.call_count == 1
+        kw = logs.filter_log_events.call_args.kwargs
+        assert kw["endTime"] - kw["startTime"] == 60 * 60 * 1000
 
-    def test_cloudwatch_logs_paginates_and_keeps_newest(self):
+    def test_cloudwatch_logs_reads_newest_slice_first(self):
+        logs = MagicMock()
+        logs.filter_log_events.return_value = {
+            "events": [{"timestamp": i * 1000, "message": f"m{i}", "eventId": str(i)} for i in range(30)]}
+        self._fetcher(logs).cloudwatch_logs("lg", minutes=160, max_events=30, max_pages=5)
+        first = logs.filter_log_events.call_args_list[0].kwargs
+        # The first call covers only the last 1/16 of the window
+        assert first["endTime"] - first["startTime"] == 160 * 60 * 1000 // 16
+        assert logs.filter_log_events.call_count == 1  # 30 lines already: stop
+
+    def test_cloudwatch_logs_walks_back_and_keeps_newest(self):
         logs = MagicMock()
         logs.filter_log_events.side_effect = [
-            {"events": [{"timestamp": i * 1000, "message": f"m{i}"} for i in range(30)], "nextToken": "t1"},
-            {"events": [{"timestamp": i * 1000, "message": f"m{i}"} for i in range(30, 60)]},
+            {"events": [{"timestamp": 900_000 + i, "message": f"new{i}", "eventId": f"n{i}"} for i in range(10)]},
+            {"events": [{"timestamp": 500_000 + i, "message": f"mid{i}", "eventId": f"m{i}"} for i in range(10)]},
+            {"events": [{"timestamp": 100_000 + i, "message": f"old{i}", "eventId": f"o{i}"} for i in range(10)]},
         ]
-        evts = self._fetcher(logs).cloudwatch_logs("lg", max_events=40, max_pages=5)
+        evts = self._fetcher(logs).cloudwatch_logs("lg", max_events=15, max_pages=5)
+        msgs = [e["event"] for e in evts]
         assert logs.filter_log_events.call_count == 2
-        assert len(evts) == 40 and evts[-1]["event"] == "m59" and evts[0]["event"] == "m20"
+        assert msgs[-1] == "new9" and "old0" not in msgs and len(msgs) == 15
+        assert msgs == [f"mid{i}" for i in range(5, 10)] + [f"new{i}" for i in range(10)]
+
+    def test_cloudwatch_logs_splits_an_overfull_slice_newer_half_first(self):
+        logs = MagicMock()
+        logs.filter_log_events.side_effect = [
+            {"events": [{"timestamp": 1, "message": "oldest-of-slice"}], "nextToken": "t"},
+            {"events": [{"timestamp": 2, "message": "newer-half", "eventId": "a"}]},
+        ]
+        evts = self._fetcher(logs).cloudwatch_logs("lg", max_events=1, max_pages=5)
+        calls = logs.filter_log_events.call_args_list
+        assert calls[1].kwargs["endTime"] == calls[0].kwargs["endTime"]
+        assert calls[1].kwargs["startTime"] > calls[0].kwargs["startTime"]
+        assert [e["event"] for e in evts] == ["newer-half"]
+
+    def test_cloudwatch_logs_keeps_lines_when_a_later_call_fails(self):
+        logs = MagicMock()
+        logs.filter_log_events.side_effect = [
+            {"events": [{"timestamp": 5, "message": "kept", "eventId": "k"}]},
+            RuntimeError("boom"),
+        ]
+        f = self._fetcher(logs)
+        evts = f.cloudwatch_logs("lg", max_events=10, max_pages=5)
+        assert [e["event"] for e in evts] == ["kept"]
+        assert "older lines missing" in f.errors["cloudwatch_logs:lg"]
+
+    def test_cloudtrail_pauses_between_pages(self):
+        ct = MagicMock()
+        ct.lookup_events.side_effect = [
+            {"Events": [_ct_event("PutRolePolicy", "r")], "NextToken": "t1"},
+            {"Events": [_ct_event("UpdateService", "s")]},
+        ]
+        f = self._fetcher(ct)
+        f._CT_PAGE_DELAY = 0.25
+        with patch("cloudctl.debug.fetcher.time.sleep") as sleep:
+            f.cloudtrail(minutes=60, writes_only=True, max_events=100)
+        sleep.assert_called_once_with(0.25)
+
+    def test_cloudtrail_retries_a_throttled_page(self):
+        ct = MagicMock()
+        ct.lookup_events.side_effect = [
+            {"Events": [_ct_event("PutRolePolicy", "r")], "NextToken": "t1"},
+            _throttle(),
+            {"Events": [_ct_event("UpdateService", "s")]},
+        ]
+        f = self._fetcher(ct)
+        evts = f.cloudtrail(minutes=60, writes_only=True, max_events=100)
+        assert [e["event"] for e in evts] == ["PutRolePolicy", "UpdateService"]
+        assert "cloudtrail" not in f.errors
+
+    def test_cloudtrail_keeps_earlier_pages_when_throttling_persists(self):
+        ct = MagicMock()
+        ct.lookup_events.side_effect = [
+            {"Events": [_ct_event("PutRolePolicy", "r")], "NextToken": "t1"},
+        ] + [_throttle()] * 10
+        f = self._fetcher(ct)
+        evts = f.cloudtrail(minutes=60, writes_only=True, max_events=100)
+        assert [e["event"] for e in evts] == ["PutRolePolicy"]
+        assert f.availability["cloudtrail"] is True
+        assert f.errors["cloudtrail"].startswith("ThrottlingException after 1 page(s)")
+
+    def test_cloudtrail_first_page_failure_is_recorded(self):
+        ct = MagicMock()
+        ct.lookup_events.side_effect = [_throttle()] * 10
+        f = self._fetcher(ct)
+        assert f.cloudtrail(minutes=60) == []
+        assert f.availability["cloudtrail"] is False
+        assert f.errors["cloudtrail"] == "ThrottlingException"
+
+
+def _throttle():
+    from botocore.exceptions import ClientError
+    return ClientError({"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+                       "LookupEvents")
 
 
 # ── Agent mode: fetched-data keys and branch determinism ──────────────────────
@@ -349,3 +442,164 @@ class TestRunBranch:
         _, bedrock = self._run()
         for call in bedrock.converse.call_args_list:
             assert call.kwargs["inferenceConfig"]["temperature"] == 0
+
+
+# ── Review fixes: dedup and budget must not lose real data ────────────────────
+
+class TestDedupKeepsResourceAttributes:
+    def test_env_vars_with_the_same_name_survive(self):
+        ctx = {"aws": {"prod": {"compute": [
+            {"name": "fn-a", "env": [{"name": "DB_HOST", "value": "a.db"}]},
+            {"name": "fn-b", "env": [{"name": "DB_HOST", "value": "b.db"}]},
+        ]}}}
+        context_shaper.dedup_nested(ctx)
+        fns = ctx["aws"]["prod"]["compute"]
+        assert [f["env"][0]["value"] for f in fns] == ["a.db", "b.db"]
+
+    def test_same_name_in_different_lists_is_not_a_duplicate(self):
+        ctx = {"aws": {"prod": {
+            "compute": [{"name": "api", "type": "lambda"}],
+            "network": [{"name": "api", "type": "alb"}],
+        }}}
+        context_shaper.dedup_nested(ctx)
+        assert ctx["aws"]["prod"]["network"] == [{"name": "api", "type": "alb"}]
+
+    def test_same_name_in_two_accounts_is_kept(self):
+        ctx = {"aws": {
+            "acct-a": {"compute": [{"name": "worker", "state": "running"}]},
+            "acct-b": {"compute": [{"name": "worker", "state": "stopped"}]},
+        }}
+        context_shaper.dedup_nested(ctx)
+        assert ctx["aws"]["acct-b"]["compute"] == [{"name": "worker", "state": "stopped"}]
+
+    def test_identical_name_only_copies_and_same_arn_are_dropped(self):
+        ctx = {"aws": {
+            "p1": {"compute": [{"name": "w", "state": "running"}, {"arn": "arn:x", "state": "ok"}]},
+            "p2": {"compute": [{"name": "w", "state": "running"}, {"arn": "arn:x", "state": "ok"}]},
+        }}
+        context_shaper.dedup_nested(ctx)
+        assert ctx["aws"]["p2"]["compute"] == []
+
+    def test_does_not_recurse_into_a_resource(self):
+        ctx = {"aws": {"p": {"compute": [
+            {"arn": "arn:svc-1", "containers": [{"name": "app"}, {"name": "app"}]},
+        ]}}}
+        context_shaper.dedup_nested(ctx)
+        assert len(ctx["aws"]["p"]["compute"][0]["containers"]) == 2
+
+
+class TestBudgetTrimsInsideSections:
+    def _inventory(self, n=200):
+        return {"aws": {"prod": {
+            "compute": [{"name": f"i{i}", "pad": "y" * 50} for i in range(n)],
+            "database": [{"name": f"d{i}"} for i in range(20)],
+        }}}
+
+    def test_barely_over_budget_loses_a_few_items_not_the_section(self):
+        ctx = self._inventory()
+        limit = len(context_shaper.serialize(ctx)) - 10
+        notes = context_shaper.fit_to_budget(ctx, max_chars=limit)
+        assert "_summary" not in ctx["aws"]
+        assert len(ctx["aws"]["prod"]["compute"]) == 199
+        assert len(ctx["aws"]["prod"]["database"]) == 20
+        assert notes == ["aws.prod.compute: kept 199 of 200 items to fit the size budget"]
+        assert len(context_shaper.serialize(ctx)) <= limit
+
+    def test_largest_inner_list_is_trimmed_first(self):
+        ctx = self._inventory()
+        context_shaper.fit_to_budget(ctx, max_chars=len(context_shaper.serialize(ctx)) - 2000)
+        assert len(ctx["aws"]["prod"]["database"]) == 20
+
+    def test_section_is_summarised_only_as_a_last_resort(self):
+        ctx = {"aws": {"prod": {"account": "x" * 5000}}, "audit_logs": [{"event": "e"}]}
+        notes = context_shaper.fit_to_budget(ctx, max_chars=200)
+        assert ctx["aws"] == {"_summary": "aws omitted to fit the size budget"}
+        assert "aws: omitted to fit the size budget" in notes
+
+    def test_unknown_keys_outrank_the_inventory(self):
+        assert context_shaper._ordered_keys({"aws": 1, "mystery": 1, "service_logs": 1}) \
+            == ["service_logs", "mystery", "aws"]
+        ctx = {"mystery": [{"event": f"e{i}"} for i in range(10)], **self._inventory()}
+        context_shaper.fit_to_budget(ctx, max_chars=len(context_shaper.serialize(ctx)) - 500)
+        assert len(ctx["mystery"]) == 10
+
+
+# ── Review fixes: audit window and fetch errors in the provider ───────────────
+
+class TestProviderAudit:
+    def _run(self, fetcher, minutes=45):
+        from cloudctl.providers.aws.provider import AWSProvider
+        prov = AWSProvider.__new__(AWSProvider)
+        prov._session = MagicMock()
+        ctx: dict = {}
+        with patch("cloudctl.debug.fetcher.DebugFetcher", return_value=fetcher), \
+             patch("cloudctl.debug.planner.plan_sources", return_value=["audit_logs"]), \
+             patch("cloudctl.debug.planner.extract_service_hints", return_value=[]):
+            try:
+                prov.fetch_debug_context("orders erroring", [], ctx, minutes=minutes)
+            except Exception:  # noqa: BLE001, S110
+                pass  # later fetches on the mock are not under test
+        return ctx
+
+    def _fetcher(self, writes, recent, errors=None):
+        f = MagicMock()
+        f.cloudtrail.side_effect = [writes, recent]
+        f.errors = errors or {}
+        f.acm_certificates.return_value = {}
+        return f
+
+    def test_respects_the_callers_window_and_keeps_failed_reads(self):
+        write = {"time": "2026-11-10T10:00:00Z", "event": "PutRolePolicy", "principal": "d",
+                 "resource": "r", "error_code": ""}
+        denied = {"time": "2026-11-10T10:05:00Z", "event": "GetSecretValue", "principal": "app",
+                  "resource": "s", "error_code": "AccessDenied"}
+        ok_read = {"time": "2026-11-10T10:06:00Z", "event": "DescribeInstances", "principal": "x",
+                   "resource": "", "error_code": ""}
+        f = self._fetcher([write], [ok_read, denied, write])
+        ctx = self._run(f, minutes=45)
+        calls = f.cloudtrail.call_args_list
+        assert all(c.kwargs["minutes"] == 45 for c in calls)
+        assert calls[0].kwargs.get("writes_only") is True and not calls[1].kwargs.get("writes_only")
+        assert [e["event"] for e in ctx["audit_logs"]] == ["GetSecretValue", "PutRolePolicy"]
+
+    def test_fetch_errors_reach_the_context(self):
+        f = self._fetcher([], [], errors={"cloudtrail": "ThrottlingException after 2 page(s)"})
+        ctx = self._run(f)
+        assert ctx["source_errors"] == ["cloudtrail: ThrottlingException after 2 page(s)"]
+
+
+# ── Review fixes: temperature only where the model and SDK accept it ──────────
+
+class TestTemperatureGate:
+    def test_models_that_reject_temperature(self):
+        from cloudctl.ai.factory import _claude_accepts_temperature as ok
+        for m in ("us.anthropic.claude-opus-4-7-v1:0", "claude-opus-4-8", "claude-opus-5-5",
+                  "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2",
+                  "claude-opus-4-7@20260101"):
+            assert not ok(m), m
+        for m in ("us.anthropic.claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-20250514-v1:0",
+                  "us.anthropic.claude-haiku-4-5-20251001-v1:0", "claude-opus-4-6@20260101",
+                  "claude-sonnet-4-5", "claude-opus-4-20250514", "m"):
+            assert ok(m), m
+
+    def test_bedrock_omits_temperature_for_newer_models(self):
+        from cloudctl.ai.factory import BedrockAI
+        obj = BedrockAI.__new__(BedrockAI)
+        obj._model, obj._region, obj._profile = "us.anthropic.claude-opus-4-7-v1:0", "us-east-1", None
+        client = MagicMock()
+        client.invoke_model.return_value = {"body": MagicMock(read=lambda: json.dumps(
+            {"content": [{"text": "ok"}]}).encode())}
+        with patch("boto3.Session") as sess:
+            sess.return_value.client.return_value = client
+            obj._invoke("p", temperature=0)
+        assert "temperature" not in json.loads(client.invoke_model.call_args.kwargs["body"])
+
+    def test_sdk_providers_by_sdk_version(self):
+        from cloudctl.ai.factory import _claude_sdk_temperature_kwargs as kw
+        with patch("cloudctl.ai.factory._anthropic_sdk_major", return_value=1):
+            assert kw(0, "claude-sonnet-4-6") == {"extra_body": {"temperature": 0}}
+            assert kw(0, "claude-opus-5-5") == {}
+            assert kw(None, "claude-sonnet-4-6") == {}
+        with patch("cloudctl.ai.factory._anthropic_sdk_major", return_value=2):
+            assert kw(0, "claude-sonnet-4-6") == {}  # API 2026-10-21 rejects it on every model
+

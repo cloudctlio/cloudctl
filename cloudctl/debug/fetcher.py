@@ -1,6 +1,7 @@
 """Debug fetcher — collects raw evidence from cloud data sources."""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -13,6 +14,38 @@ _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 # metrics (1-min lag). If an incident happened < 20 minutes ago, the caller should
 # surface a lag warning so users know CloudTrail data may be incomplete.
 CLOUDTRAIL_LAG_MINUTES = 15
+
+# Error codes AWS uses for rate limiting. LookupEvents allows about 2 calls
+# per second per region, so paging back to back can hit it.
+_THROTTLE_CODES = {
+    "ThrottlingException", "Throttling", "TooManyRequestsException",
+    "RequestLimitExceeded", "LimitExceededException",
+}
+
+
+def _error_code(exc: Exception) -> str:
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):
+        return str(resp.get("Error", {}).get("Code", "")) or type(exc).__name__
+    return type(exc).__name__
+
+
+def _newest_first_slices(start: int, end: int, n: int) -> list[tuple[int, int]]:
+    """Split [start, end] into n slices, newest first, each older one double.
+
+    For n=5: the last 1/16, then 1/16, 1/8, 1/4, 1/2 of the window.
+    """
+    if n <= 1:
+        return [(start, end)]
+    span = end - start
+    unit = span / (2 ** (n - 1))
+    widths = [unit] + [unit * (2 ** i) for i in range(n - 1)]
+    slices, hi = [], end
+    for i, w in enumerate(widths):
+        lo = start if i == n - 1 else max(start, round(hi - w))
+        slices.append((lo, hi))
+        hi = lo
+    return slices
 
 
 class DebugFetcher:
@@ -31,14 +64,41 @@ class DebugFetcher:
         """
         self._session = session
         self._availability: dict[str, bool] = {}
+        self._errors: dict[str, str] = {}
 
     @property
     def availability(self) -> dict[str, bool]:
         """Which sources returned data (True) vs were missing/disabled (False)."""
         return dict(self._availability)
 
+    @property
+    def errors(self) -> dict[str, str]:
+        """Sources whose fetch failed or stopped early, with what went wrong.
+
+        A source can be in both availability (True, some data came back) and
+        errors (the rest did not), so callers can say the data is partial.
+        """
+        return dict(self._errors)
+
     def _mark(self, source: str, ok: bool) -> None:
         self._availability[source] = ok
+
+    # Pause between CloudTrail pages and the first backoff step (seconds).
+    # Tests set these to 0.
+    _CT_PAGE_DELAY = 0.5
+    _BACKOFF_BASE = 1.0
+    _MAX_RETRIES = 3
+
+    def _call_with_backoff(self, fn, **kwargs):
+        """Call an AWS API, retrying on throttling with exponential backoff."""
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                return fn(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if _error_code(exc) not in _THROTTLE_CODES or attempt == self._MAX_RETRIES:
+                    raise
+                time.sleep(self._BACKOFF_BASE * (2 ** attempt))
+        raise RuntimeError("unreachable")
 
     def cloudwatch_metrics(
         self,
@@ -86,54 +146,75 @@ class DebugFetcher:
         max_events: int = 100,
         max_pages: int = 5,
     ) -> list[dict]:
-        """Matching log events, oldest first, keeping the newest max_events."""
+        """Matching log events, oldest first.
+
+        filter_log_events returns events in time order from startTime, so
+        paging forward through a busy window yields its oldest lines. With
+        max_pages > 1 the window is instead read newest first, in slices that
+        double in size going back (the last 1/16, then 1/16, 1/8, 1/4, 1/2),
+        and an overfull slice is split so its newer half is read first. The
+        newest max_events lines are kept. With max_pages=1 the whole window
+        is one call.
+
+        If a call fails after some lines came back, those lines are kept and
+        the failure is recorded in ``errors``.
+        """
         if not self._session:
             self._mark("cloudwatch_logs", False)
             return []
+        raw_events: list[dict] = []
         try:
             logs  = self._session.client("logs")
             end   = int(datetime.now(timezone.utc).timestamp() * 1000)
             start = end - minutes * 60 * 1000
-            kwargs: dict = dict(
-                logGroupName=log_group,
-                startTime=start,
-                endTime=end,
-                limit=min(max_events, 10_000),
-            )
+            base: dict = dict(logGroupName=log_group, limit=min(max_events, 10_000))
             if filter_pattern:
-                kwargs["filterPattern"] = filter_pattern
-            # Paginate (bounded) and keep the MOST RECENT events. filter_log_events
-            # returns oldest-first; a single 100-event page of a busy group is all
-            # startup chatter, hiding a later error burst and making the model
-            # conclude "logs are clean". Hard page/event caps keep this from
-            # hanging or over-fetching.
-            raw: list[dict] = []
-            token = None
-            for _ in range(max(1, max_pages)):   # bounded pages / ≤500 events
-                if token:
-                    kwargs["nextToken"] = token
-                resp  = logs.filter_log_events(**kwargs)
-                raw.extend(resp.get("events", []))
-                token = resp.get("nextToken")
-                if not token or len(raw) >= 500:
-                    break
-            raw.sort(key=lambda e: e.get("timestamp", 0))
-            recent = raw[-max_events:] if (max_events and max_events > 0) else raw
-            events = [
-                {
-                    "time":   datetime.fromtimestamp(
-                        e["timestamp"] / 1000, tz=timezone.utc
-                    ).strftime(_TS_FMT),
-                    "source": f"CloudWatch/Logs/{log_group}",
-                    "event":  e.get("message", "").strip()[:500],
-                }
-                for e in recent
-            ]
-            self._mark("cloudwatch_logs", bool(events))
-            return events
-        except Exception:  # noqa: BLE001
-            self._mark("cloudwatch_logs", False)
-            return []
+                base["filterPattern"] = filter_pattern
+
+            n_slices = max(1, min(5, max_pages))
+            pending = _newest_first_slices(start, end, n_slices)
+            budget = max(1, max_pages)
+            seen_ids: set = set()
+            while pending and budget > 0 and len(raw_events) < max_events:
+                s_ms, e_ms = pending.pop(0)
+                resp = self._call_with_backoff(
+                    logs.filter_log_events, startTime=s_ms, endTime=e_ms, **base
+                )
+                budget -= 1
+                if resp.get("nextToken") and budget > 0 and e_ms - s_ms > 1000:
+                    # More lines in this slice than one page holds: read the
+                    # newer half first, then the older half.
+                    mid = (s_ms + e_ms) // 2
+                    pending[0:0] = [(mid, e_ms), (s_ms, mid)]
+                    continue
+                for ev in resp.get("events", []):
+                    key = ev.get("eventId") or (ev.get("timestamp"), ev.get("message"))
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+                    raw_events.append(ev)
+        except Exception as exc:  # noqa: BLE001
+            if not raw_events:
+                self._mark("cloudwatch_logs", False)
+                self._errors[f"cloudwatch_logs:{log_group}"] = _error_code(exc)
+                return []
+            self._errors[f"cloudwatch_logs:{log_group}"] = (
+                f"{_error_code(exc)} after {len(raw_events)} lines; older lines missing"
+            )
+        raw_events.sort(key=lambda e: e.get("timestamp", 0))
+        raw_events = raw_events[-max_events:]
+        events = [
+            {
+                "time":   datetime.fromtimestamp(
+                    e["timestamp"] / 1000, tz=timezone.utc
+                ).strftime(_TS_FMT),
+                "source": f"CloudWatch/Logs/{log_group}",
+                "event":  e.get("message", "").strip()[:500],
+            }
+            for e in raw_events
+        ]
+        self._mark("cloudwatch_logs", bool(events))
+        return events
 
     def cloudtrail(
         self,
@@ -181,8 +262,21 @@ class DebugFetcher:
             # LookupEvents pages hold at most 50 events. Callers that ask for
             # neither more events nor writes only get the old single call.
             max_pages = 10 if (writes_only or max_events > 50) else 1
-            for _ in range(max_pages):
-                resp = ct.lookup_events(**kwargs)
+            pages = 0
+            for page in range(max_pages):
+                if page:
+                    time.sleep(self._CT_PAGE_DELAY)  # stay under ~2 calls/s
+                try:
+                    resp = self._call_with_backoff(ct.lookup_events, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    if not pages:
+                        raise
+                    # Keep what came back; say the rest is missing.
+                    self._errors["cloudtrail"] = (
+                        f"{_error_code(exc)} after {pages} page(s); older events missing"
+                    )
+                    break
+                pages += 1
                 for e in resp.get("Events", []):
                     if name_filter:
                         names = " ".join(
@@ -209,8 +303,9 @@ class DebugFetcher:
                 })
             self._mark("cloudtrail", True)
             return events
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             self._mark("cloudtrail", False)
+            self._errors["cloudtrail"] = _error_code(exc)
             return []
 
     def alb_metrics(
