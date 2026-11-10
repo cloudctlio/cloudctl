@@ -1416,6 +1416,10 @@ def _run_branch(
                     system=_sys(system_text),
                     messages=_conv(msgs),
                     toolConfig=_cached_tools(_AGENT_TOOLS),
+                    # Every other model call in the graph is pinned to
+                    # temperature 0; without this the branches (where the
+                    # evidence is gathered) ran at Bedrock's default.
+                    inferenceConfig={"temperature": 0},
                 )
             except Exception as exc:
                 return {"conclusion": f"error: {exc}", "confidence": "LOW",
