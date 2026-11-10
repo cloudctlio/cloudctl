@@ -41,7 +41,15 @@ REPLAY_STATS = {"exact": 0, "fuzzy": 0, "fallback": 0, "miss": 0}
 # investigation these are idempotent, so identical calls inside the TTL are
 # served from memory — cuts AWS traffic and tokens with no accuracy impact.
 _SESSION_CACHE: dict[str, tuple[float, str]] = {}
-_CACHE_TTL_SECONDS = 300.0
+# Long enough to cover a whole budgeted investigation (default budget 8 min):
+# at 300 s the cache expired mid-run and later branches re-fetched what the
+# first ones had already read. Override with CLOUDCTL_TOOL_CACHE_TTL_S.
+_CACHE_TTL_SECONDS = float(os.environ.get("CLOUDCTL_TOOL_CACHE_TTL_S", "") or 900.0)
+
+# Single-flight: when parallel branches issue the SAME read at the same moment
+# (all three list the same resources at branch start), only the first runs it;
+# the others wait for its result instead of each hitting AWS.
+_INFLIGHT: dict[str, threading.Event] = {}
 
 # Session-scoped fields that identify credentials, not the request — excluded
 # from the canonical input so recordings replay across accounts/sessions.
@@ -146,6 +154,7 @@ def reset_replay_state() -> None:
     with _LOCK:
         _REPLAY_CACHE.clear()
         _SESSION_CACHE.clear()
+        _INFLIGHT.clear()
         _MODEL_QUEUES.clear()
         global _REPLAY_PATH_LOADED, _MODEL_QUEUES_PATH
         _REPLAY_PATH_LOADED = None
@@ -388,17 +397,34 @@ def recordable(tool_name: str):
                 return _lookup(tool_name, canonical)
 
             cache_key = tool_name + "|" + json.dumps(canonical, sort_keys=True, default=str)
-            now = time.monotonic()
-            with _LOCK:
-                hit = _SESSION_CACHE.get(cache_key)
-            if hit and now - hit[0] < _CACHE_TTL_SECONDS:
-                return hit[1]
-
-            out = fn(*args, **kwargs)
-            # Don't pin transient failures — errors should retry on next call.
-            if '"error"' not in out[:200]:
+            for _attempt in range(2):
+                now = time.monotonic()
                 with _LOCK:
-                    _SESSION_CACHE[cache_key] = (now, out)
+                    hit = _SESSION_CACHE.get(cache_key)
+                    if hit and now - hit[0] < _CACHE_TTL_SECONDS:
+                        return hit[1]
+                    waiter = _INFLIGHT.get(cache_key)
+                    if waiter is None:
+                        _INFLIGHT[cache_key] = threading.Event()
+                        break
+                # Someone else is fetching exactly this: wait for them (bounded),
+                # then re-check the cache once; on an error result, fetch ourselves.
+                waiter.wait(timeout=60)
+            else:
+                with _LOCK:
+                    _INFLIGHT.setdefault(cache_key, threading.Event())
+
+            try:
+                out = fn(*args, **kwargs)
+                # Don't pin transient failures — errors should retry on next call.
+                if '"error"' not in out[:200]:
+                    with _LOCK:
+                        _SESSION_CACHE[cache_key] = (now, out)
+            finally:
+                with _LOCK:
+                    ev = _INFLIGHT.pop(cache_key, None)
+                if ev is not None:
+                    ev.set()
             _record(tool_name, canonical, out)
             return out
         return wrapper

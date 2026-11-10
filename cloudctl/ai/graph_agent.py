@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict
 
@@ -243,6 +244,52 @@ def _conv(msgs: list[dict]) -> list[dict]:
         last["content"] = content + [_CACHE_POINT]
         out[-1] = last
     return out
+
+
+# ── Time budget plumbing (see cloudctl/ai/budget.py) ──────────────────────────
+
+from cloudctl.ai import budget as _budget_mod  # noqa: E402
+
+
+def _budget(session_id: str | None) -> "_budget_mod.RunBudget":
+    """This run's budget, or an unbounded one when a node runs outside
+    debug_incident_graph (unit tests): unbounded means unchanged behavior."""
+    return _budget_mod.get(session_id)
+
+
+def _append_wrap_up(msgs: list[dict]) -> None:
+    """Tell the model this is its last turn. Appended to the trailing user
+    message (which may hold tool results) so the conversation still ends on a
+    user turn; a text block after toolResult blocks is valid Converse."""
+    note = {"text": _budget_mod.WRAP_UP_NOTE}
+    if msgs and msgs[-1].get("role") == "user":
+        last = dict(msgs[-1])
+        last["content"] = list(last.get("content", [])) + [note]
+        msgs[-1] = last
+    else:
+        msgs.append({"role": "user", "content": [note]})
+
+
+def _tool_uses(msg: dict) -> list[dict]:
+    return [b["toolUse"] for b in msg.get("content", []) if "toolUse" in b]
+
+
+def _tool_result_msg(tool_uses: list[dict], outputs: list[str]) -> dict:
+    return {"role": "user", "content": [
+        {"toolResult": {"toolUseId": tu["toolUseId"], "content": [{"text": out}]}}
+        for tu, out in zip(tool_uses, outputs)
+    ]}
+
+
+def _budget_hint(b: "_budget_mod.RunBudget", phase: str) -> str:
+    """One line for a kickoff message: how much time this step has, and that
+    independent tool calls in one turn run in parallel. Empty when unbounded,
+    so prompts outside a budgeted run are byte-identical to before."""
+    if not b.bounded:
+        return ""
+    return (f"\n\nTIME BUDGET: about {int(b.left(phase))}s for this step. Request "
+            f"independent tool calls together in ONE turn; they run in parallel. "
+            f"Stop as soon as the evidence decides the question.")
 
 
 def _make_bedrock(profile: str | None, region: str):
@@ -500,14 +547,34 @@ def observe_node(state: GraphState) -> dict:
     system_text = _OBSERVE_SYSTEM + (
         _OBSERVE_REPRODUCE_ADDENDUM if reproduce_enabled else ""
     )
+    b = _budget(state.get("session_id"))
+    _t_phase = time.monotonic()
+
+    # Budgeted runs fetch the broad, symptom-independent evidence up front IN
+    # PARALLEL (inventory, dependency graph, event timeline) and start the log
+    # survey in the background, instead of letting the model ask for each one a
+    # turn at a time. Unbounded runs skip this (unchanged behavior).
+    prefetched = _prefetch_evidence(state, b)
+    prefetch_text = ""
+    if prefetched:
+        prefetch_text = "\n\nALREADY FETCHED IN PARALLEL (do not fetch these again):\n" + \
+            "\n".join(f"[{k}] {_truncate_tool_output(v, k)[:2500]}"
+                      for k, v in prefetched.items())
+
     msgs = [{"role": "user", "content": [{"text": (
         f"Reported symptom: {state['symptom']}\n\n"
         f"Measure this symptom in real data now."
+        f"{prefetch_text}{_budget_hint(b, 'observe')}"
     )}]}]
     observation: dict = {}
-    for _ in range(10 if reproduce_enabled else 8):
+    max_turns = 10 if reproduce_enabled else 8
+    for turn in range(max_turns):
+        final = turn == max_turns - 1 or b.should_wrap_up("observe")
+        if final and b.bounded:
+            _append_wrap_up(msgs)
         try:
-            resp = bedrock.converse(
+            resp = _budget_mod.converse(
+                b, bedrock, "observe",
                 modelId=_MODEL,
                 system=_sys(system_text),
                 messages=_conv(msgs),
@@ -515,6 +582,10 @@ def observe_node(state: GraphState) -> dict:
                 inferenceConfig={"maxTokens": 900 if reproduce_enabled else 700,
                                  "temperature": 0},
             )
+        except _budget_mod.BudgetSpent as exc:
+            observation = {"_error": f"observe stopped at its time budget: {exc}"[:300]}
+            b.skip("observe: ran out of time before a measurement")
+            break
         except Exception as exc:
             # Never fail silently — an empty observation that hides its cause
             # is how the PRISM no-op went unnoticed for three runs.
@@ -528,25 +599,20 @@ def observe_node(state: GraphState) -> dict:
                 "shorter measurement strings."
             )}]})
             continue
-        if resp["stopReason"] == "end_turn":
-            text = next((b["text"] for b in msg.get("content", []) if "text" in b), "")
+        if resp["stopReason"] == "end_turn" or (final and b.bounded):
+            text = next((bb["text"] for bb in msg.get("content", []) if "text" in bb), "")
             observation = _extract_json(text, "symptom_observable_now") or {}
             if not isinstance(observation, dict):
                 observation = {"_error": f"unparseable observe output: {text[:200]}"}
+            if resp["stopReason"] != "end_turn" and not observation:
+                observation = {"_error": "observe hit its time budget before measuring"}
             break
         if resp["stopReason"] == "tool_use":
-            tool_results = []
-            for block in msg.get("content", []):
-                if "toolUse" in block:
-                    tu = block["toolUse"]
-                    tool_results.append({
-                        "toolResult": {
-                            "toolUseId": tu["toolUseId"],
-                            "content": [{"text": _dispatch(tu["name"], tu["input"])}],
-                        }
-                    })
-            if tool_results:
-                msgs.append({"role": "user", "content": tool_results})
+            tus = _tool_uses(msg)
+            if tus:
+                outs = _budget_mod.run_tools(
+                    b, "observe", [(tu["name"], tu["input"]) for tu in tus], _dispatch)
+                msgs.append(_tool_result_msg(tus, outs))
 
     # First-class reproduction evidence: attach the CONCRETE responses verbatim
     # (deterministically captured above) so downstream nodes and the grounding
@@ -557,7 +623,78 @@ def observe_node(state: GraphState) -> dict:
             observation = {}
         observation["reproduction_observed"] = reproductions
 
-    return {"observation": observation}
+    b.mark("observe", time.monotonic() - _t_phase)
+    out = {"observation": observation}
+    if prefetched:
+        # Prefetched results are real evidence: put them in the corpus (so the
+        # grounding checks can trace claims to them) and hand triage the
+        # inventory so it need not enumerate the account again.
+        fetched = dict(state.get("all_fetched") or {})
+        for k, v in prefetched.items():
+            try:
+                parsed = json.loads(v)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(parsed, dict) and not parsed.get("error"):
+                _store_unique(fetched, f"{k}:prefetch", parsed)
+        out["all_fetched"] = fetched
+    return out
+
+
+_PREFETCH_SURVEY_KEY = "log_survey"
+
+
+def _prefetch_evidence(state: GraphState, b) -> dict[str, str]:
+    """Bounded runs only: fetch in parallel the account-wide evidence that the
+    observe and triage loops would otherwise request one model turn at a time,
+    and start the log survey (used later by log_intelligence) in the background
+    so it overlaps observe + triage instead of starting after them."""
+    if not b.bounded:
+        return {}
+    import threading
+    from cloudctl.mcp.tools.debug import (
+        list_resources, get_dependency_graph, get_event_timeline,
+    )
+    from cloudctl.ai.guardrails import audit_log_tool_call
+
+    prof, reg, mins = state["profile"], state["region"], state["minutes"]
+
+    # Log survey in the background (its own thread; log_intelligence joins it).
+    if _PREFETCH_SURVEY_KEY not in b.background:
+        holder: dict = {}
+        done = threading.Event()
+
+        def _bg():
+            try:
+                holder["value"] = _recorded_log_survey(prof, reg, mins)
+            except Exception as exc:  # noqa: BLE001
+                holder["value"] = {"events": [], "groups": [],
+                                   "error": f"{type(exc).__name__}: {exc}"[:300]}
+            finally:
+                done.set()
+
+        threading.Thread(target=_bg, daemon=True, name="cctl-log-survey").start()
+        b.background[_PREFETCH_SURVEY_KEY] = (done, holder)
+
+    calls = [
+        ("list_resources", {"service_type": ""}),
+        ("get_dependency_graph", {}),
+        ("get_event_timeline", {"symptom": state["symptom"]}),
+    ]
+
+    def _fetch(name: str, _inp: dict) -> str:
+        audit_log_tool_call(session_id=state["session_id"], tool_name=name,
+                            resource_name="prefetch", allowed=True, block_reason="")
+        if name == "list_resources":
+            return list_resources("", prof, reg)
+        if name == "get_dependency_graph":
+            return get_dependency_graph(prof, reg)
+        return get_event_timeline(state["symptom"], prof, reg, mins)
+
+    _t0 = time.monotonic()
+    outs = _budget_mod.run_tools(b, "observe", calls, _fetch)
+    b.mark("prefetch", time.monotonic() - _t0)
+    return {name: out for (name, _), out in zip(calls, outs)}
 
 
 # ── Generic diagnostic methodology scaffold (Feature 3) ───────────────────────
@@ -835,29 +972,63 @@ def triage_node(state: GraphState) -> dict:
             return json.dumps({"error": str(exc)})
 
     # Agentic loop: LLM calls list_resources for whatever services it judges relevant.
-    # Capped at 6 turns (up to 4 tool calls + final answer).
+    # Capped at 6 turns (up to 4 tool calls + final answer), and in a budgeted
+    # run also by the triage phase's share of the clock.
+    b = _budget(state.get("session_id"))
+    _t_phase = time.monotonic()
     obs = state.get("observation") or {}
     obs_text = (
         f"\n\nMEASURED OBSERVATION (from real data, trust over the symptom text):\n"
         f"{json.dumps(obs, indent=2)}"
         if obs else ""
     )
-    msgs = [{"role": "user", "content": [{"text": f"Symptom: {state['symptom']}{obs_text}"}]}]
+    # Budgeted runs prefetched the whole inventory and the dependency graph in
+    # observe: seed discovery with them and show the model, so triage does not
+    # spend turns enumerating the account again.
+    inv_text = ""
+    for k, v in (state.get("all_fetched") or {}).items():
+        if not str(k).endswith(":prefetch") or not isinstance(v, dict):
+            continue
+        if k.startswith("list_resources"):
+            discovered.setdefault("all", v)
+            names = (v.get("resources_detailed") or [])[:150]
+            inv_text += ("\n\nDISCOVERED RESOURCES (already enumerated; call "
+                         "list_resources only to filter further):\n"
+                         + json.dumps([[r.get("service"), r.get("name")] for r in names
+                                       if isinstance(r, dict)], separators=(",", ":")))
+        elif k.startswith("get_dependency_graph"):
+            discovered.setdefault("_dependency_graph", v)
+            inv_text += ("\n\nDEPENDENCY GRAPH (already fetched):\n"
+                         + json.dumps(v, separators=(",", ":"), default=str)[:3000])
+    msgs = [{"role": "user", "content": [{"text": (
+        f"Symptom: {state['symptom']}{obs_text}{inv_text}{_budget_hint(b, 'triage')}"
+    )}]}]
     hypotheses = []
-    for _ in range(6):
-        resp = bedrock.converse(
-            modelId=_MODEL,
-            system=_sys(_TRIAGE_SYSTEM),
-            messages=_conv(msgs),
-            toolConfig=_cached_tools([t for t in _AGENT_TOOLS
-                                  if t["toolSpec"]["name"] in ("list_resources", "get_dependency_graph")]),
-            inferenceConfig={"maxTokens": 1000, "temperature": 0},
-        )
+    max_turns = 6
+    for turn in range(max_turns):
+        final = b.bounded and (turn == max_turns - 1 or b.should_wrap_up("triage"))
+        if final:
+            _append_wrap_up(msgs)
+        try:
+            resp = _budget_mod.converse(
+                b, bedrock, "triage",
+                modelId=_MODEL,
+                system=_sys(_TRIAGE_SYSTEM),
+                messages=_conv(msgs),
+                toolConfig=_cached_tools([t for t in _AGENT_TOOLS
+                                      if t["toolSpec"]["name"] in ("list_resources", "get_dependency_graph")]),
+                inferenceConfig={"maxTokens": 1000, "temperature": 0},
+            )
+        except _budget_mod.BudgetSpent:
+            # Out of triage time: fall through to the discovery-derived
+            # hypotheses below rather than failing the run.
+            b.skip("triage: ran out of time, used fallback hypotheses")
+            break
         stop_reason = resp["stopReason"]
         msg = resp["output"]["message"]
         msgs.append(msg)
 
-        if stop_reason == "max_tokens":
+        if stop_reason == "max_tokens" and not final:
             # Conversation must end with a user message — nudge for a shorter reply.
             msgs.append({"role": "user", "content": [{"text": (
                 "Your response was cut off at the token limit. Respond again with "
@@ -865,9 +1036,9 @@ def triage_node(state: GraphState) -> dict:
             )}]})
             continue
 
-        if stop_reason == "end_turn":
+        if stop_reason == "end_turn" or final:
             text = next(
-                (b["text"] for b in msg.get("content", []) if "text" in b), ""
+                (bb["text"] for bb in msg.get("content", []) if "text" in bb), ""
             ).strip()
             if "```" in text:
                 for p in text.split("```"):
@@ -896,18 +1067,11 @@ def triage_node(state: GraphState) -> dict:
             break
 
         if stop_reason == "tool_use":
-            tool_results = []
-            for block in msg.get("content", []):
-                if "toolUse" in block:
-                    tu = block["toolUse"]
-                    tool_results.append({
-                        "toolResult": {
-                            "toolUseId": tu["toolUseId"],
-                            "content": [{"text": _dispatch_list(tu["name"], tu["input"])}],
-                        }
-                    })
-            if tool_results:
-                msgs.append({"role": "user", "content": tool_results})
+            tus = _tool_uses(msg)
+            if tus:
+                outs = _budget_mod.run_tools(
+                    b, "triage", [(tu["name"], tu["input"]) for tu in tus], _dispatch_list)
+                msgs.append(_tool_result_msg(tus, outs))
 
     if not hypotheses:
         # Robust fallback: do NOT collapse to a single hard-coded guess. The old
@@ -915,11 +1079,16 @@ def triage_node(state: GraphState) -> dict:
         # every unparseable triage toward one fault class regardless of symptom.
         # Derive neutral hypotheses from whatever resources were actually
         # discovered (hint-free — no fault category assumed).
-        for svc, parsed in (discovered or {}).items():
+        for svc, parsed in list((discovered or {}).items()):
             if svc.startswith("_"):
                 continue
             names = parsed.get("resources") if isinstance(parsed, dict) else None
             first = names[0] if isinstance(names, list) and names else ""
+            if svc == "all":
+                # Prefetched whole-account inventory: name the first resource's
+                # own service instead of the pseudo-key.
+                det = (parsed.get("resources_detailed") or [{}]) if isinstance(parsed, dict) else [{}]
+                svc = str((det[0] or {}).get("service") or "unknown")
             hypotheses.append({
                 "service": svc,
                 "reason": f"triage returned no parseable hypotheses; {svc} was discovered and may be implicated by the symptom",
@@ -944,6 +1113,7 @@ def triage_node(state: GraphState) -> dict:
     # untested assumption that its own configuration is sound.
     hypotheses = _ensure_anchor_hypothesis(hypotheses, obs, discovered)
 
+    b.mark("triage", time.monotonic() - _t_phase)
     return {
         "hypotheses": hypotheses,
         "all_fetched": {**state.get("all_fetched", {}), "_discovery": discovered},
@@ -1222,6 +1392,7 @@ def _run_branch(
     minutes: int,
     session_id: str,
     failure_map: list | None = None,
+    phase: str = "investigate",
 ) -> BranchResult:
     from cloudctl.mcp.tools.debug import (
         _AGENT_TOOLS, _truncate_tool_output,
@@ -1240,7 +1411,17 @@ def _run_branch(
     tools_called: list[str] = []
     _interned: dict = {}   # rung 4: sha1(output) -> reference id, within this branch
 
-    def dispatch(tool_name: str, tool_input: dict) -> str:
+    b = _budget(session_id)
+    _branch_key = f"{h.service}:{h.focus}"[:120]
+
+    class _Fetched(str):
+        """A raw tool result that still needs evidence-store post-processing
+        (validation failures and unknown tools return plain str and skip it)."""
+
+    def _fetch_raw(tool_name: str, tool_input: dict) -> str:
+        """I/O half of a tool call: validation, audit, and the AWS read. Safe
+        to run on a worker thread; it touches no shared branch state except the
+        append-only tools_called list."""
         tools_called.append(tool_name)
         resource_name = (
             tool_input.get("resource_name")
@@ -1370,7 +1551,19 @@ def _run_branch(
             ), default=str)
         else:
             return json.dumps({"error": f"unknown tool: {tool_name}"})
+        return _Fetched(raw)
 
+    def _post(tool_name: str, tool_input: dict, raw: str) -> str:
+        """Evidence-store half of a tool call, run on the branch's own thread in
+        the model's call order, so parallel fetching never races the store and
+        an abandoned (timed-out) fetch can never write into it later."""
+        if not isinstance(raw, _Fetched):
+            return raw
+        raw = str(raw)
+        resource_name = (
+            tool_input.get("resource_name")
+            or tool_input.get("service_type", "")
+        )
         try:
             parsed = json.loads(raw)
             sanitised = sanitise_fetched_data(parsed) if isinstance(parsed, dict) else parsed
@@ -1398,6 +1591,22 @@ def _run_branch(
             _interned[key] = f"{tool_name}:{resource_name or len(_interned)}"
         return out
 
+    def dispatch(tool_name: str, tool_input: dict) -> str:
+        return _post(tool_name, tool_input, _fetch_raw(tool_name, tool_input))
+
+    def _dispatch_turn(tus: list[dict]) -> list[str]:
+        """All tool calls of one model turn: fetched in parallel under the
+        budget (unbounded: one by one, as before), post-processed in order."""
+        cap = None
+        if b.bounded:
+            cap = max(0, b.branch_tool_calls - len(tools_called))
+        calls = [(tu["name"], tu["input"]) for tu in tus]
+        raws = _budget_mod.run_tools(b, phase, calls, _fetch_raw, per_call_cap=cap)
+        return [_post(n, i, r) for (n, i), r in zip(calls, raws)]
+
+    def _tool_budget_left() -> bool:
+        return (not b.bounded) or len(tools_called) < b.branch_tool_calls
+
     def _voi_stop_check(conclusion: dict | None) -> bool:
         """Feature 5: decisively-resolved-and-floor-met check, evaluated on the
         evidence gathered SO FAR (the pending call, if any, is what we may skip)."""
@@ -1409,9 +1618,24 @@ def _run_branch(
     def _loop(system_text: str, init_messages: list, max_turns: int,
               stop_check=None) -> dict:
         msgs = list(init_messages)
-        for _ in range(max_turns):
+        # Budgeted runs cap each branch turn's output: an uncapped turn can
+        # narrate for thousands of tokens before its tool call, and output
+        # tokens are most of a turn's latency. Unbounded runs keep the old
+        # request byte-for-byte (recordings still replay).
+        infer = {"temperature": 0}
+        if b.bounded:
+            infer["maxTokens"] = 1500
+        for turn in range(max_turns):
+            final = b.bounded and (turn == max_turns - 1
+                                   or b.should_wrap_up(phase)
+                                   or not _tool_budget_left())
+            if final:
+                if b.left(phase) <= 0:
+                    break
+                _append_wrap_up(msgs)
             try:
-                resp = bedrock.converse(
+                resp = _budget_mod.converse(
+                    b, bedrock, phase,
                     modelId=_MODEL,
                     system=_sys(system_text),
                     messages=_conv(msgs),
@@ -1419,29 +1643,39 @@ def _run_branch(
                     # Every other model call in the graph is pinned to
                     # temperature 0; without this the branches (where the
                     # evidence is gathered) ran at Bedrock's default.
-                    inferenceConfig={"temperature": 0},
+                    inferenceConfig=infer,
                 )
+            except _budget_mod.BudgetSpent:
+                break
             except Exception as exc:
                 return {"conclusion": f"error: {exc}", "confidence": "LOW",
                         "confirmed": False, "phase2_needed": True, "evidence": []}
             stop_reason = resp["stopReason"]
             msg = resp["output"]["message"]
             msgs.append(msg)
-            if stop_reason == "max_tokens":
+            text = next(
+                (bb["text"] for bb in msg.get("content", []) if "text" in bb), ""
+            ).strip()
+            if stop_reason == "max_tokens" and not final:
                 msgs.append({"role": "user", "content": [{"text": (
                     "Your response was cut off at the token limit. Respond again "
                     "with ONLY the conclusion JSON, more concisely."
                 )}]})
                 continue
             if stop_reason == "end_turn":
-                text = next(
-                    (b["text"] for b in msg.get("content", []) if "text" in b), ""
-                ).strip()
                 result = _extract_json(text, "conclusion")
                 if result and isinstance(result, dict):
                     return result
                 return {"conclusion": text[:400], "confidence": "LOW",
                         "confirmed": False, "phase2_needed": True, "evidence": []}
+            if final:
+                # Last turn and the model still wants tools (or was cut off):
+                # keep any conclusion it wrote alongside, never dispatch more.
+                result = _extract_json(text, "conclusion") if text else None
+                if isinstance(result, dict):
+                    result["_budget_wrap_up"] = True
+                    return result
+                break
             if stop_reason == "tool_use":
                 # VOI early-stop: if the model has ALREADY narrated a decisive,
                 # traceable conclusion (floor met) alongside this tool request,
@@ -1450,34 +1684,28 @@ def _run_branch(
                 # fires on a decisively-resolved verdict; otherwise dispatch as
                 # usual. Never runs before the floor, never exceeds the ceiling.
                 if stop_check is not None:
-                    _txt = next(
-                        (b["text"] for b in msg.get("content", []) if "text" in b), ""
-                    ).strip()
-                    _prelim = _extract_json(_txt, "conclusion") if _txt else None
+                    _prelim = _extract_json(text, "conclusion") if text else None
                     if isinstance(_prelim, dict) and stop_check(_prelim):
                         _prelim["_voi_early_stop"] = True
                         return _prelim
-                tool_results = []
-                for block in msg.get("content", []):
-                    if "toolUse" in block:
-                        tu = block["toolUse"]
-                        tool_results.append({
-                            "toolResult": {
-                                "toolUseId": tu["toolUseId"],
-                                "content": [{"text": dispatch(tu["name"], tu["input"])}],
-                            }
-                        })
-                if tool_results:
-                    msgs.append({"role": "user", "content": tool_results})
+                tus = _tool_uses(msg)
+                if tus:
+                    msgs.append(_tool_result_msg(tus, _dispatch_turn(tus)))
         # Do NOT report the fetched-store KEYS as evidence: tool-key strings like
         # "get_service_config:resource_name=x" are not observations, yet ≥3 of
         # them wrongly qualified the branch as "well-evidenced" in calibration.
+        if b.bounded and (b.left(phase) <= 0 or b.should_wrap_up(phase)):
+            return {"conclusion": "stopped at the time budget before concluding",
+                    "confidence": "LOW", "confirmed": False, "phase2_needed": True,
+                    "evidence": [],
+                    "_incomplete": "branch reached its time budget before concluding"}
         return {"conclusion": "hit turn limit without a conclusion", "confidence": "LOW",
                 "confirmed": False, "phase2_needed": True, "evidence": [],
                 "_incomplete": "branch exhausted its turn budget before concluding"}
 
     init_msg = [{"role": "user", "content": [{"text": (
         f"Symptom: {symptom}\n\nInvestigate: {h.reason}\nStart with: {h.focus}"
+        f"{_budget_hint(b, phase)}"
     )}]}]
 
     # Phase 1: config-state check (max 6 turns: up to 3 tool calls + conclude)
@@ -1485,6 +1713,10 @@ def _run_branch(
         _PHASE1_SYSTEM.format(reason=h.reason, service=h.service, focus=h.focus),
         init_msg, max_turns=6,
     )
+    b.note_branch(_branch_key, {"hypothesis": hypothesis, "phase": 1,
+                                "conclusion": p1.get("conclusion", ""),
+                                "evidence": list(p1.get("evidence") or []),
+                                "confirmed": False})
 
     # Only exit early for structural absence AND only if all mandatory tools have
     # been called. If Phase 1 found a structural absence but never called tail_logs
@@ -1525,6 +1757,7 @@ def _run_branch(
             f"Phase 1 found no structural config issue. Now investigate operational "
             f"state to prove or disprove: {h.reason}"
         )
+    p2_kickoff += _budget_hint(b, phase)
     p2 = _loop(
         _PHASE2_SYSTEM.format(
             reason=h.reason, service=h.service,
@@ -1535,11 +1768,21 @@ def _run_branch(
         max_turns=7,
         stop_check=_voi_stop_check,   # Feature 5: VOI early-stop (floor-gated)
     )
+    if b.bounded and p2.get("_incomplete") and p1.get("conclusion"):
+        # Phase 2 ran out of time: keep what Phase 1 established instead of
+        # replacing it with an empty "stopped" note.
+        p2 = {**p2,
+              "conclusion": f"{p1.get('conclusion')} (operational checks not "
+                            f"completed within the time budget)",
+              "evidence": p2.get("evidence") or list(p1.get("evidence") or [])}
 
     # Enforce mandatory tool coverage — if required tools weren't called, force a
-    # short pass before concluding.
+    # short pass before concluding. A budgeted run only does it with time for
+    # at least two more turns; otherwise the gap is recorded, not chased.
     cov = verify_tool_coverage(symptom, set(tools_called))
-    if not cov.satisfied:
+    if not cov.satisfied and b.bounded and not b.room_for(2.0, phase):
+        b.skip(f"coverage pass for {h.service}: no time")
+    elif not cov.satisfied:
         p3 = _loop(
             _PHASE2_SYSTEM.format(
                 reason=h.reason, service=h.service,
@@ -1617,6 +1860,10 @@ def _run_branch(
     if confirmed and (n_confirmed == 0 or n_refuted > 0):
         confirmed = False
 
+    b.note_branch(_branch_key, {"hypothesis": hypothesis, "phase": 2,
+                                "conclusion": p2.get("conclusion", ""),
+                                "evidence": list(p2.get("evidence", []) or p1.get("evidence", [])),
+                                "confirmed": confirmed, "predictions_tested": preds})
     return BranchResult(
         hypothesis=h,
         evidence=p2.get("evidence", []) or p1.get("evidence", []),
@@ -1630,21 +1877,67 @@ def _run_branch(
     )
 
 
+def _unfinished_branch(h, why: str, err: str = "") -> dict:
+    """Marker for a hypothesis that was never fully tested, so synthesis KNOWS
+    it was left uninvestigated — otherwise it silently vanishes and the
+    alternatives_considered step confabulates a ruling-out reason."""
+    hyp = h if isinstance(h, dict) else {"service": str(h), "reason": "", "focus": ""}
+    out = {
+        "hypothesis": hyp,
+        "evidence": [],
+        "conclusion": f"investigation branch did not complete ({why}); "
+                      "this hypothesis was NOT ruled out — it was never fully tested",
+        "confidence": "LOW",
+        "confirmed": False,
+        "tools_called": [],
+        "predictions_tested": [],
+    }
+    if err:
+        out["_branch_error"] = err[:200]
+    return out
+
+
+def _partial_branch(b, h) -> dict:
+    """What an abandoned branch had established so far (its last progress
+    note), never upgraded to confirmed; else the plain unfinished marker."""
+    key = (f"{h.get('service', '')}:{h.get('focus', '')}"[:120]
+           if isinstance(h, dict) else str(h))
+    note = b.branch_progress.get(key)
+    out = _unfinished_branch(h, "time budget")
+    if note and (note.get("evidence") or note.get("conclusion")):
+        out["evidence"] = list(note.get("evidence") or [])
+        out["conclusion"] = (f"{note.get('conclusion', '')} (partial: this branch was "
+                             "stopped at the time budget; not confirmed)")
+        out["_partial"] = True
+    return out
+
+
 def investigate_node(state: GraphState) -> dict:
+    import concurrent.futures as _cf
     all_fetched_merged = dict(state.get("all_fetched") or {})
     branch_results: list[dict] = []
+    b = _budget(state.get("session_id"))
+    _t_phase = time.monotonic()
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futures = {
-            ex.submit(
-                _run_branch,
-                h, state["symptom"], state["profile"],
-                state["region"], state["minutes"], state["session_id"],
-                state.get("failure_map"),
-            ): h
-            for h in state["hypotheses"]
-        }
-        for f in as_completed(futures):
+    # Manually managed executor: a `with` block would JOIN a branch that is
+    # still running past the phase deadline and defeat the time budget.
+    ex = ThreadPoolExecutor(max_workers=3)
+    futures = {
+        ex.submit(
+            _run_branch,
+            h, state["symptom"], state["profile"],
+            state["region"], state["minutes"], state["session_id"],
+            state.get("failure_map"),
+        ): h
+        for h in state["hypotheses"]
+    }
+    # Branches stop themselves at the phase deadline; this outer wait is the
+    # backstop for one stuck inside a call (one extra model call of grace).
+    wait_s = None if not b.bounded else b.left("investigate") + b.est_call_s() + 5.0
+    seen: set = set()
+    try:
+        for f in as_completed(futures, timeout=wait_s):
+            seen.add(f)
             try:
                 result = f.result()
             except Exception as exc:  # noqa: BLE001
@@ -1656,25 +1949,26 @@ def investigate_node(state: GraphState) -> dict:
                 h = futures[f]
                 log.error("investigation branch %r failed, continuing with the "
                           "others: %s", getattr(h, "service", h), exc)
-                # Record a marker branch so synthesis KNOWS this hypothesis was
-                # left uninvestigated — otherwise it silently vanishes and the
-                # alternatives_considered step confabulates a ruling-out reason.
-                hyp = h if isinstance(h, dict) else {"service": str(h), "reason": "", "focus": ""}
-                branch_results.append({
-                    "hypothesis": hyp,
-                    "evidence": [],
-                    "conclusion": f"investigation branch did not complete ({type(exc).__name__}); "
-                                  "this hypothesis was NOT ruled out — it was never fully tested",
-                    "confidence": "LOW",
-                    "confirmed": False,
-                    "tools_called": [],
-                    "predictions_tested": [],
-                    "_branch_error": f"{type(exc).__name__}: {exc}"[:200],
-                })
+                branch_results.append(_unfinished_branch(
+                    h, type(exc).__name__, f"{type(exc).__name__}: {exc}"))
                 continue
             branch_results.append(result.model_dump())
             _merge_fetched(all_fetched_merged, result.all_fetched)
+    except _cf.TimeoutError:
+        for f, h in futures.items():
+            if f in seen:
+                continue
+            if f.done() and f.exception() is None:
+                branch_results.append(f.result().model_dump())
+                _merge_fetched(all_fetched_merged, f.result().all_fetched)
+            else:
+                b.skip(f"branch {h.get('service', '?') if isinstance(h, dict) else h}: "
+                       "abandoned at the investigate deadline")
+                branch_results.append(_partial_branch(b, h))
+    finally:
+        ex.shutdown(wait=not b.bounded, cancel_futures=True)
 
+    b.mark("investigate", time.monotonic() - _t_phase)
     return {"branch_results": branch_results, "all_fetched": all_fetched_merged}
 
 
@@ -1727,76 +2021,101 @@ Return ONLY this JSON (no markdown):
 """
 
 
+def _log_survey(profile: str | None, region: str, minutes: int) -> dict:
+    """Read every recently active log group (see log_intelligence_node). Module
+    level so a budgeted run can start it in the background during observe."""
+    from cloudctl.mcp.tools.debug import _make_session
+    from cloudctl.debug.fetcher import DebugFetcher
+    from cloudctl.mcp.tools.debug import _mine_log_templates
+    per_group: list[list[str]] = []
+    raw_events: list[dict] = []
+    grps: list[str] = []
+    err = ""
+    try:
+        session = _make_session(profile, region)
+        fetcher = DebugFetcher(session)
+        grps = fetcher.recently_active_log_groups(minutes=minutes, limit=8)
+
+        def _read(grp: str) -> list[dict]:
+            evts = fetcher.cloudwatch_logs(log_group=grp, minutes=minutes)
+            return evts or fetcher.tail_log_group(grp, lines=30)
+
+        # The groups are independent: read them concurrently (bounded so the
+        # account's Logs API rate is not swamped), keep the original order.
+        with ThreadPoolExecutor(max_workers=4) as _pool:
+            fetched_groups = list(_pool.map(_read, grps))
+        for grp, events in zip(grps, fetched_groups):
+            short = grp.rsplit("/", 1)[-1]
+            for evt in events:
+                evt["_group"] = short
+            raw_events.extend(events)
+            lines_here: list[str] = []
+            for evt in events[:20]:
+                msg = evt.get("event", "").strip()
+                if msg:
+                    ts = evt.get("time", "")
+                    lines_here.append(f"[{ts}] [{short}] {msg[:300]}")
+            if lines_here:
+                per_group.append(lines_here)
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"[:300]
+    # Round-robin across groups so one noisy group can't starve the 80-line
+    # window that feeds the model — every active service gets represented.
+    events_out = _round_robin_merge(per_group)
+    # Frequency view over everything fetched — the per-group line sample
+    # can miss a flood entirely; template counts cannot.
+    templates = [
+        f"count={t['count']} :: {t['template'][:160]}"
+        for t in _mine_log_templates(raw_events)
+    ]
+    # LOCALIZE pillar: from the SAME fetched events, determine which components
+    # are actually EMITTING failures now (service-agnostic — reports what is
+    # failing, never judges config). This anchors the diagnosis on the emitting
+    # component instead of a quiet one that merely looks unusual.
+    from cloudctl.debug.localize import localize_failures
+    comp_logs: dict = {}
+    for evt in raw_events:
+        g = evt.get("_group", "")
+        m = (evt.get("event", "") or "").strip()
+        if g and m:
+            comp_logs.setdefault(g, []).append(m)
+    failure_map = localize_failures(comp_logs)
+    return {"events": events_out, "groups": grps, "templates": templates,
+            "error": err, "failure_map": failure_map}
+
+
+def _recorded_log_survey(profile: str | None, region: str, minutes: int) -> dict:
+    from cloudctl.mcp.tools.recorder import recorded
+    return recorded("log_survey", {"minutes": minutes},
+                    lambda: _log_survey(profile, region, minutes))
+
+
 def log_intelligence_node(state: GraphState) -> dict:
     """Analyze raw logs with an AI to classify root cause category.
 
     Runs in parallel with investigate_node after triage. Produces cause_category
     signals (uniform vs partial behavior) that constrain the discriminate node.
     """
-    from cloudctl.mcp.tools.debug import _make_session
-    from cloudctl.debug.fetcher import DebugFetcher
-
     # Independent survey: read every log group with recent activity, not just
     # the resources triage hypothesized about. Triage can anchor on
     # infrastructure and never look at the service whose logs hold the real
     # signal — this node exists to catch exactly that, so it must not inherit
     # triage's blind spots. Log groups are the universal substrate: anything
     # that logs, logs here, regardless of what compute runs it.
-    from cloudctl.mcp.tools.recorder import recorded
-
-    def _survey() -> dict:
-        from cloudctl.mcp.tools.debug import _mine_log_templates
-        per_group: list[list[str]] = []
-        raw_events: list[dict] = []
-        grps: list[str] = []
-        err = ""
-        try:
-            session = _make_session(state["profile"], state["region"])
-            fetcher = DebugFetcher(session)
-            grps = fetcher.recently_active_log_groups(minutes=state["minutes"], limit=8)
-            for grp in grps:
-                events = fetcher.cloudwatch_logs(log_group=grp, minutes=state["minutes"])
-                if not events:
-                    events = fetcher.tail_log_group(grp, lines=30)
-                short = grp.rsplit("/", 1)[-1]
-                for evt in events:
-                    evt["_group"] = short
-                raw_events.extend(events)
-                lines_here: list[str] = []
-                for evt in events[:20]:
-                    msg = evt.get("event", "").strip()
-                    if msg:
-                        ts = evt.get("time", "")
-                        lines_here.append(f"[{ts}] [{short}] {msg[:300]}")
-                if lines_here:
-                    per_group.append(lines_here)
-        except Exception as exc:  # noqa: BLE001
-            err = f"{type(exc).__name__}: {exc}"[:300]
-        # Round-robin across groups so one noisy group can't starve the 80-line
-        # window that feeds the model — every active service gets represented.
-        events_out = _round_robin_merge(per_group)
-        # Frequency view over everything fetched — the per-group line sample
-        # can miss a flood entirely; template counts cannot.
-        templates = [
-            f"count={t['count']} :: {t['template'][:160]}"
-            for t in _mine_log_templates(raw_events)
-        ]
-        # LOCALIZE pillar: from the SAME fetched events, determine which components
-        # are actually EMITTING failures now (service-agnostic — reports what is
-        # failing, never judges config). This anchors the diagnosis on the emitting
-        # component instead of a quiet one that merely looks unusual.
-        from cloudctl.debug.localize import localize_failures
-        comp_logs: dict = {}
-        for evt in raw_events:
-            g = evt.get("_group", "")
-            m = (evt.get("event", "") or "").strip()
-            if g and m:
-                comp_logs.setdefault(g, []).append(m)
-        failure_map = localize_failures(comp_logs)
-        return {"events": events_out, "groups": grps, "templates": templates,
-                "error": err, "failure_map": failure_map}
-
-    survey = recorded("log_survey", {"minutes": state["minutes"]}, _survey)
+    b = _budget(state.get("session_id"))
+    _t_phase = time.monotonic()
+    bg = b.background.get(_PREFETCH_SURVEY_KEY)
+    if bg is not None:
+        # Started during observe; wait for it only as long as this phase allows.
+        done, holder = bg
+        if done.wait(timeout=max(0.0, b.left("log_intelligence"))):
+            survey = holder.get("value")
+        else:
+            survey = {"events": [], "groups": [],
+                      "error": "log survey did not finish within the time budget"}
+            b.skip("log survey: did not finish in time")
+    else:
+        survey = _recorded_log_survey(state["profile"], state["region"], state["minutes"])
     if not isinstance(survey, dict):
         survey = {"events": [], "groups": [], "error": "unreplayable survey record"}
     all_events = survey.get("events", [])
@@ -1818,7 +2137,8 @@ def log_intelligence_node(state: GraphState) -> dict:
     bedrock = _make_bedrock(state["profile"], state["region"])
 
     def _converse_logintel():
-        return bedrock.converse(
+        return _budget_mod.converse(
+            b, bedrock, "log_intelligence",
             modelId=_LOG_INTEL_MODEL,
             system=_sys(_LOG_INTEL_SYSTEM),
             messages=[{"role": "user", "content": [{"text": (
@@ -1830,6 +2150,10 @@ def log_intelligence_node(state: GraphState) -> dict:
             inferenceConfig={"maxTokens": 800, "temperature": 0},
         )
 
+    if b.bounded and b.left("log_intelligence") <= 0:
+        b.skip("log intelligence: no time left")
+        return {"log_insights": {"_error": "skipped: time budget used up"},
+                "failure_map": failure_map}
     try:
         try:
             resp = _converse_logintel()
@@ -1851,6 +2175,7 @@ def log_intelligence_node(state: GraphState) -> dict:
     except Exception as exc:
         insights = {"_error": f"{type(exc).__name__}: {exc}"[:300]}
 
+    b.mark("log_intelligence", time.monotonic() - _t_phase)
     return {"log_insights": insights, "failure_map": failure_map}
 
 
@@ -2131,10 +2456,18 @@ def discriminate_node(state: GraphState) -> dict:
     log_summary = json.dumps(log_insights, indent=2) if log_insights else "(no log analysis available)"
 
     bedrock = _make_bedrock(state["profile"], state["region"])
+    b = _budget(state.get("session_id"))
+    _t_phase = time.monotonic()
+    # Synthesis is the step that produces the answer; discrimination only
+    # constrains it. Without time for both, keep the time for synthesis.
+    if b.bounded and not b.room_for(2.5):
+        b.skip("discriminate: kept the time for synthesis")
+        return {"discrimination": {"_error": "skipped: time budget kept for synthesis"}}
 
     try:
         # Sonnet: discriminate needs full reasoning power — wrong category = wrong diagnosis
-        resp = bedrock.converse(
+        resp = _budget_mod.converse(
+            b, bedrock, "verdict",
             modelId=_MODEL,
             system=_sys(_DISCRIMINATE_SYSTEM),
             messages=[{"role": "user", "content": [{"text": (
@@ -2153,6 +2486,7 @@ def discriminate_node(state: GraphState) -> dict:
     except Exception as exc:
         discrimination = {"_error": f"{type(exc).__name__}: {exc}"[:300]}
 
+    b.mark("discriminate", time.monotonic() - _t_phase)
     return {"discrimination": _apply_interaction_guard(discrimination)}
 
 
@@ -2660,8 +2994,78 @@ def _calibrate_confidence(all_branch_results: list[dict],
     return agent_conf, None
 
 
+def _fallback_verdict(branch_results: list[dict], why: str) -> dict:
+    """A verdict assembled in code, with no model call, from what the branches
+    established. Used when the time budget leaves no room for synthesis (or the
+    outer ceiling fires), so a run never ends with no answer.
+
+    Honest by construction: it only reports a cause a branch CONFIRMED (a
+    confirmation that already passed the anti-fabrication check in
+    _run_branch); otherwise it says the cause could not be verified and names
+    the best-evidenced lead as unverified. Confidence is never HIGH."""
+    def _preds(br, verdict):
+        return sum(1 for p in (br.get("predictions_tested") or [])
+                   if isinstance(p, dict) and p.get("verdict") == verdict)
+
+    def _score(br):
+        return (_preds(br, "CONFIRMED"), -_preds(br, "REFUTED"),
+                len(br.get("evidence") or []))
+
+    brs = [br for br in (branch_results or []) if isinstance(br, dict)]
+    confirmed = [br for br in brs if br.get("confirmed")]
+    alternatives = []
+    if confirmed:
+        best = max(confirmed, key=_score)
+        root = best.get("conclusion") or "see evidence"
+        confidence = ("MEDIUM" if _preds(best, "CONFIRMED") and not _preds(best, "REFUTED")
+                      else "LOW")
+        verdict = "BEST_SUPPORTED"
+    else:
+        lead = max(brs, key=_score, default={})
+        lead_txt = (lead.get("conclusion") or "").strip()
+        if lead.get("_incomplete") or not lead.get("evidence"):
+            # A branch that ran out of time has no finding of its own; name
+            # the hypothesis it was checking, never its "stopped at…" note.
+            lead_txt = ((lead.get("hypothesis") or {}).get("reason") or "").strip()
+            if lead_txt:
+                lead_txt += " (its check did not finish)"
+        root = ("Could not verify a root cause within the time budget. "
+                + (f"Best-evidenced lead (NOT verified): {lead_txt}" if lead_txt
+                   else "No branch gathered enough evidence to name a lead."))
+        best = lead
+        confidence = "LOW"
+        verdict = "UNVERIFIED"
+    for br in brs:
+        if br is best:
+            continue
+        alternatives.append({
+            "hypothesis": (br.get("hypothesis") or {}).get("reason")
+                          or (br.get("hypothesis") or {}).get("service", "?"),
+            "reason": (br.get("conclusion") or "not completed")[:300],
+        })
+    return {
+        "root_cause": root,
+        "evidence": list(best.get("evidence") or []),
+        "remediation_steps": [],
+        "severity": "UNKNOWN",
+        "confidence": confidence,
+        "resources_investigated": [
+            (br.get("hypothesis") or {}).get("focus", "") for br in brs
+            if (br.get("hypothesis") or {}).get("focus")
+        ],
+        "alternatives_considered": alternatives,
+        "verdict_status": verdict,
+        "_budget_fallback": why,
+    }
+
+
 def synthesize_node(state: GraphState) -> dict:
     meaningful = [br for br in state["branch_results"] if br.get("evidence")]
+    if not meaningful and _budget(state.get("session_id")).bounded:
+        # Under a time budget, "retry" is not an answer: say what could and
+        # could not be verified instead.
+        return {"final_report": _fallback_verdict(
+            state["branch_results"], "no branch finished with evidence in the time budget")}
     if not meaningful:
         return {"final_report": {
             "root_cause": "Investigation failed: all branches returned empty evidence. "
@@ -2677,12 +3081,34 @@ def synthesize_node(state: GraphState) -> dict:
     all_branch_results = list(state["branch_results"])
     all_fetched_merged = dict(state.get("all_fetched") or {})
     arbitration_note = ""
+    b = _budget(state.get("session_id"))
+    _t_phase = time.monotonic()
+    _prev = state.get("final_report") or {}
+    _have_prev = bool(_prev.get("root_cause")) and not _prev.get("_budget_fallback")
+    if b.bounded and not b.room_for(1.0):
+        # Not even one model call fits. A second pass (after reinvestigation)
+        # keeps the first synthesized verdict; a first pass assembles one from
+        # the branches in code.
+        if _have_prev:
+            b.skip("second synthesis: no time, kept the first verdict")
+            return {"final_report": _prev}
+        b.skip("synthesize: no time for the model call, verdict built from branches")
+        return {"final_report": _fallback_verdict(
+            all_branch_results, "the time budget ran out before synthesis")}
 
     # Feature 4: Branch disagreement escalation
     # If ≥2 branches independently confirmed contradicting root causes, spawn a
     # targeted 4th arbitration branch that re-investigates with all findings in
     # context before the final synthesis.
     has_contradiction, contradicting = _detect_contradiction(state["branch_results"])
+    if has_contradiction and b.bounded:
+        # The arbitration branch is a whole extra investigation. Run it only
+        # with time for several turns AFTER which the verdict calls still fit.
+        granted = b.open_phase("arbitration", seconds=0.25 * (b.total or 0),
+                               reserve_calls=4.0)
+        if granted < 4 * b.est_call_s():
+            b.skip("arbitration branch: no time")
+            has_contradiction = False
     if has_contradiction:
         findings = json.dumps([
             {
@@ -2710,6 +3136,7 @@ def synthesize_node(state: GraphState) -> dict:
                 state["minutes"],
                 state["session_id"],
                 failure_map=state.get("failure_map"),
+                phase="arbitration",
             )
             all_branch_results.append(arb_result.model_dump())
             _merge_fetched(all_fetched_merged, arb_result.all_fetched)
@@ -2839,12 +3266,22 @@ def synthesize_node(state: GraphState) -> dict:
     )
 
     try:
-        resp = bedrock.converse(
+        resp = _budget_mod.converse(
+            b, bedrock, "verdict",
             modelId=_MODEL,
             system=_sys(system),
             messages=[{"role": "user", "content": [{"text": user_content}]}],
             inferenceConfig={"maxTokens": 2500, "temperature": 0},
         )
+    except _budget_mod.BudgetSpent:
+        if _have_prev:
+            b.skip("second synthesis: hit the deadline, kept the first verdict")
+            return {"final_report": _prev, "all_fetched": all_fetched_merged,
+                    "branch_results": all_branch_results}
+        b.skip("synthesize: model call hit the deadline, verdict built from branches")
+        return {"final_report": _fallback_verdict(
+            all_branch_results, "the synthesis call did not finish within the time budget"),
+            "all_fetched": all_fetched_merged, "branch_results": all_branch_results}
     except Exception as exc:  # noqa: BLE001
         # Do NOT crash a fully-completed investigation on a synthesis-call error
         # (exhausted-retry throttle, transient network). Assemble a best-effort
@@ -2883,7 +3320,11 @@ def synthesize_node(state: GraphState) -> dict:
     # without explaining what it ruled out and why.
     from cloudctl.ai.guardrails import verify_alternatives_considered
     alt_check = verify_alternatives_considered(result)
-    if not alt_check.satisfied:
+    if not alt_check.satisfied and b.bounded and not b.room_for(2.5):
+        # The retry only fills alternatives_considered; with critique still to
+        # come, it is the first thing to drop when time is short.
+        b.skip("synthesize: alternatives retry")
+    elif not alt_check.satisfied:
         retry_msg = (
             f"Your response is missing alternatives_considered with at least 2 entries. "
             f"Re-submit the SAME conclusion JSON but ensure 'alternatives_considered' "
@@ -2891,20 +3332,26 @@ def synthesize_node(state: GraphState) -> dict:
             f"primary cause, with a 'hypothesis' string and 'reason' string for each. "
             f"Do not change the root_cause or evidence — only fill in alternatives_considered."
         )
-        resp2 = bedrock.converse(
-            modelId=_MODEL,
-            system=_sys(system),
-            messages=[
-                {"role": "user", "content": [{"text": user_content}]},
-                {"role": "assistant", "content": [{"text": text}]},
-                {"role": "user", "content": [{"text": retry_msg}]},
-            ],
-            inferenceConfig={"maxTokens": 2500, "temperature": 0},
-        )
-        text2 = resp2["output"]["message"]["content"][0]["text"].strip()
-        result2 = _extract_json(text2, "root_cause")
-        if result2 and isinstance(result2, dict):
-            result = result2
+        try:
+            resp2 = _budget_mod.converse(
+                b, bedrock, "verdict",
+                modelId=_MODEL,
+                system=_sys(system),
+                messages=[
+                    {"role": "user", "content": [{"text": user_content}]},
+                    {"role": "assistant", "content": [{"text": text}]},
+                    {"role": "user", "content": [{"text": retry_msg}]},
+                ],
+                inferenceConfig={"maxTokens": 2500, "temperature": 0},
+            )
+        except _budget_mod.BudgetSpent:
+            resp2 = None   # keep the first synthesis; it already has a verdict
+            b.skip("synthesize: alternatives retry hit the deadline")
+        if resp2 is not None:
+            text2 = resp2["output"]["message"]["content"][0]["text"].strip()
+            result2 = _extract_json(text2, "root_cause")
+            if result2 and isinstance(result2, dict):
+                result = result2
 
     # VERDICT confidence calibration — confidence follows prediction outcomes,
     # not branch agreement (see _calibrate_confidence for the policy).
@@ -2925,6 +3372,7 @@ def synthesize_node(state: GraphState) -> dict:
     result["provenance"] = _prov
     result["unsourced_claims"] = _unsourced
 
+    b.mark("synthesize", time.monotonic() - _t_phase)
     # Propagate arbitration fetched data back into state
     if all_fetched_merged != state.get("all_fetched"):
         try:
@@ -3048,6 +3496,12 @@ Respond ONLY with the JSON. No markdown, no extra text.
 def critique_node(state: GraphState) -> dict:
     bedrock = _make_bedrock(state["profile"], state["region"])
     report = state["final_report"]
+    b = _budget(state.get("session_id"))
+    if b.bounded and (report.get("_budget_fallback") or not b.room_for(1.2)):
+        # The critique refines a finished verdict; it never runs instead of one.
+        b.skip("critique: no time")
+        return {"final_report": report, "critique_feedback": ""}
+    _t_phase = time.monotonic()
     branches_summary = json.dumps([
         {
             "hypothesis": br["hypothesis"]["reason"],
@@ -3076,7 +3530,8 @@ def critique_node(state: GraphState) -> dict:
         f"fabricated):\n{inventory_text}"
     )
     try:
-        resp = bedrock.converse(
+        resp = _budget_mod.converse(
+            b, bedrock, "verdict",
             modelId=_CRITIC_MODEL,
             system=_sys(_CRITIQUE_SYSTEM),
             messages=[{"role": "user", "content": [{"text": user_content}]}],
@@ -3086,6 +3541,7 @@ def critique_node(state: GraphState) -> dict:
         # A critique-call failure must not crash a completed run — ship the
         # synthesized report unchanged (critique is a refinement layer).
         return {"final_report": report, "critique_feedback": ""}
+    b.mark("critique", time.monotonic() - _t_phase)
     text = resp["output"]["message"]["content"][0]["text"].strip()
     critique = _extract_json(text, "verdict")
 
@@ -3179,7 +3635,8 @@ def _run_falsification(state: GraphState, report: dict) -> dict:
             f"  evidence: {json.dumps(report.get('evidence', []), default=str)}\n\n"
             f"FETCHED EVIDENCE (the ONLY data you may argue from):\n{corpus}"
         )
-        resp = bedrock.converse(
+        resp = _budget_mod.converse(
+            _budget(state.get("session_id")), bedrock, "verdict",
             modelId=_CRITIC_MODEL,
             system=_sys(_FALSIFICATION_SYSTEM),
             messages=[{"role": "user", "content": [{"text": user_content}]}],
@@ -3332,7 +3789,13 @@ def falsify_node(state: GraphState) -> dict:
     if not (report.get("root_cause") or "").strip() or not report.get("evidence"):
         return {}
 
+    b = _budget(state.get("session_id"))
+    if b.bounded and (report.get("_budget_fallback") or not b.room_for(1.2)):
+        b.skip("falsify: no time")
+        return {}
+    _t_phase = time.monotonic()
     falsification = _run_falsification(state, report)
+    b.mark("falsify", time.monotonic() - _t_phase)
     return _falsification_outcome(
         report, falsification, state.get("critique_round", 0)
     )
@@ -3354,6 +3817,12 @@ def reinvestigate_node(state: GraphState) -> dict:
             "critique_feedback": "",
         }
 
+    b = _budget(state.get("session_id"))
+    if b.bounded:
+        # One more branch, then synthesize + critique + falsify again: grant it
+        # only the time those three calls leave over.
+        b.open_phase("reinvestigate", seconds=b.left("verdict"), reserve_calls=4.0)
+    _t_phase = time.monotonic()
     try:
         result = _run_branch(
             hypothesis={
@@ -3367,6 +3836,7 @@ def reinvestigate_node(state: GraphState) -> dict:
             minutes=state["minutes"],
             session_id=state["session_id"],
             failure_map=state.get("failure_map"),
+            phase="reinvestigate",
         )
         new_branches = list(state["branch_results"]) + [result.model_dump()]
         new_fetched = dict(state.get("all_fetched", {}))
@@ -3374,6 +3844,7 @@ def reinvestigate_node(state: GraphState) -> dict:
     except Exception:
         new_branches = list(state["branch_results"])
         new_fetched = dict(state.get("all_fetched", {}))
+    b.mark("reinvestigate", time.monotonic() - _t_phase)
 
     return {
         "branch_results": new_branches,
@@ -3392,6 +3863,12 @@ def _after_falsify(state: GraphState) -> str:
     if state.get("critique_round", 0) >= 1:
         return END
     if state.get("critique_feedback", ""):
+        b = _budget(state.get("session_id"))
+        # A reinvestigation is a branch (several turns) plus a second
+        # synthesize/critique/falsify; skip it unless all of that fits.
+        if b.bounded and not b.room_for(8.0):
+            b.skip("reinvestigation: no time")
+            return END
         return "reinvestigate"
     return END
 
@@ -3490,6 +3967,30 @@ def _get_graph():
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
+def _ceiling_report(checkpointed: dict, b, why: str) -> dict:
+    """The report when the outer ceiling (or spend cap) stops the graph: the
+    synthesized verdict if one was checkpointed, else a verdict built in code
+    from the finished branches, else from the branches' progress notes — so
+    even a stopped run names its best-supported cause or says it can't verify
+    one, never "no conclusion"."""
+    partial = checkpointed.get("final_report") or {}
+    if partial.get("root_cause"):
+        report = dict(partial)
+        report["confidence"] = "LOW" if report.get("confidence") == "HIGH" else \
+            report.get("confidence", "LOW")
+        report.setdefault("_budget_fallback", f"stopped early ({why}) after synthesis")
+        return report
+    branches = list(checkpointed.get("branch_results") or [])
+    if not branches:
+        branches = [
+            {**{k: v for k, v in note.items() if k != "phase"},
+             "confirmed": False,   # an unfinished branch never counts as confirmed
+             "conclusion": f"{note.get('conclusion', '')} (partial)"}
+            for note in b.branch_progress.values()
+        ]
+    return _fallback_verdict(branches, f"stopped early ({why})")
+
+
 def debug_incident_graph(
     symptom: str,
     profile: str | None,
@@ -3545,7 +4046,12 @@ def debug_incident_graph(
     # per-call boto/Bedrock timeouts this bounds total wall-clock. The ceiling
     # below is the hard backstop that emits a partial report instead of hanging.
     invoke_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
-    _ceiling_s = int(_os.environ.get("CLOUDCTL_INVESTIGATION_CEILING_S", "1200"))
+    # Time budget: every node reads this run's clock (see cloudctl/ai/budget.py)
+    # and the outer ceiling is budget + grace, so a run ends with a verdict in
+    # about CLOUDCTL_TIME_BUDGET_S (default 8 min) and never past the ceiling.
+    run_budget = _budget_mod.RunBudget.from_env()
+    _budget_mod.register(session_id, run_budget)
+    _ceiling_s = _budget_mod.ceiling_s(run_budget)
 
     initial_state = None if resume_thread else {
         "symptom": symptom,
@@ -3594,32 +4100,32 @@ def debug_incident_graph(
         except BudgetExceededError as exc:
             _stop_reason["why"] = str(exc)
             return None
+        except _budget_mod.BudgetSpent as exc:
+            # A node let a time-budget stop escape: same as the ceiling.
+            _stop_reason["why"] = f"time budget: {exc}"
+            return None
         finally:
             _ex.shutdown(wait=False, cancel_futures=True)
 
     final_state = _invoke_bounded(initial_state)
     if final_state is None:
-        # Ceiling or budget breached — assemble whatever the checkpoint holds.
+        # Ceiling or budget breached. Stop the abandoned worker first: every
+        # node checks this flag, so it stops calling the model and AWS instead
+        # of running on in the background (and competing with the next run).
+        run_budget.cancel()
         try:
             snap = graph.get_state(invoke_config)
             checkpointed = dict(snap.values) if snap and snap.values else {}
         except Exception:  # noqa: BLE001
             checkpointed = {}
-        partial = checkpointed.get("final_report") or {}
-        report = {
-            "root_cause": partial.get("root_cause")
-                or (f"Investigation stopped early ({_stop_reason['why']}) before "
-                    "reaching a conclusion. Partial findings below; resume with "
-                    f"CLOUDCTL_RESUME_THREAD={thread_id}."),
-            "evidence": partial.get("evidence", []),
-            "remediation_steps": partial.get("remediation_steps", []),
-            "severity": partial.get("severity", "UNKNOWN"),
-            "confidence": "LOW",
-            "resources_investigated": partial.get("resources_investigated", []),
+        report = _ceiling_report(checkpointed, run_budget, _stop_reason["why"])
+        report.update({
             "_timed_out": True,
             "_thread_id": thread_id,
             "_usage": usage_report(),
-        }
+            "_timing": run_budget.report(),
+        })
+        _budget_mod.unregister(session_id)
         return json.dumps(report), checkpointed.get("all_fetched", {}) or {}
 
     # Human-in-the-loop: clarify_node may interrupt when no hypothesis
@@ -3665,6 +4171,9 @@ def debug_incident_graph(
     parsed["_thread_id"] = thread_id
     # Cost/latency of this investigation (behavior-neutral instrumentation).
     parsed["_usage"] = usage_report()
+    # Where the time went, and what the budget skipped to finish in time.
+    parsed["_timing"] = run_budget.report()
+    _budget_mod.unregister(session_id)
 
     # Resolution plumbing: lift deployment_source/iac_file_hint from any
     # get_deployment_info result gathered during investigation — the

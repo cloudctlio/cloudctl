@@ -1,6 +1,7 @@
 """Debug fetcher — collects raw evidence from cloud data sources."""
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -82,6 +83,25 @@ class DebugFetcher:
 
     def _mark(self, source: str, ok: bool) -> None:
         self._availability[source] = ok
+
+    # LookupEvents is limited to about 2 calls/s per account and region, and
+    # parallel investigation branches each build their own client (botocore's
+    # adaptive limiter is per client), so they throttled each other into long
+    # retry backoffs. One limiter shared by every fetcher in the process.
+    _CT_MIN_INTERVAL = 0.5
+    _ct_lock = threading.Lock()
+    _ct_next = [0.0]
+
+    @classmethod
+    def _ct_pace(cls) -> None:
+        if cls._CT_MIN_INTERVAL <= 0:
+            return
+        with cls._ct_lock:
+            now = time.monotonic()
+            wait = cls._ct_next[0] - now
+            cls._ct_next[0] = max(now, cls._ct_next[0]) + cls._CT_MIN_INTERVAL
+        if wait > 0:
+            time.sleep(wait)
 
     # Pause between CloudTrail pages and the first backoff step (seconds).
     # Tests set these to 0.
@@ -267,6 +287,7 @@ class DebugFetcher:
                 if page:
                     time.sleep(self._CT_PAGE_DELAY)  # stay under ~2 calls/s
                 try:
+                    self._ct_pace()
                     resp = self._call_with_backoff(ct.lookup_events, **kwargs)
                 except Exception as exc:  # noqa: BLE001
                     if not pages:
@@ -4304,6 +4325,7 @@ class DebugFetcher:
                     )
                     if token:
                         kw["NextToken"] = token
+                    self._ct_pace()
                     resp = ct.lookup_events(**kw)
                     out.extend(resp.get("Events", []))
                     token = resp.get("NextToken")
@@ -5013,3 +5035,7 @@ class DebugFetcher:
         return None
 
 
+def ct_pace() -> None:
+    """Wait for the shared CloudTrail LookupEvents slot (about 2 calls/s per
+    process). Call before every lookup_events."""
+    DebugFetcher._ct_pace()

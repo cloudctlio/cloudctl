@@ -27,6 +27,8 @@ Read-only everywhere; any denial/absence degrades to a structured
 """
 from __future__ import annotations
 
+from cloudctl.debug.fetcher import ct_pace as _ct_pace
+
 import json
 import logging
 import re
@@ -282,6 +284,7 @@ def _cloudtrail_reconstruction(session, resource_name: str, minutes: int) -> dic
         )
         if token:
             kw["NextToken"] = token
+        _ct_pace()  # shared CloudTrail rate limit (see fetcher.ct_pace)
         resp = ct.lookup_events(**kw)
         events.extend(resp.get("Events", []))
         token = resp.get("NextToken")

@@ -327,10 +327,22 @@ def _bedrock_client(profile: str | None, region: str):
     from botocore.config import Config as _BotoConfig
     from cloudctl.mcp.tools.debug import _make_session
     session = _make_session(profile, region)
+    # Bounded so one throttled model call cannot eat the investigation's time
+    # budget: 10 adaptive attempts x 120 s read timeout allowed a single call to
+    # wait for many minutes. The run budget also abandons a call at its phase
+    # deadline; these make the underlying socket give up soon after.
+    try:
+        attempts = int(os.environ.get("CLOUDCTL_MODEL_MAX_ATTEMPTS", "") or 4)
+    except ValueError:
+        attempts = 4
+    try:
+        read_s = float(os.environ.get("CLOUDCTL_MODEL_READ_TIMEOUT_S", "") or 90)
+    except ValueError:
+        read_s = 90.0
     return session.client(
         "bedrock-runtime", region_name=region,
-        config=_BotoConfig(retries={"mode": "adaptive", "max_attempts": 10},
-                           connect_timeout=10, read_timeout=120),
+        config=_BotoConfig(retries={"mode": "adaptive", "max_attempts": attempts},
+                           connect_timeout=10, read_timeout=read_s),
     )
 
 

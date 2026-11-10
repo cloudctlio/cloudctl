@@ -13,9 +13,12 @@ All tools create a fresh boto3 Session per call so SSO tokens are always current
 """
 from __future__ import annotations
 
+from cloudctl.debug.fetcher import ct_pace as _ct_pace
+
 import json
 import logging
 import re
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -815,6 +818,37 @@ def _enumerate_resources(session, max_total: int = 500) -> list[dict]:
     return resources
 
 
+_ENUM_CACHE: dict = {}
+_ENUM_LOCK = threading.Lock()
+
+
+def _cached_enumeration(profile: str | None, region: str) -> list[dict]:
+    """Account inventory, enumerated ONCE per (profile, region) per cache TTL.
+
+    list_resources is called with many different service_type filters (observe,
+    triage, every branch's phase 1), and each call used to re-run the whole
+    account enumeration (Resource Explorer up to 10 pages + the Tagging API up
+    to 500 resources) just to filter it differently. The filter is applied to
+    this one shared result instead. The lock makes concurrent first calls from
+    parallel branches share a single enumeration."""
+    import time as _time
+    from cloudctl.mcp.tools.recorder import _CACHE_TTL_SECONDS
+    key = (profile or "", region)
+    with _ENUM_LOCK:
+        hit = _ENUM_CACHE.get(key)
+        if hit and _time.monotonic() - hit[0] < _CACHE_TTL_SECONDS:
+            return hit[1]
+        resources = _enumerate_resources(_make_session(profile, region))
+        if resources:   # never pin an empty (possibly failed) enumeration
+            _ENUM_CACHE[key] = (_time.monotonic(), resources)
+        return resources
+
+
+def reset_enumeration_cache() -> None:
+    with _ENUM_LOCK:
+        _ENUM_CACHE.clear()
+
+
 @recordable("list_resources")
 def list_resources(
     service_type: str = "",
@@ -827,8 +861,7 @@ def list_resources(
     (matched against the resource's service namespace or name) — NOT as a router
     to a per-service lister, so discovery is never bounded by a maintained list.
     """
-    session = _make_session(profile, region)
-    resources = _enumerate_resources(session)
+    resources = _cached_enumeration(profile, region)
 
     filt = (service_type or "").strip().lower()
     if filt:
@@ -944,6 +977,20 @@ def tail_logs(
 
     session = _make_session(profile, region)
     fetcher = DebugFetcher(session)
+    # Soft time cap: each fallback stage below can issue several paged
+    # FilterLogEvents calls per group (on a noisy group, ~5 per group), so the
+    # stages stop starting new groups after this many seconds and return what
+    # they have instead of being cut off at the tool timeout with nothing.
+    import os as _os
+    import time as _time
+    try:
+        _soft = float(_os.environ.get("CLOUDCTL_TAIL_LOGS_SOFT_S", "") or 25)
+    except ValueError:
+        _soft = 25.0
+    _t_end = _time.monotonic() + _soft
+
+    def _out_of_time() -> bool:
+        return _time.monotonic() >= _t_end
 
     # Groups that matched and returned events
     discovered: list[str] = []
@@ -963,6 +1010,8 @@ def tail_logs(
         f"/aws/apigateway/{resource_hint}",
     ]
     for lg in candidates:
+        if _out_of_time():
+            break
         try:
             evts = fetcher.cloudwatch_logs(
                 log_group=lg, minutes=minutes,
@@ -977,11 +1026,13 @@ def tail_logs(
             pass
 
     # Fall back to discover_log_groups
-    if not logs:
+    if not logs and not _out_of_time():
         try:
             groups = fetcher.discover_log_groups(resource_hint)
             existing.extend(groups[:5])
             for grp in groups[:5]:
+                if _out_of_time():
+                    break
                 evts = fetcher.cloudwatch_logs(
                     log_group=grp, minutes=minutes,
                     filter_pattern=filter_pattern, max_events=max_events,
@@ -997,6 +1048,8 @@ def tail_logs(
     # the known groups WITHOUT the filter before concluding the logs are clean.
     if not logs and filter_pattern and existing:
         for grp in list(dict.fromkeys(existing))[:3]:
+            if _out_of_time():
+                break
             try:
                 evts = fetcher.cloudwatch_logs(
                     log_group=grp, minutes=minutes, max_events=max_events,
@@ -1031,6 +1084,8 @@ def tail_logs(
         # a template's count is a fact the line sample can miss.
         "log_templates":    _mine_log_templates(logs),
         "events":           _serialise(logs[:max_events]),
+        **({"partial": f"stopped trying more log groups after {_soft:.0f}s"}
+           if _out_of_time() else {}),
     }, separators=(",", ":"))
 
 
@@ -1343,6 +1398,7 @@ def get_deployment_info(
         ])))
 
         for sv in search_values:
+            _ct_pace()  # shared CloudTrail rate limit (see fetcher.ct_pace)
             resp = ct.lookup_events(
                 LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": sv}],
                 StartTime=start, EndTime=end, MaxResults=20,
