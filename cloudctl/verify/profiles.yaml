@@ -1,0 +1,160 @@
+# Per-model settings for the proposer (and the narrative call). Data, not code:
+# adding a model means adding an entry here, never an if-branch.
+#
+# IMPORTANT: every entry below is UNPINNED. The model ids, context windows and
+# capabilities come from what was known when this file was written, not from a
+# catalog check. Before a study run: confirm each id in the provider's catalog
+# for the region you run in, fill in prices, and set pinned: true. The study
+# loader refuses unpinned profiles (profiles.require_pinned).
+#
+# Fields
+#   provider          bedrock | anthropic | openai | gemini | openai_compatible
+#   model_id          exact id sent to the provider
+#   region            bedrock region (ignored elsewhere)
+#   base_url          openai_compatible only (vLLM, Ollama, ...)
+#   pinned            true once model_id/prices were checked on run day
+#   temperature       number to send, or null to omit (models that reject it)
+#   structured_mode   native_schema | tool_use | json_repair
+#                     native_schema is not valid for bedrock (Converse has no
+#                     response schema); tool_use needs Converse tool support.
+#   reasoning         one fixed level per model: {level: none} or
+#                     {effort: low|medium|high} (openai) or
+#                     {budget_tokens: N} (gemini thinking, anthropic thinking)
+#   max_output_tokens same cap for every model in a study (shared below)
+#   context_window    tokens; the snapshot must fit the smallest one
+#   price_in/out      USD per 1M tokens; null until filled on run day
+#   rate_limit        {max_retries, base_delay_s} throttling backoff
+#   force_tool        tool_use only: send toolChoice to force the submit tool
+#
+# First pass (Nov 10): the mid size of each family, plus small Claude and
+# small Llama.
+
+defaults:
+  max_output_tokens: 2000
+  rate_limit: {max_retries: 6, base_delay_s: 2.0}
+
+profiles:
+  claude-mid:
+    family: anthropic
+    size: mid
+    provider: bedrock
+    model_id: us.anthropic.claude-sonnet-4-6
+    region: us-east-1
+    pinned: false
+    temperature: 0
+    structured_mode: tool_use
+    reasoning: {level: none}
+    context_window: 200000
+    price_in: null
+    price_out: null
+
+  claude-small:
+    family: anthropic
+    size: small
+    provider: bedrock
+    model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    region: us-east-1
+    pinned: false
+    temperature: 0
+    structured_mode: tool_use
+    reasoning: {level: none}
+    context_window: 200000
+    price_in: null
+    price_out: null
+
+  openai-mid:
+    family: openai
+    size: mid
+    provider: openai
+    model_id: gpt-5-mini
+    pinned: false
+    temperature: null          # reasoning models accept only the default
+    structured_mode: native_schema
+    reasoning: {effort: low}
+    context_window: 400000
+    price_in: null
+    price_out: null
+
+  gemini-mid:
+    family: google
+    size: mid
+    provider: gemini
+    model_id: gemini-2.5-flash
+    pinned: false
+    temperature: 0
+    structured_mode: native_schema
+    reasoning: {budget_tokens: 0}
+    context_window: 1000000
+    price_in: null
+    price_out: null
+
+  llama-mid:
+    family: meta
+    size: mid
+    provider: bedrock
+    model_id: us.meta.llama4-maverick-17b-instruct-v1:0
+    region: us-east-1
+    pinned: false
+    temperature: 0
+    structured_mode: tool_use
+    force_tool: false          # check whether Bedrock accepts toolChoice for this model
+    reasoning: {level: none}
+    context_window: 128000     # conservative; check the Bedrock limit on run day
+    price_in: null
+    price_out: null
+
+  llama-small:
+    family: meta
+    size: small
+    provider: bedrock
+    model_id: us.meta.llama3-1-8b-instruct-v1:0
+    region: us-east-1
+    pinned: false
+    temperature: 0
+    structured_mode: json_repair   # small model: don't rely on tool use
+    reasoning: {level: none}
+    context_window: 128000
+    price_in: null
+    price_out: null
+
+  mistral-mid:
+    family: mistral
+    size: mid
+    provider: bedrock
+    model_id: CHECK-CATALOG-mistral-mid   # pick the mid Mistral Bedrock lists on run day
+    region: us-east-1
+    pinned: false
+    temperature: 0
+    structured_mode: json_repair
+    reasoning: {level: none}
+    context_window: 32000
+    price_in: null
+    price_out: null
+
+  qwen-mid:
+    family: qwen
+    size: mid
+    provider: bedrock
+    model_id: qwen.qwen3-32b-v1:0
+    region: us-west-2
+    pinned: false
+    temperature: 0
+    structured_mode: json_repair
+    reasoning: {level: none}
+    context_window: 32000
+    price_in: null
+    price_out: null
+
+  nova-mid:
+    family: amazon
+    size: mid
+    provider: bedrock
+    model_id: us.amazon.nova-lite-v1:0
+    region: us-east-1
+    pinned: false
+    temperature: 0
+    structured_mode: tool_use
+    reasoning: {level: none}
+    context_window: 300000
+    price_in: null
+    price_out: null

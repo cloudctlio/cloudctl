@@ -3799,4 +3799,15 @@ def debug_incident_graph(
         confidence=parsed.get("confidence", ""),
     )
 
+    # Propose-then-verify in SHADOW mode (off unless CLOUDCTL_VERIFY_SHADOW=1):
+    # logs what the verifier would have verified, on a copy of the report.
+    # It never changes this function's output.
+    if _os.environ.get("CLOUDCTL_VERIFY_SHADOW") == "1":
+        try:
+            from cloudctl.verify.shadow import run_shadow
+            run_shadow(symptom=symptom, report=parsed, final_state=dict(final_state),
+                       all_fetched=all_fetched, aws_profile=profile)
+        except Exception:  # noqa: BLE001
+            log.debug("verify shadow failed to start", exc_info=True)
+
     return json.dumps(parsed, indent=2), all_fetched
