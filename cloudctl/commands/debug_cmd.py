@@ -323,6 +323,56 @@ def _render_agent_result(d: dict, account: Optional[str]) -> None:
     console.print()
 
 
+def _render_iac_fix(fix: dict) -> None:
+    """Show the read-only IaC fix suggestion, apart from the diagnosis. It
+    never changes the diagnosis or its confidence."""
+    from rich.panel import Panel  # noqa: PLC0415
+    from rich.syntax import Syntax  # noqa: PLC0415
+    from rich.console import Group  # noqa: PLC0415
+
+    status = fix.get("status")
+    where = ""
+    if fix.get("resource"):
+        where = f"{fix['resource']}  ({fix.get('file')}:{fix.get('lines')}), matched because {fix.get('how')}"
+    if status == "suggested":
+        check = fix.get("check") or {}
+        if fix.get("verified"):
+            label, style = "CHECKED: " + check.get("detail", ""), "green"
+            note = "Well-formed, but not proven to fix the incident. Nothing was applied."
+        elif check.get("status") == "failed":
+            label, style = "CHECK FAILED", "red"
+            note = check.get("detail", "")
+        else:
+            label, style = "UNVERIFIED", "yellow"
+            note = f"Not checked ({check.get('detail', 'no check ran')}). Nothing was applied."
+        body = [Text(where, style="dim")]
+        if fix.get("summary"):
+            body.append(Text(fix["summary"]))
+        body.append(Syntax(fix.get("diff", ""), "diff", theme="ansi_dark", word_wrap=True))
+        body.append(Text(note, style="dim"))
+        for p in fix.get("rejected_edits") or []:
+            body.append(Text(f"Ignored: {p}", style="dim yellow"))
+        console.print(Panel(Group(*body), title=f"[bold]IaC FIX SUGGESTION — {label}[/bold]",
+                            border_style=style, expand=True))
+    else:
+        msg = fix.get("detail", "")
+        if status == "ambiguous":
+            msg += "\n" + "\n".join(f"  - {c}" for c in fix.get("candidates") or [])
+        elif status in ("not_found", "no_iac") and fix.get("searched_for"):
+            msg += f"\nLooked for: {', '.join(fix['searched_for'])} under {fix.get('iac_root')}"
+        if where:
+            msg = where + "\n" + msg
+        console.print(Panel(Text(msg), title="[bold]IaC FIX SUGGESTION — none[/bold]",
+                            border_style="dim", expand=True))
+    console.print()
+
+
+def _iac_fix(diagnosis: dict, iac_dir: str, account: Optional[str], region: Optional[str]) -> dict:
+    from cloudctl.debug.iac_fix import suggest_fix  # noqa: PLC0415
+    with console.status("[dim]Looking up the blamed resource in your IaC...[/dim]"):
+        return suggest_fix(diagnosis, iac_dir, profile=account, region=region or "us-east-1")
+
+
 @app.command()
 def debug_issue(
     issue:    str           = typer.Argument(..., metavar="TEXT", help="Describe what's wrong, e.g. 'payments returning 502s'"),
@@ -359,7 +409,9 @@ def debug_issue(
     ),
     iac_root: Optional[str] = typer.Option(
         None, "--iac-root",
-        help="Local path to IaC root directory (Terraform / CDK). Required when --resolve is set.",
+        help="Local path to your IaC root (Terraform / CDK Python). With it, debug finds the "
+             "blamed resource there and shows a read-only diff that would fix it (nothing is "
+             "applied). Also read from CLOUDCTL_IAC_ROOT. Required when --resolve is set.",
     ),
     resolve_yes: bool = typer.Option(
         False, "--yes",
@@ -449,6 +501,22 @@ def debug_issue(
                     )
 
         _render_agent_result(d, account)
+
+        import os as _os_iac  # noqa: PLC0415
+        iac_root = iac_root or _os_iac.environ.get("CLOUDCTL_IAC_ROOT") or None
+        if iac_root and d.get("root_cause"):
+            fix = _iac_fix(d, iac_root, account, region)
+            d["iac_fix"] = fix
+            _render_iac_fix(fix)
+            # The located resource is better evidence of how it is deployed
+            # than CloudTrail (which lags and only covers 24 h): let --resolve
+            # use it instead of refusing on an unknown deployment source.
+            if fix.get("resource") and d.get("deployment_source") in (None, "", "unknown", "manual"):
+                d["deployment_source"] = fix.get("kind")
+                d["iac_file_hint"] = f"{fix.get('file')}:{fix.get('lines')} ({fix.get('resource')})"
+        elif not iac_root and d.get("root_cause"):
+            console.print("[dim]Tip: add --iac-root <dir> to get a diff against your own "
+                          "Terraform/CDK for this root cause.[/dim]\n")
 
         if json_out:
             from pathlib import Path as _Path  # noqa: PLC0415
@@ -626,6 +694,15 @@ def debug_issue(
         )
 
     _render_incident(finding, account)
+
+    import os as _os_iac  # noqa: PLC0415
+    iac_dir = iac_root or _os_iac.environ.get("CLOUDCTL_IAC_ROOT")
+    if iac_dir and finding.root_cause:
+        _render_iac_fix(_iac_fix({
+            "root_cause": finding.root_cause,
+            "affected_resources": finding.affected_resources,
+            "remediation_steps": finding.remediation_steps,
+        }, iac_dir, account, region))
 
     if explain:
         _render_explain(finding)
