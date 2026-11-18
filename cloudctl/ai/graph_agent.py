@@ -1022,6 +1022,9 @@ Phase 2 rules — operational investigation:
   path, and downstream services — to find what is failing at runtime.
   For permission predictions, probe_permission tests an action deterministically
   via the policy simulator — a REFUTED/CONFIRMED permission needs no log evidence.
+  Give it the exact resource ARN. An implicitDeny it marks conclusive=false is a
+  flaw in the probe (wrong or missing ARN, missing context), never proof that a
+  permission is missing; a permission that logs show succeeding is not missing.
   When the dedicated tools don't go deep enough for the service under
   investigation, use aws_read to call the service's own read-only APIs directly —
   you know which operations reveal its configuration, status, limits, and
