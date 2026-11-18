@@ -1,0 +1,30 @@
+{
+ "root_cause": "The api Lambda cctl-complexapp-api QUEUE_URL points at orders-v2, a queue that does not exist. The api also cannot reach its redis cache at 127.0.0.1:6379, which causes the 500s.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Update the Terraform and run terraform apply."
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "suggested",
+  "resource": "aws_lambda_function.api",
+  "kind": "terraform",
+  "file": "x.tf",
+  "lines": "1-9",
+  "diff": "--- a/lambda.tf\n+++ b/lambda.tf\n-      CACHE_ENDPOINT = \"redis://127.0.0.1:6379\"\n",
+  "check": {
+   "status": "passed"
+  },
+  "verified": true
+ }
+}
