@@ -636,8 +636,15 @@ _FAILURE_SIGNAL_PATTERNS = (
     ("http_error_status",     re.compile(r'"?status(?:_?code)?"?\s*[:=]\s*"?[45]\d\d\b', re.I)),
     ("nonzero_error_metric",  re.compile(r'"(errors?|faults?|throttl\w*|[45]xxerror\w*)"\s*:\s*[1-9]', re.I)),
     ("failed_state",          re.compile(r'"?(status|state|health\w*)"?\s*[:=]\s*"?(failed|failing|unhealthy|impaired|critical|timed[_ ]?out|timeout)\b', re.I)),
-    ("aws_error_code",        re.compile(r'\b(accessdenied\w*|throttlingexception|serviceunavailable|provisionedthroughputexceeded|resourcenotfound\w*exception|timeout\w*exception)\b', re.I)),
-    ("error_log_event",       re.compile(r'\b(traceback|exception:|\bfatal\b|panic:|segfault|oomkill\w*)\b', re.I)),
+    # ProvisionedThroughputExceeded and ServiceUnavailable take \w* because AWS
+    # reports them with an "Exception" suffix (DynamoDB's throttle error is
+    # ProvisionedThroughputExceededException); a closing \b right after the
+    # stem never matched that form.
+    ("aws_error_code",        re.compile(r'\b(accessdenied\w*|throttlingexception|serviceunavailable\w*|provisionedthroughputexceeded\w*|resourcenotfound\w*exception|timeout\w*exception)\b', re.I)),
+    # "exception:" and "panic:" end in ':', so a closing \b after them only matched
+    # when a word character followed the colon directly; "Exception: boom" never
+    # matched. They are anchored on their own instead.
+    ("error_log_event",       re.compile(r'\b(?:traceback|fatal|segfault|oomkill\w*)\b|exception:|\bpanic:', re.I)),
 )
 
 
