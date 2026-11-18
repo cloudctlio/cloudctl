@@ -479,6 +479,7 @@ def debug_issue(
             # ── Resolution agent ───────────────────────────────────────────
             if resolve:
                 import os as _os  # noqa: PLC0415
+                import sys as _sys  # noqa: PLC0415
                 from cloudctl.ai.resolution_agent import run as _resolve_run  # noqa: PLC0415
 
                 root = iac_root
@@ -503,8 +504,6 @@ def debug_issue(
                                 ).strip() or "develop"
                             except (EOFError, KeyboardInterrupt):
                                 pass
-
-                    import sys as _sys  # noqa: PLC0415
 
                     def _approve(stage: str, detail: str) -> bool:
                         """Two-gate operator approval: 'plan' before any file
