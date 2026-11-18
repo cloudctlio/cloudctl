@@ -308,10 +308,32 @@ def _render_agent_result(d: dict, account: Optional[str]) -> None:
         )
 
     fix_steps = d.get("remediation_steps") or []
-    if fix_steps:
+    rc = d.get("remediation_check") or {}
+    if rc and not d.get("remediation_confirmed", True):
+        # Fail closed: the cause stands, the fix is not presented as the fix.
+        lines = [f"Found the cause but couldn't confirm the fix: {rc.get('reason', 'unchecked')}."]
+        if rc.get("candidates"):
+            lines.append("Resources it could be:")
+            lines += [f"  - {c}" for c in rc["candidates"]]
+        unv = {u["step"]: u["reason"] for u in rc.get("unverified") or []}
+        if fix_steps:
+            lines.append("Unverified steps, check each before running:")
+            for st in fix_steps:
+                lines.append(f"  [unverified] {st}" + (f"  ({unv[st]})" if st in unv else ""))
+        for f in rc.get("flagged") or []:
+            lines.append(f"  [held back] {f['step']}  ({f['reason']})")
+        t.add_row(
+            Text("FIX NOT\nCONFIRMED", style="bold yellow"),
+            Text("\n".join(lines), style="yellow"),
+            end_section=True,
+        )
+    elif fix_steps:
+        lines = list(fix_steps)
+        for f in rc.get("flagged") or []:
+            lines.append(f"[held back] {f['step']}  ({f['reason']})")
         t.add_row(
             Text("FIX NOW", style="bold cyan"),
-            Text("\n".join(fix_steps)),
+            Text("\n".join(lines)),
             end_section=True,
         )
 
@@ -365,6 +387,32 @@ def _render_iac_fix(fix: dict) -> None:
         console.print(Panel(Text(msg), title="[bold]IaC FIX SUGGESTION — none[/bold]",
                             border_style="dim", expand=True))
     console.print()
+
+
+def _ground_remediation(d: dict, fix: Optional[dict], iac_root: Optional[str], all_fetched) -> None:
+    """Check the fix steps against the resolved resource before they are
+    shown (see cloudctl.debug.remediation_check). Steps the IaC lookup wrote
+    for the resolved resource replace the agent's own; the originals are kept
+    in remediation_steps_original. Never touches root cause or confidence."""
+    import json as _json  # noqa: PLC0415
+    from cloudctl.debug.remediation_check import (  # noqa: PLC0415
+        check_remediation, iac_text_for, resolve_target,
+    )
+    original = list(d.get("remediation_steps") or [])
+    steps = original
+    if fix and fix.get("remediation_steps"):
+        steps = list(fix["remediation_steps"])
+        d["remediation_steps_original"] = original
+    target = resolve_target(d, fix)
+    try:
+        fetched_text = _json.dumps(all_fetched or {}, default=str)[:3_000_000]
+    except (TypeError, ValueError):
+        fetched_text = ""
+    rc = check_remediation(steps, d, target, iac_text_for(iac_root), fix, fetched_text)
+    d["remediation_steps"] = rc["steps"]
+    d["remediation_confirmed"] = rc["confirmed"]
+    d["remediation_check"] = {k: rc[k] for k in ("reason", "flagged", "unverified", "candidates",
+                                                  "replaced_with_iac_step", "target")}
 
 
 def _iac_fix(diagnosis: dict, iac_dir: str, account: Optional[str], region: Optional[str]) -> dict:
@@ -488,7 +536,10 @@ def debug_issue(
         # times before with the agent's chosen evidence sources, promote
         # MEDIUM -> HIGH. Stops the agent self-rating MEDIUM on incidents we've
         # already validated repeatedly.
-        match = best_pattern_match(issue)
+        # Scoped to this account and region: a pattern learned elsewhere must
+        # never change this run's confidence.
+        match = best_pattern_match(issue, account_id=(d.get("_guardrails") or {}).get("account_id"),
+                                   region=region or "us-east-1")
         if match and match.get("confirmed_count", 0) >= 3:
             agent_sources = {k.split(":", 1)[0] for k in (all_fetched or {})}
             pattern_sources = set(match.get("data_sources") or [])
@@ -500,21 +551,25 @@ def debug_issue(
                         f"{match['confirmed_count']}x previously; confidence promoted."
                     )
 
-        _render_agent_result(d, account)
-
         import os as _os_iac  # noqa: PLC0415
         iac_root = iac_root or _os_iac.environ.get("CLOUDCTL_IAC_ROOT") or None
+        fix = None
         if iac_root and d.get("root_cause"):
             fix = _iac_fix(d, iac_root, account, region)
             d["iac_fix"] = fix
-            _render_iac_fix(fix)
             # The located resource is better evidence of how it is deployed
             # than CloudTrail (which lags and only covers 24 h): let --resolve
             # use it instead of refusing on an unknown deployment source.
             if fix.get("resource") and d.get("deployment_source") in (None, "", "unknown", "manual"):
                 d["deployment_source"] = fix.get("kind")
                 d["iac_file_hint"] = f"{fix.get('file')}:{fix.get('lines')} ({fix.get('resource')})"
-        elif not iac_root and d.get("root_cause"):
+        if d.get("root_cause"):
+            _ground_remediation(d, fix, iac_root, all_fetched)
+
+        _render_agent_result(d, account)
+        if fix is not None:
+            _render_iac_fix(fix)
+        elif d.get("root_cause"):
             console.print("[dim]Tip: add --iac-root <dir> to get a diff against your own "
                           "Terraform/CDK for this root cause.[/dim]\n")
 
@@ -645,6 +700,7 @@ def debug_issue(
                 agent_output=d,
                 user_correction=correction_value,
                 account_id=meta.get("account_id") or account or "",
+                region=region or "us-east-1",
             )
 
         return

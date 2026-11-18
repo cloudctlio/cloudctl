@@ -57,6 +57,7 @@ class IncidentPattern:
     confirmed_count: int
     last_seen:       str
     account_ids:     list[str]
+    regions:         list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -125,6 +126,7 @@ def on_confirmed_wrong(
     agent_output:    dict,
     user_correction: str,
     account_id:      str,
+    region:          str = "",
 ) -> None:
     """Called when user says 'n' or 'partial'. Silent — no output to user."""
     from cloudctl.ai.guardrails import detect_hallucinations
@@ -175,7 +177,10 @@ def on_confirmed_wrong(
                 time.sleep(0.05)
         try:
             with open(corrections_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"lessons": rules}) + "\n")
+                # Scope tags: a lesson is only ever loaded back for the same
+                # account and region (see in_scope / harness.build_system_prompt).
+                f.write(json.dumps({"lessons": rules, "account": _anonymise_account(account_id or ""),
+                                    "region": region}) + "\n")
         finally:
             if _acquired:
                 try:
@@ -184,13 +189,48 @@ def on_confirmed_wrong(
                     pass
 
 
-def get_investigation_hints(query: str) -> list[str]:
+def in_scope(entry: dict, account_id: str | None, region: str | None) -> bool:
+    """True only when a stored entry was learned in this account AND region.
+    Entries without scope tags (written before tagging) are out of scope:
+    learned state must never carry one environment's resources into another."""
+    if not account_id or not region:
+        return False
+    acct = _anonymise_account(account_id)
+    accts = entry.get("account_ids") or ([entry["account"]] if entry.get("account") else [])
+    regions = entry.get("regions") or ([entry["region"]] if entry.get("region") else [])
+    return acct in accts and region in regions
+
+
+_IDENT_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[-:/][A-Za-z0-9*]+){1,}\b")
+
+
+def named_identifiers(text: str) -> list[str]:
+    """Resource-like names in learned text (platform-orders, platform-orders:145,
+    cctl-app-api). Deliberately broad: a learned line is dropped when in doubt.
+    IAM actions (s3:PutObject) are not names."""
+    out = []
+    for t in _IDENT_RE.findall(text or ""):
+        if re.fullmatch(r"[a-z0-9]+:[A-Z][A-Za-z]+", t) or len(t) < 5:
+            continue
+        out.append(t)
+    return out
+
+
+def drop_unknown_names(lines: list[str], known_names: set[str] | None) -> list[str]:
+    """Drop any learned line that names a resource not discovered in this run
+    (known_names). With no known_names, drop every line that names one."""
+    known = {n.lower() for n in (known_names or set())}
+    return [ln for ln in lines if all(n.lower() in known for n in named_identifiers(ln))]
+
+
+def get_investigation_hints(query: str, account_id: str | None = None,
+                            region: str | None = None) -> list[str]:
     """
     Return investigation hints from confirmed past patterns.
-    Only patterns confirmed >= 2 times are used.
+    Only patterns confirmed >= 2 times in this account and region are used.
     Injected into the first user message to the agent.
     """
-    patterns     = _load_patterns()
+    patterns     = [p for p in _load_patterns() if in_scope(p, account_id, region)]
     query_tokens = set(_tokenise(query))
     hints        = []
 
@@ -209,7 +249,8 @@ def get_investigation_hints(query: str) -> list[str]:
     return hints[:3]
 
 
-def best_pattern_match(query: str) -> dict | None:
+def best_pattern_match(query: str, account_id: str | None = None,
+                       region: str | None = None) -> dict | None:
     """
     Return the most-confirmed pattern whose symptom tokens overlap the query, or None.
 
@@ -217,7 +258,7 @@ def best_pattern_match(query: str) -> dict | None:
     if a pattern has been confirmed N times and matches the current symptom, the
     model's self-rated confidence can be promoted (MEDIUM -> HIGH at N >= 3).
     """
-    patterns     = _load_patterns()
+    patterns     = [p for p in _load_patterns() if in_scope(p, account_id, region)]
     query_tokens = set(_tokenise(query))
     best         = None
     best_score   = 0
@@ -254,6 +295,7 @@ def _extract_pattern(fixture: IncidentFixture) -> IncidentPattern | None:
         confirmed_count=1,
         last_seen=fixture.ts,
         account_ids=[fixture.account_id],
+        regions=[fixture.region] if fixture.region else [],
     )
 
 
@@ -265,6 +307,9 @@ def _upsert_pattern(new: IncidentPattern) -> None:
         existing["last_seen"] = new.last_seen
         if new.account_ids[0] not in existing.get("account_ids", []):
             existing.setdefault("account_ids", []).append(new.account_ids[0])
+        for r in new.regions:
+            if r not in existing.get("regions", []):
+                existing.setdefault("regions", []).append(r)
     else:
         patterns.append({
             "pattern_id":      new.pattern_id,
@@ -275,6 +320,7 @@ def _upsert_pattern(new: IncidentPattern) -> None:
             "confirmed_count": new.confirmed_count,
             "last_seen":       new.last_seen,
             "account_ids":     new.account_ids,
+            "regions":         new.regions,
         })
     _save_patterns(patterns)
 
