@@ -402,7 +402,7 @@ def debug_issue(
         import json as _json  # noqa: PLC0415
         from cloudctl.ai.graph_agent import debug_incident_graph  # noqa: PLC0415
         from cloudctl.ai.live_learner  import (  # noqa: PLC0415
-            on_confirmed_correct, on_confirmed_wrong, best_pattern_match,
+            on_confirmed_correct, on_confirmed_wrong,
         )
 
         console.print(f"\n[bold]Agent investigating:[/bold] {issue}")
@@ -432,21 +432,9 @@ def debug_issue(
             warn(d["error"])
             raise typer.Exit(1)
 
-        # Fixture-match boost: when this symptom has been confirmed correct N>=3
-        # times before with the agent's chosen evidence sources, promote
-        # MEDIUM -> HIGH. Stops the agent self-rating MEDIUM on incidents we've
-        # already validated repeatedly.
-        match = best_pattern_match(issue)
-        if match and match.get("confirmed_count", 0) >= 3:
-            agent_sources = {k.split(":", 1)[0] for k in (all_fetched or {})}
-            pattern_sources = set(match.get("data_sources") or [])
-            if pattern_sources and pattern_sources.issubset(agent_sources):
-                if d.get("confidence") == "MEDIUM":
-                    d["confidence"] = "HIGH"
-                    d.setdefault("evidence", []).append(
-                        f"Pattern '{match['pattern_id']}' confirmed correct "
-                        f"{match['confirmed_count']}x previously; confidence promoted."
-                    )
+        # Confidence is the verdict pipeline's alone. Past y/n answers matched
+        # on question keywords must not raise it: that added no evidence and
+        # put a non-evidence line into the evidence list.
 
         _render_agent_result(d, account)
 
