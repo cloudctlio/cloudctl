@@ -300,9 +300,12 @@ def _render_agent_result(d: dict, account: Optional[str]) -> None:
     # specifics that traced to no fetched source) get their own row.
     uns_extra = [u for u in unsourced
                  if u not in {str(e).strip() for e in evidence}]
+    for u in d.get("unverified_claims") or []:
+        if isinstance(u, str) and u.strip() and u.strip() not in uns_extra:
+            uns_extra.append(u.strip())
     if uns_extra:
         t.add_row(
-            Text("UNSOURCED", style="bold yellow"),
+            Text("UNVERIFIED", style="bold yellow"),
             Text("\n".join(f"- {u[:120]}" for u in uns_extra), style="yellow"),
             end_section=True,
         )
