@@ -325,35 +325,59 @@ def _dispatch(tool_name: str, args: dict) -> str:
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
+def _run_tool(name: str, arguments: dict | None) -> str:
+    """Dispatch one tool call; never leak exception text (it can carry ARNs,
+    account IDs or credentials)."""
+    try:
+        return _dispatch(name, arguments or {})
+    except Exception as e:  # noqa: BLE001
+        log.error("Tool %s failed: %s", name, type(e).__name__)
+        return json.dumps({"error": "Tool execution failed"})
+
+
+def build_server():
+    """Build the MCP server for whichever mcp SDK is installed.
+
+    mcp 1.x registers handlers with decorators (server.list_tools()); mcp 2.x
+    removed those and takes on_list_tools / on_call_tool callbacks in the
+    constructor. Same tools and dispatch either way."""
+    from mcp.server import Server  # noqa: PLC0415
+    from mcp import types  # noqa: PLC0415
+
+    def _tools() -> list:
+        return [types.Tool(name=t["name"], description=t["description"],
+                           inputSchema=t["inputSchema"]) for t in _TOOLS]
+
+    if hasattr(Server, "list_tools"):            # mcp 1.x
+        server = Server("cloudctl")
+
+        @server.list_tools()
+        async def list_tools() -> list:
+            return _tools()
+
+        @server.call_tool()
+        async def call_tool(name: str, arguments: dict) -> list:
+            return [types.TextContent(type="text", text=_run_tool(name, arguments))]
+
+        return server
+
+    async def on_list_tools(ctx, params):           # mcp 2.x
+        return types.ListToolsResult(tools=_tools())
+
+    async def on_call_tool(ctx, params):
+        text = _run_tool(params.name, params.arguments)
+        is_error = text.startswith('{"error"')
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)],
+                                    isError=is_error)
+
+    return Server("cloudctl", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+
+
 async def main() -> None:
     """Run the cloudctl MCP server over stdio."""
-    from mcp.server import Server  # noqa: PLC0415
     from mcp.server.stdio import stdio_server  # noqa: PLC0415
-    from mcp.types import Tool, TextContent  # noqa: PLC0415
 
-    server = Server("cloudctl")
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name=t["name"],
-                description=t["description"],
-                inputSchema=t["inputSchema"],
-            )
-            for t in _TOOLS
-        ]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        try:
-            result = _dispatch(name, arguments or {})
-        except Exception as e:
-            # Log type only — exception messages can contain ARNs, account IDs, credentials
-            log.error("Tool %s failed: %s", name, type(e).__name__)
-            result = json.dumps({"error": "Tool execution failed"})
-        return [TextContent(type="text", text=result)]
-
+    server = build_server()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

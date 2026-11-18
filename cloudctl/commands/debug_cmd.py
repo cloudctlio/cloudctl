@@ -552,6 +552,13 @@ def debug_issue(
                             console.print(f"  - {step}")
                     else:
                         warn(f"Resolution failed: {result.get('detail', 'unknown error')}")
+                        if result.get("branch"):
+                            console.print(f"  Branch (local): {result['branch']}")
+                        if result.get("files_changed"):
+                            console.print("  Edited but not pushed: "
+                                          + ", ".join(result["files_changed"]))
+                    for w in result.get("warnings") or []:
+                        warn(w)
 
         elif verdict_value in ("n", "no", "partial"):
             if correction is not None:

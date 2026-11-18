@@ -334,6 +334,15 @@ def _bedrock_client(profile: str | None, region: str):
     )
 
 
+DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6"
+
+
+def default_model() -> str:
+    """The model id every cloudctl agent should use: CLOUDCTL_MODEL, else the
+    Bedrock Sonnet default. One place, so no agent hardcodes its own model."""
+    return os.environ.get("CLOUDCTL_MODEL", "").strip() or DEFAULT_MODEL
+
+
 def make_model_client(profile: str | None, region: str):
     """Return a client exposing converse(**kwargs) in the Converse shape, chosen
     by CLOUDCTL_MODEL_PROVIDER (default 'bedrock')."""
