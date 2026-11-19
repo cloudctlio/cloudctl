@@ -1,0 +1,30 @@
+{
+ "root_cause": "The worker Lambda cctl-complexapp-worker has reserved concurrency 1, so the SQS event source is throttled; the backlog grows and throttled messages exhaust maxReceiveCount and go to the DLQ.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Update the Terraform and run terraform apply."
+ ],
+ "severity": "HIGH",
+ "confidence": "MEDIUM",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "suggested",
+  "resource": "aws_lambda_function.worker",
+  "kind": "terraform",
+  "file": "x.tf",
+  "lines": "1-9",
+  "diff": "--- a/variables.tf\n+++ b/variables.tf\n-  default     = 1\n+  default     = -1\n",
+  "check": {
+   "status": "passed"
+  },
+  "verified": true
+ }
+}

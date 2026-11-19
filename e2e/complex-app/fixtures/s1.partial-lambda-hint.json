@@ -1,0 +1,30 @@
+{
+ "root_cause": "The worker role policy denies s3:PutObject on the receipts/ prefix (it allows invoices/*), so receipt orders fail with AccessDenied.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Update the Terraform and run terraform apply."
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "suggested",
+  "resource": "aws_lambda_function.worker",
+  "kind": "terraform",
+  "file": "x.tf",
+  "lines": "1-9",
+  "diff": "--- a/lambda.tf\n+++ b/lambda.tf\n-      RECEIPT_BUCKET = aws_s3_bucket.receipts.id\n+      RECEIPT_BUCKET = \"x\"\n",
+  "check": {
+   "status": "passed"
+  },
+  "verified": true
+ }
+}

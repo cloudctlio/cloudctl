@@ -1,0 +1,30 @@
+{
+ "root_cause": "POST /orders fails because the api Lambda cctl-complexapp-api has QUEUE_URL set to cctl-complexapp-orders-v2, which does not exist, so SendMessage fails. The cache warmup errors on 127.0.0.1:6379 are non-fatal noise.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Update the Terraform and run terraform apply."
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "suggested",
+  "resource": "aws_lambda_function.api",
+  "kind": "terraform",
+  "file": "x.tf",
+  "lines": "1-9",
+  "diff": "--- a/lambda.tf\n+++ b/lambda.tf\n-      QUEUE_URL      = \"https://sqs.${var.region}.amazonaws.com/${data.aws_caller_identity.current.account_id}/${var.prefix}-orders-v2\"\n+      QUEUE_URL      = aws_sqs_queue.orders.url\n",
+  "check": {
+   "status": "passed"
+  },
+  "verified": true
+ }
+}

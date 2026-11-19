@@ -1,0 +1,22 @@
+{
+ "root_cause": "The worker's SQS event source mapping is disabled, so messages are not consumed.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "aws lambda update-event-source-mapping --uuid X --enabled"
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "no_edit",
+  "resource": "aws_lambda_event_source_mapping.worker"
+ }
+}

@@ -1,0 +1,30 @@
+{
+ "root_cause": "The worker Lambda cctl-complexapp-worker is limited to a reserved concurrency of 1 and is being throttled.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Run aws lambda delete-function-concurrency --function-name cctl-complexapp-worker"
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "suggested",
+  "resource": "aws_lambda_function.worker",
+  "kind": "terraform",
+  "file": "x.tf",
+  "lines": "1-9",
+  "diff": "--- a/variables.tf\n+++ b/variables.tf\n-  default     = 1\n+  default     = -1\n",
+  "check": {
+   "status": "passed"
+  },
+  "verified": true
+ }
+}

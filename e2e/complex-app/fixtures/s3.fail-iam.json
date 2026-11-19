@@ -1,0 +1,30 @@
+{
+ "root_cause": "The api role is missing permissions; grant it access.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Update the Terraform and run terraform apply."
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "suggested",
+  "resource": "aws_iam_role_policy.api",
+  "kind": "terraform",
+  "file": "x.tf",
+  "lines": "1-9",
+  "diff": "--- a/iam.tf\n+++ b/iam.tf\n-        Action   = [\"sqs:SendMessage\"]\n+        Action   = [\"sqs:*\"]\n",
+  "check": {
+   "status": "passed"
+  },
+  "verified": true
+ }
+}

@@ -1,0 +1,18 @@
+{
+ "root_cause": "DynamoDB throttling on cctl-complexapp-orders slows the worker.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Update the Terraform and run terraform apply."
+ ],
+ "severity": "HIGH",
+ "confidence": "LOW",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ }
+}
