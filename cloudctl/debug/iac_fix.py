@@ -189,10 +189,12 @@ def _depth1_literals(block_text: str) -> set[str]:
     return out
 
 
-def _state_addresses(root: Path, name: str) -> set[str]:
+def _state_addresses(root: Path, name: str) -> dict[str, bool]:
     """terraform.tfstate (local state only): addresses whose instance has this
-    name/id/arn. Remote state is not read."""
-    hits: set[str] = set()
+    name/id/arn -> True when a value equals it exactly, False when one only
+    ends with it (a log group "/aws/lambda/<name>" or an ARN tail). Remote
+    state is not read."""
+    hits: dict[str, bool] = {}
     for sf in [root / "terraform.tfstate"]:
         if not sf.exists():
             continue
@@ -208,9 +210,63 @@ def _state_addresses(root: Path, name: str) -> set[str]:
                 vals = {str(a.get(k)) for k in ("name", "id", "arn", "function_name",
                                                  "bucket", "table_name", "cluster_identifier")
                         if a.get(k)}
-                if name in vals or any(v.endswith(f":{name}") or v.endswith(f"/{name}") for v in vals):
-                    hits.add(f"{r.get('type')}.{r.get('name')}")
+                addr = f"{r.get('type')}.{r.get('name')}"
+                if name in vals:
+                    hits[addr] = True
+                elif any(v.endswith(f":{name}") or v.endswith(f"/{name}") for v in vals):
+                    hits.setdefault(addr, False)
     return hits
+
+
+def _interpolate_vars(text: str, variables: dict[str, dict]) -> str:
+    """Substitute "${var.x}" with the variable's literal default, so a name
+    built as "${var.prefix}-api" can be matched without state."""
+    def sub(m: re.Match) -> str:
+        d = variables.get(m.group(1), {}).get("default")
+        return d if d is not None and "$" not in d else m.group(0)
+    return re.sub(r"\$\{var\.([A-Za-z0-9_]+)\}", sub, text)
+
+
+def _block_address(b: dict) -> str:
+    return f'{b["a"]}.{b["b"]}' if b["type"] == "resource" else f'{b["type"]}.{b["a"]}.{b["b"]}'
+
+
+def _refs(text: str) -> set[str]:
+    """Addresses a block references, ignoring depends_on (ordering, not data)."""
+    body = re.sub(r"depends_on\s*=\s*\[[^\]]*\]", "", text)
+    out = set(re.findall(r"\b((?:data\.)?[a-z0-9]+_[a-z0-9_]+\.[A-Za-z0-9_\-]+)\.", body))
+    return {r for r in out if not r.startswith(("var.", "local.", "module."))}
+
+
+def _family(rtype: str) -> str:
+    """Provider plus service segment of a resource type: aws_iam_role -> aws_iam."""
+    return "_".join(rtype.split("_")[:2])
+
+
+_MAX_RELATED = 6
+_MAX_RELATED_CHARS = 6000
+
+
+def _related_blocks(root: Path, b: dict, blocks: list[dict]) -> list[dict]:
+    """Resources that configure this one and live in the same service family:
+    blocks that reference it (a role's aws_iam_role_policy and attachments, a
+    function's permissions) and data/resource blocks it references (a policy
+    document). The bad value is often in one of these, not the block itself.
+    Structural only: references plus the provider_service prefix of the type."""
+    addr, fam = _block_address(b), _family(b["a"])
+    out = []
+    for o in blocks:
+        if o is b or o["type"] not in ("resource", "data") or _family(o["a"]) != fam:
+            continue
+        oaddr = _block_address(o)
+        if addr in _refs(o["text"]) or oaddr in _refs(b["text"]):
+            if len(o["text"]) > _MAX_RELATED_CHARS:
+                continue
+            out.append({"file": str(o["file"].relative_to(root)), "start": o["start"], "end": o["end"],
+                        "text": o["text"], "address": oaddr})
+        if len(out) >= _MAX_RELATED:
+            break
+    return out
 
 
 def _locate_terraform(root: Path, names: list[str]) -> list[Located]:
@@ -233,10 +289,13 @@ def _locate_terraform(root: Path, names: list[str]) -> list[Located]:
                 continue
             addr = f'{b["a"]}.{b["b"]}'
             how, score = "", 0
-            if addr in state_hits:
+            if state_hits.get(addr):
                 how, score = "terraform.tfstate maps it to this address", 5
-            elif name in _depth1_literals(b["text"]):
+            elif name in _depth1_literals(b["text"]) or \
+                    name in _depth1_literals(_interpolate_vars(b["text"], variables)):
                 how, score = f'the block sets an attribute to "{name}"', 4
+            elif addr in state_hits:
+                how, score = "terraform.tfstate has a value ending in it at this address", 3
             else:
                 for v in re.findall(r"var\.([A-Za-z0-9_]+)", b["text"]):
                     if variables.get(v, {}).get("default") == name and \
@@ -256,6 +315,7 @@ def _locate_terraform(root: Path, names: list[str]) -> list[Located]:
                 if vb:
                     related.append({"file": str(vb["file"].relative_to(root)), "start": vb["start"],
                                     "end": vb["end"], "text": vb["text"], "address": f"var.{v}"})
+            related += _related_blocks(root, b, blocks)
             found.append(Located("terraform", addr, str(b["file"].relative_to(root)), b["start"],
                                  b["end"], b["text"], name, how, score * 10 - rank, related))
     return found
@@ -306,9 +366,91 @@ def _locate_cdk_python(root: Path, names: list[str]) -> list[Located]:
     return found
 
 
-def locate(root: str | Path, names: list[str]) -> tuple[list[Located], list[str]]:
+_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/*\-]{2,}")
+
+
+def _evidence_tokens(diagnosis: dict, exclude: set[str]) -> set[str]:
+    """Distinctive tokens from the root cause and evidence (not remediation,
+    which may be wrong): identifiers with a separator, UPPER_CASE names and
+    camelCase API names. Compared case-insensitively against IaC text."""
+    text = " ".join([str(diagnosis.get("root_cause") or "")] +
+                    [str(e) for e in diagnosis.get("evidence") or []])
+    out = set()
+    for t in _TOKEN_RE.findall(text):
+        t = t.strip(".,;:()/")
+        if len(t) < 3 or t.lower() in exclude:
+            continue
+        if any(c in t for c in "_-:/*") or re.search(r"[a-z][A-Z]", t):
+            out.add(t.lower())
+    return out
+
+
+def _type_words(addr: str) -> list[str]:
+    """aws_lambda_function.api -> ["lambda", "function"]; CDK "X (dynamodb.Table)" -> ["dynamodb", "table"]."""
+    if "(" in addr:
+        t = addr.split("(")[-1].rstrip(")").replace(".", "_").lower()
+        return [w for w in t.split("_") if w]
+    return addr.split(".")[0].split("_")[1:]
+
+
+def _break_tie(top: list[Located], diagnosis: dict) -> tuple[list[Located], str]:
+    """Pick one of several equally good matches using only structure and the
+    diagnosis itself. Each stage keeps the best; stops when one is left.
+      1. a block that references another tied block configures it (a Lambda
+         permission naming its function) -> keep the referenced one;
+      2. the most root-cause/evidence tokens appearing in the block itself
+         (QUEUE_URL, s3:PutObject, invoices/*);
+      3. the resource type the root cause and evidence name (a Lambda error
+         -> aws_lambda_function, not its log group or API)."""
+    reasons = []
+    addrs = {h.address for h in top}
+    if all(h.kind == "terraform" for h in top):
+        kept = [h for h in top if not (_refs(h.text) & (addrs - {h.address}))]
+        if kept and len(kept) < len(top):
+            reasons.append("the others only reference it")
+            top = kept
+    if len(top) > 1:
+        tokens = _evidence_tokens(diagnosis, {h.matched.lower() for h in top})
+
+        def overlap(h: Located) -> int:
+            blob = h.text.lower()
+            return sum(1 for t in tokens if t in blob)
+        scores = {id(h): overlap(h) for h in top}
+        best = max(scores.values())
+        if best > 0 and sum(1 for v in scores.values() if v == best) < len(top):
+            reasons.append("it holds the most values the root cause and evidence name")
+            top = [h for h in top if scores[id(h)] == best]
+    if len(top) > 1:
+        text = " ".join([str(diagnosis.get("root_cause") or "")] +
+                        [str(e) for e in diagnosis.get("evidence") or []] +
+                        [str(r) for r in diagnosis.get("resources_investigated") or []] +
+                        [str(r) for r in diagnosis.get("affected_resources") or []]).lower()
+        squashed = re.sub(r"[\s_\-]", "", text)
+        words = set(re.findall(r"[a-z0-9]+", text))
+
+        def type_score(h: Located) -> int:
+            tw = _type_words(h.address)
+            if not tw:
+                return 0
+            svc = re.sub(r"v\d+$", "", tw[0])
+            score = 2 if svc and svc in squashed else 0
+            score += sum(1 for w in tw[1:] if w in words)
+            arn_hit = re.search(rf"arn:aws[a-z\-]*:{re.escape(svc)}:[^\s:]*:[^\s:]*:([a-z\-]+)[:/]", text)
+            if arn_hit and arn_hit.group(1).replace("-", "") in "".join(tw[1:]):
+                score += 3
+            return score
+        scores = {id(h): type_score(h) for h in top}
+        best = max(scores.values())
+        if best > 0 and sum(1 for v in scores.values() if v == best) == 1:
+            reasons.append("its resource type is the one the root cause and evidence name")
+            top = [h for h in top if scores[id(h)] == best]
+    return top, "; ".join(reasons)
+
+
+def locate(root: str | Path, names: list[str], diagnosis: dict | None = None) -> tuple[list[Located], list[str]]:
     """Return (best matches, kinds searched). Several matches come back only
-    when they tie on the best score; the caller treats that as ambiguous."""
+    when they tie on the best score and the diagnosis can't separate them;
+    the caller treats that as ambiguous."""
     root = Path(root).resolve()
     kinds = detect_kinds(root)
     hits: list[Located] = []
@@ -324,15 +466,28 @@ def locate(root: str | Path, names: list[str]) -> tuple[list[Located], list[str]
         if h.score == best and (h.file, h.start) not in seen:
             seen.add((h.file, h.start))
             top.append(h)
+    if len(top) > 1 and diagnosis:
+        n = len(top)
+        top, why = _break_tie(top, diagnosis)
+        if len(top) == 1 and why:
+            top[0].how += f"; chosen over {n - 1} other match{'es' if n > 2 else ''} because {why}"
     return top, kinds
 
 
 # ── 3. propose ────────────────────────────────────────────────────────────────
 
+def resource_type(address: str) -> str:
+    """aws_lambda_function.api -> aws_lambda_function; "OrdersTable (dynamodb.Table)" -> dynamodb.Table."""
+    if "(" in address:
+        return address.split("(")[-1].rstrip(")")
+    return address.split(".")[0]
+
+
 _PROPOSE_SYSTEM = """\
 You write the smallest change to an operator's infrastructure-as-code that fixes a
-diagnosed incident. You are shown the diagnosis and the exact IaC text of the
-resource it blames (plus variables that resource reads). Change only that text.
+diagnosed incident. You are shown the diagnosis, the resolved resource (its IaC
+address and type) and the exact IaC text of that resource plus the resources and
+variables that configure it. Change only that text.
 
 Rules:
 - Each edit's "old" must be copied verbatim from the text shown (including
@@ -343,10 +498,17 @@ Rules:
 - If the root cause cannot be fixed by editing the shown text (for example the
   fix belongs in application code or in a resource not shown), return no edits
   and say why.
+- Also write remediation_steps for an operator: concrete steps for THIS resource
+  type and THIS IaC tool only (edit the file, then plan/apply or diff/deploy).
+  Never name a different service or platform than the resolved resource's, and
+  never change the cloud resource directly (console, CLI or API calls that
+  modify it), because that bypasses the IaC and drifts. Read-only checks to
+  confirm the fix afterwards are fine.
 
 Respond ONLY with JSON:
 {"edits": [{"file": "<path as given>", "old": "<exact text>", "new": "<replacement>"}],
  "summary": "<one sentence: what the change does and why it addresses the root cause>",
+ "remediation_steps": ["<step>", "..."],
  "reason_if_no_edit": "<only when edits is empty>"}"""
 
 
@@ -358,7 +520,9 @@ def _propose(diagnosis: dict, loc: Located, client, model_id: str) -> dict:
     prompt = json.dumps({
         "root_cause": diagnosis.get("root_cause", ""),
         "evidence": (diagnosis.get("evidence") or [])[:8],
-        "suggested_remediation": diagnosis.get("remediation_steps") or [],
+        "suggested_remediation_unchecked": diagnosis.get("remediation_steps") or [],
+        "resolved_resource": {"address": loc.address, "type": resource_type(loc.address),
+                              "file": loc.file},
         "iac_kind": loc.kind,
         "iac_text": shown,
     }, indent=2)
@@ -400,6 +564,20 @@ def _apply_edits(root: Path, loc: Located, edits: list[dict]) -> tuple[dict[str,
             continue
         changed[f] = (before, current.replace(old, new, 1))
     return changed, problems
+
+
+def _edited_addresses(loc: Located, edits: list[dict], problems: list[str]) -> list[str]:
+    """Which shown blocks the accepted edits landed in (the located resource
+    or a related one), in order."""
+    blocks = [(loc.file, loc.text, loc.address)] + [(r["file"], r["text"], r["address"]) for r in loc.related]
+    out: list[str] = []
+    for e in edits:
+        f, old = str(e.get("file", "")).lstrip("./"), e.get("old", "")
+        for bf, bt, ba in blocks:
+            if bf == f and old and old in bt and ba not in out:
+                out.append(ba)
+                break
+    return out
 
 
 # ── 4. check ──────────────────────────────────────────────────────────────────
@@ -465,7 +643,7 @@ def suggest_fix(diagnosis: dict, iac_root: str, client=None, model_id: str | Non
         return {"status": "error", "verified": False, "detail": f"{iac_root} is not a directory"}
     names = candidate_names(diagnosis)
     try:
-        hits, kinds = locate(root, names)
+        hits, kinds = locate(root, names, diagnosis)
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "verified": False, "detail": f"IaC search failed: {type(exc).__name__}"}
     base = {"iac_root": str(root), "searched_for": names[:8], "iac_kinds": kinds, "verified": False}
@@ -480,8 +658,10 @@ def suggest_fix(diagnosis: dict, iac_root: str, client=None, model_id: str | Non
                 "candidates": [f"{h.address} ({h.file}:{h.start})" for h in hits],
                 "detail": "more than one IaC resource matches equally well; no diff suggested"}
     loc = hits[0]
-    found = {**base, "resource": loc.address, "kind": loc.kind, "file": loc.file,
-             "lines": f"{loc.start}-{loc.end}", "matched": loc.matched, "how": loc.how}
+    found = {**base, "resource": loc.address, "resource_type": resource_type(loc.address),
+             "kind": loc.kind, "file": loc.file,
+             "lines": f"{loc.start}-{loc.end}", "matched": loc.matched, "how": loc.how,
+             "related": [r["address"] for r in loc.related]}
     try:
         if client is None:
             from cloudctl.ai.model_providers import make_model_client  # noqa: PLC0415
@@ -492,6 +672,9 @@ def suggest_fix(diagnosis: dict, iac_root: str, client=None, model_id: str | Non
         proposal = _propose(diagnosis, loc, client, model_id)
     except Exception as exc:  # noqa: BLE001
         return {**found, "status": "error", "detail": f"could not get a proposal: {type(exc).__name__}: {str(exc)[:200]}"}
+    steps = [str(x) for x in proposal.get("remediation_steps") or [] if str(x).strip()]
+    if steps:
+        found["remediation_steps"] = steps
     edits = proposal.get("edits") or []
     if not edits:
         return {**found, "status": "no_edit",
@@ -504,6 +687,8 @@ def suggest_fix(diagnosis: dict, iac_root: str, client=None, model_id: str | Non
                                      fromfile=f"a/{f}", tofile=f"b/{f}"))
         for f, (before, after) in changed.items())
     check = _check(root, loc.kind, changed)
+    edited = _edited_addresses(loc, edits, problems)
     return {**found, "status": "suggested", "diff": diff, "summary": proposal.get("summary", ""),
+            "edited_resources": edited,
             "check": check, "verified": check.get("status") == "passed",
             "rejected_edits": problems}

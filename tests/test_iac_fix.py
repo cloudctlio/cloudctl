@@ -95,7 +95,7 @@ def test_ambiguous_match_gives_no_diff(tf):
     (tf / "other.tf").write_text('resource "aws_sqs_queue" "q" {\n  name = "orders"\n}\n'
                                  'resource "aws_sns_topic" "t" {\n  name = "orders"\n}\n')
     client = _model({"edits": []})
-    out = iac_fix.suggest_fix({"root_cause": "queue orders backs up", "resources_investigated": ["orders"]},
+    out = iac_fix.suggest_fix({"root_cause": "orders is slow", "resources_investigated": ["orders"]},
                               str(tf), client=client, model_id="m")
     assert out["status"] == "ambiguous" and len(out["candidates"]) >= 2
     client.converse.assert_not_called()

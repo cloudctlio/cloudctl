@@ -2597,7 +2597,7 @@ def debug_incident_agent(
 
     # Build 4-layer system prompt
     account_id = _get_account_id(profile, region)
-    system_prompt = build_system_prompt(account_id=account_id or None)
+    system_prompt = build_system_prompt(account_id=account_id or None, region=region)
 
     import time as _time
     from botocore.config import Config as _BotoConfig
@@ -2709,7 +2709,7 @@ def debug_incident_agent(
         return _truncate_tool_output(raw, tool_name)
 
     # Prepend any investigation hints from confirmed past patterns
-    hints = get_investigation_hints(symptom)
+    hints = get_investigation_hints(symptom, account_id=account_id or None, region=region)
     user_content = f"Investigate this incident: {symptom}"
     if hints:
         user_content += "\n\nHINTS FROM PAST INCIDENTS IN THIS ACCOUNT:\n" + "\n".join(hints)
