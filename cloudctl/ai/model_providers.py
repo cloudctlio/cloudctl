@@ -88,6 +88,23 @@ def tools_to_generic(tool_config) -> list[dict]:
     return out
 
 
+def tool_choice_name(tool_config) -> str:
+    """Converse toolChoice {"tool": {"name": X}} -> X (forced tool), else ""."""
+    choice = (tool_config or {}).get("toolChoice") or {}
+    return ((choice.get("tool") or {}).get("name")) or ""
+
+
+def gemini_schema(schema):
+    """Gemini's response/parameter schema accepts an OpenAPI subset without
+    ``additionalProperties`` or ``title``; strip them recursively."""
+    if isinstance(schema, dict):
+        return {k: gemini_schema(v) for k, v in schema.items()
+                if k not in ("additionalProperties", "title", "$schema")}
+    if isinstance(schema, list):
+        return [gemini_schema(v) for v in schema]
+    return schema
+
+
 _STOP_MAP = {
     "end_turn": "end_turn", "stop": "end_turn", "stop_sequence": "end_turn",
     "tool_use": "tool_use", "tool_calls": "tool_use", "function_call": "tool_use",
@@ -134,11 +151,22 @@ class AnthropicConverseClient:
             system=system_to_text(kwargs.get("system")),
             messages=messages_to_generic(kwargs.get("messages")),
             max_tokens=int(infer.get("maxTokens", 2000)),
-            temperature=float(infer.get("temperature", 0)),
         )
+        # Temperature only when the caller set one, and only in the form the
+        # installed SDK and the model accept (see factory: anthropic 1.x drops
+        # the keyword, 2.x and newer Claude models reject the field).
+        if "temperature" in infer:
+            from cloudctl.ai.factory import _claude_sdk_temperature_kwargs
+            req.update(_claude_sdk_temperature_kwargs(float(infer["temperature"]), kwargs["modelId"]))
         tools = tools_to_generic(kwargs.get("toolConfig"))
         if tools:
             req["tools"] = tools
+            choice = tool_choice_name(kwargs.get("toolConfig"))
+            if choice:
+                req["tool_choice"] = {"type": "tool", "name": choice}
+        budget = (kwargs.get("reasoning") or {}).get("budget_tokens")
+        if budget:
+            req["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
         try:
             resp = self._client.messages.create(**req)
         except Exception as e:  # normalize throttling across SDK versions
@@ -165,9 +193,14 @@ class OpenAIConverseClient:
 
     exceptions = _Exceptions()
 
-    def __init__(self):
+    def __init__(self, base_url: str | None = None, send_temperature: bool = False):
         import openai  # lazy
-        self._client = openai.OpenAI()
+        # base_url serves OpenAI-compatible endpoints (vLLM, Ollama); the SDK
+        # also reads OPENAI_BASE_URL itself.
+        self._client = openai.OpenAI(base_url=base_url) if base_url else openai.OpenAI()
+        # Off by default: reasoning models reject any temperature but the
+        # default, and agent mode always passes 0. A model profile turns it on.
+        self._send_temperature = send_temperature
 
     def _to_openai_messages(self, system_text, generic_msgs):
         msgs = [{"role": "system", "content": system_text}] if system_text else []
@@ -203,6 +236,8 @@ class OpenAIConverseClient:
                 system_to_text(kwargs.get("system")), generic),
             max_completion_tokens=int(infer.get("maxTokens", 2000)),
         )
+        if getattr(self, "_send_temperature", False) and "temperature" in infer:
+            req["temperature"] = float(infer["temperature"])
         tools = tools_to_generic(kwargs.get("toolConfig"))
         if tools:
             req["tools"] = [
@@ -211,6 +246,16 @@ class OpenAIConverseClient:
                     "parameters": t["input_schema"]}}
                 for t in tools
             ]
+            choice = tool_choice_name(kwargs.get("toolConfig"))
+            if choice:
+                req["tool_choice"] = {"type": "function", "function": {"name": choice}}
+        schema = kwargs.get("responseSchema")
+        if schema:
+            req["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": schema.get("title", "response"), "strict": True, "schema": schema}}
+        effort = (kwargs.get("reasoning") or {}).get("effort")
+        if effort:
+            req["reasoning_effort"] = effort
         try:
             resp = self._client.chat.completions.create(**req)
         except Exception as e:
@@ -271,10 +316,16 @@ class GeminiConverseClient:
     def converse(self, **kwargs) -> dict:
         infer = kwargs.get("inferenceConfig") or {}
         generic = messages_to_generic(kwargs.get("messages"))
-        config = {
-            "max_output_tokens": int(infer.get("maxTokens", 2000)),
-            "temperature": float(infer.get("temperature", 0)),
-        }
+        config = {"max_output_tokens": int(infer.get("maxTokens", 2000))}
+        if "temperature" in infer:
+            config["temperature"] = float(infer["temperature"])
+        schema = kwargs.get("responseSchema")
+        if schema:
+            config["response_mime_type"] = "application/json"
+            config["response_schema"] = gemini_schema(schema)
+        reasoning = kwargs.get("reasoning") or {}
+        if "budget_tokens" in reasoning:
+            config["thinking_config"] = {"thinking_budget": int(reasoning["budget_tokens"])}
         sys_text = system_to_text(kwargs.get("system"))
         if sys_text:
             config["system_instruction"] = sys_text
@@ -282,7 +333,11 @@ class GeminiConverseClient:
         if tools:
             config["tools"] = [{"function_declarations": [
                 {"name": t["name"], "description": t["description"],
-                 "parameters": t["input_schema"]} for t in tools]}]
+                 "parameters": gemini_schema(t["input_schema"])} for t in tools]}]
+            choice = tool_choice_name(kwargs.get("toolConfig"))
+            if choice:
+                config["tool_config"] = {"function_calling_config": {
+                    "mode": "ANY", "allowed_function_names": [choice]}}
         try:
             resp = self._client.models.generate_content(
                 model=kwargs["modelId"],
@@ -325,6 +380,7 @@ def _json_loads(s):
 
 def _bedrock_client(profile: str | None, region: str):
     from botocore.config import Config as _BotoConfig
+
     from cloudctl.mcp.tools.debug import _make_session
     session = _make_session(profile, region)
     return session.client(
@@ -332,6 +388,23 @@ def _bedrock_client(profile: str | None, region: str):
         config=_BotoConfig(retries={"mode": "adaptive", "max_attempts": 10},
                            connect_timeout=10, read_timeout=120),
     )
+
+
+def make_model_client_for(model_profile, aws_profile: str | None = None):
+    """Client for one verify ModelProfile (cloudctl.verify.profiles): the
+    provider, endpoint and temperature handling come from the profile, not
+    from environment variables."""
+    prov = model_profile.provider
+    if prov == "bedrock":
+        return _bedrock_client(aws_profile, model_profile.region or "us-east-1")
+    if prov == "anthropic":
+        return AnthropicConverseClient()
+    if prov in ("openai", "openai_compatible"):
+        return OpenAIConverseClient(base_url=model_profile.base_url or None,
+                                    send_temperature=model_profile.temperature is not None)
+    if prov == "gemini":
+        return GeminiConverseClient()
+    raise ValueError(f"unknown provider {prov!r} in profile {model_profile.name!r}")
 
 
 def make_model_client(profile: str | None, region: str):
