@@ -143,3 +143,22 @@ def mock_azure():
 @pytest.fixture()
 def mock_gcp():
     return MagicMock()
+
+
+@pytest.fixture(autouse=True)
+def _reset_enumeration_cache():
+    """list_resources caches the account inventory per (profile, region); tests
+    that stub the enumerator must not see another test's cached inventory."""
+    from cloudctl.mcp.tools.debug import reset_enumeration_cache
+    reset_enumeration_cache()
+    yield
+    reset_enumeration_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_cloudtrail_pacing(monkeypatch):
+    """The shared CloudTrail limiter sleeps between LookupEvents calls; tests
+    stub CloudTrail, so pacing would only slow them. Pacing tests re-enable it."""
+    from cloudctl.debug.fetcher import DebugFetcher
+    monkeypatch.setattr(DebugFetcher, "_CT_MIN_INTERVAL", 0.0)
+    DebugFetcher._ct_next[0] = 0.0
