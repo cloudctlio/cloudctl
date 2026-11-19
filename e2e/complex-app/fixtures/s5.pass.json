@@ -1,0 +1,23 @@
+{
+ "root_cause": "The event source mapping that connects cctl-complexapp-orders to the worker was disabled outside Terraform (UpdateEventSourceMapping, State=Disabled), so nothing polls the queue.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Run terraform plan to confirm the drift, then terraform apply to re-enable the mapping."
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "no_edit",
+  "resource": "aws_lambda_event_source_mapping.worker",
+  "detail": "IaC already enabled"
+ }
+}

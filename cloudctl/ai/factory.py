@@ -161,6 +161,48 @@ def parse_debug_response(text: str) -> DebugResponse:
     )
 
 
+def _temperature_kwargs(temperature: float | None) -> dict:
+    """Only pass temperature when the caller set one, so provider defaults stay unchanged."""
+    return {} if temperature is None else {"temperature": temperature}
+
+
+# Claude models that return a 400 for a non-default temperature: Opus 4.7 and
+# later reject the field outright; Sonnet 5 / 5.5 and Haiku 5.5 reject any
+# value but the default. Matches Bedrock, Vertex, Azure and direct API ids.
+_NO_TEMPERATURE_MODELS = re.compile(
+    r"opus-4-[7-9]|opus-[5-9]|sonnet-[5-9]|haiku-[5-9]|fable|mythos", re.IGNORECASE
+)
+
+
+def _claude_accepts_temperature(model: str | None) -> bool:
+    return not _NO_TEMPERATURE_MODELS.search(model or "")
+
+
+def _anthropic_sdk_major() -> int:
+    try:
+        from importlib.metadata import version  # noqa: PLC0415
+        return int(version("anthropic").split(".")[0])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _claude_sdk_temperature_kwargs(temperature: float | None, model: str | None) -> dict:
+    """Temperature for an anthropic-SDK call, only where it will be accepted.
+
+    - Models that reject it get nothing (the request would 400).
+    - anthropic 1.x removed the ``temperature`` keyword (a TypeError), but
+      still sends API version 2023-06-01, where the field is valid, so it
+      goes in ``extra_body``. 0.x accepts ``extra_body`` too.
+    - anthropic 2.x sends API version 2026-10-21, which rejects the field on
+      every model, so nothing is sent.
+    """
+    if temperature is None or not _claude_accepts_temperature(model):
+        return {}
+    if _anthropic_sdk_major() >= 2:
+        return {}
+    return {"extra_body": {"temperature": temperature}}
+
+
 # ── AWS Bedrock ────────────────────────────────────────────────────────────────
 
 class BedrockAI(BaseAI):
@@ -173,7 +215,7 @@ class BedrockAI(BaseAI):
         self._profile = profile
         # Client is created lazily in _invoke so SSO credentials are always fresh
 
-    def _invoke(self, prompt: str, system: str | None = None) -> str:
+    def _invoke(self, prompt: str, system: str | None = None, temperature: float | None = None) -> str:
         import json  # noqa: PLC0415
         import boto3  # noqa: PLC0415
         # Create a fresh session each invocation so SSO tokens are always current.
@@ -183,12 +225,15 @@ class BedrockAI(BaseAI):
         session = boto3.Session(profile_name=self._profile) if self._profile else boto3.Session()
         config = BotoConfig(connect_timeout=10, read_timeout=120)
         client = session.client("bedrock-runtime", region_name=self._region, config=config)
-        body = json.dumps({
+        payload = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 4096,
             "system": system or _SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}],
-        })
+        }
+        if temperature is not None and _claude_accepts_temperature(self._model):
+            payload["temperature"] = temperature
+        body = json.dumps(payload)
         resp = client.invoke_model(modelId=self._model, body=body)
         data = json.loads(resp["body"].read())
         return data["content"][0]["text"]
@@ -235,12 +280,13 @@ class AzureFoundryAI(BaseAI):
                 api_key="placeholder",
             )
 
-    def _invoke(self, prompt: str) -> str:
+    def _invoke(self, prompt: str, system: str | None = None, temperature: float | None = None) -> str:
         msg = self._client.messages.create(
             model=self._model,
             max_tokens=4096,
-            system=_SYSTEM_PROMPT,
+            system=system or _SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            **_claude_sdk_temperature_kwargs(temperature, self._model),
         )
         return msg.content[0].text
 
@@ -275,12 +321,13 @@ class VertexAI(BaseAI):
         self._model  = cfg.get("ai.vertex_model") or _VERTEX_MODELS.get(tier, _VERTEX_MODELS["sonnet"])
         self._client = AnthropicVertex(region=region, project_id=project_id)
 
-    def _invoke(self, prompt: str) -> str:
+    def _invoke(self, prompt: str, system: str | None = None, temperature: float | None = None) -> str:
         msg = self._client.messages.create(
             model=self._model,
             max_tokens=4096,
-            system=_SYSTEM_PROMPT,
+            system=system or _SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            **_claude_sdk_temperature_kwargs(temperature, self._model),
         )
         return msg.content[0].text
 
@@ -309,11 +356,12 @@ class AnthropicAI(BaseAI):
         self._model  = cfg.get("ai.anthropic_model") or _ANTHROPIC_MODELS.get(tier, _ANTHROPIC_MODELS["sonnet"])
         self._client = Anthropic(api_key=api_key)
 
-    def _invoke(self, prompt: str) -> str:
+    def _invoke(self, prompt: str, system: str | None = None, temperature: float | None = None) -> str:
         msg = self._client.messages.create(
             model=self._model, max_tokens=4096,
-            system=_SYSTEM_PROMPT,
+            system=system or _SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            **_claude_sdk_temperature_kwargs(temperature, self._model),
         )
         return msg.content[0].text
 
@@ -340,10 +388,11 @@ class OpenAIProvider(BaseAI):
         self._model  = cfg.get("ai.openai_model") or "gpt-4o"
         self._client = OpenAI(api_key=cfg.get("ai.openai_api_key") or "")
 
-    def _invoke(self, prompt: str) -> str:
+    def _invoke(self, prompt: str, system: str | None = None, temperature: float | None = None) -> str:
         resp = self._client.chat.completions.create(
             model=self._model,
-            messages=[{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            messages=[{"role": "system", "content": system or _SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            **_temperature_kwargs(temperature),
         )
         return resp.choices[0].message.content or ""
 
@@ -371,11 +420,15 @@ class OllamaAI(BaseAI):
         self._model   = cfg.get("ai.ollama_model") or "llama3"
         self._session = requests.Session()
 
-    def _invoke(self, prompt: str) -> str:
-        import json  # noqa: PLC0415
+    def _invoke(self, prompt: str, system: str | None = None, temperature: float | None = None) -> str:
         resp = self._session.post(
             f"{self._host}/api/generate",
-            json={"model": self._model, "prompt": f"{_SYSTEM_PROMPT}\n\n{prompt}", "stream": False},
+            json={
+                "model": self._model,
+                "prompt": f"{system or _SYSTEM_PROMPT}\n\n{prompt}",
+                "stream": False,
+                **({"options": {"temperature": temperature}} if temperature is not None else {}),
+            },
             timeout=120,
         )
         resp.raise_for_status()

@@ -14,6 +14,8 @@ Detection order (same logic for every cloud):
 """
 from __future__ import annotations
 
+from cloudctl.debug.fetcher import ct_pace as _ct_pace
+
 from typing import Optional
 
 def _is_terraform_ua(ua: str) -> bool:
@@ -264,6 +266,7 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
         start = end - timedelta(hours=24)
 
         # First pass: lookup by ARN
+        _ct_pace()  # shared CloudTrail rate limit (see fetcher.ct_pace)
         resp = ct.lookup_events(
             LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_arn}],
             StartTime=start,
@@ -278,6 +281,7 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
         # e.g. arn:aws:lambda:...:function:my-fn  →  "my-fn"
         short_name = resource_arn.split(":")[-1]
         if short_name and short_name != resource_arn:
+            _ct_pace()  # shared CloudTrail rate limit (see fetcher.ct_pace)
             resp2 = ct.lookup_events(
                 LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": short_name}],
                 StartTime=start,
@@ -296,6 +300,7 @@ def _aws_cloudtrail(session, resource_arn: str) -> str:
             _HEX  = _re.compile(r"^[0-9a-f]{16,}$")
             for seg in short_name.split("/"):
                 if seg and seg not in _SKIP and not _HEX.match(seg) and seg != short_name:
+                    _ct_pace()  # shared CloudTrail rate limit (see fetcher.ct_pace)
                     resp3 = ct.lookup_events(
                         LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": seg}],
                         StartTime=start,

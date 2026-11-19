@@ -1,0 +1,326 @@
+{
+ "version": 1,
+ "app": "cctl-complexapp",
+ "notes": "Each IaC fault is a 'bad commit': text edits to app/*.tf applied with terraform apply, so the IaC root cctl reads contains the bug and the correct fix is the reverse edit. s5 is an out-of-band change (drift): the IaC is already correct and the right fix is to re-apply it, not to change it. Regexes are matched case-insensitively.",
+ "drift_risk_regex": "update-function-configuration|put-role-policy|update-table|set-queue-attributes|put-rule|put-targets|update-event-source-mapping|put-function-concurrency|delete-function-concurrency|UpdateFunctionConfiguration|PutRolePolicy|UpdateTable|SetQueueAttributes|PutRule|UpdateEventSourceMapping|PutFunctionConcurrency|DeleteFunctionConcurrency|in the (aws )?console|via the console",
+ "iac_mention_regex": "terraform|\\.tf\\b|iac|infrastructure as code|re-?apply|drift",
+ "scenarios": [
+  {
+   "id": "s1",
+   "name": "iam-one-path",
+   "title": "IAM policy missing one action on one code path",
+   "kind": "iac",
+   "edits": [
+    {
+     "file": "iam.tf",
+     "before": "Resource = \"${aws_s3_bucket.receipts.arn}/receipts/*\"",
+     "after": "Resource = \"${aws_s3_bucket.receipts.arn}/invoices/*\""
+    }
+   ],
+   "load": {
+    "rps": 6,
+    "receipt_ratio": 0.35,
+    "large_ratio": 0.1,
+    "get_ratio": 0.2
+   },
+   "symptom": "About a third of new orders never finish: they stay PENDING when we look them up with GET /orders/{id}, while the rest complete normally. This started in the last 15 minutes.",
+   "symptom_check": {
+    "dlq_min": 3
+   },
+   "ground_truth": {
+    "root_cause": "The worker's IAM policy (WriteReceipts) allows s3:PutObject only on invoices/* in the receipts bucket, but the worker writes receipts/<order_id>.json. Orders that ask for a receipt (about 35%) fail with AccessDenied, retry 3 times and land in the DLQ, so they stay PENDING. Orders without a receipt are unaffected.",
+    "blamed_resource": "aws_iam_role_policy.worker (cctl-complexapp-worker-policy on cctl-complexapp-worker-role)",
+    "faults": [
+     {
+      "id": "A",
+      "root_cause_all": [
+       "s3:?putobject|put_?object|accessdenied|access denied|not authori[sz]ed|permission|iam|polic",
+       "receipt|invoices"
+      ],
+      "localize_any": [
+       "worker[- _]?(role|policy)",
+       "worker'?s? (iam )?(role|policy|permissions)",
+       "aws_iam_role_policy\\.worker",
+       "writereceipts",
+       "iam (role|policy) (of|for) the worker"
+      ],
+      "iac_resources": [
+       "aws_iam_role_policy.worker",
+       "aws_iam_role.worker"
+      ],
+      "fix_remove_any": [
+       "invoices/\\*"
+      ],
+      "fix_add_any": [
+       "receipts/\\*",
+       "receipts\\.arn\\}/\\*"
+      ]
+     }
+    ],
+    "iac_fix_diff": "--- a/iam.tf\n+++ b/iam.tf\n@@ resource \"aws_iam_role_policy\" \"worker\"\n       {\n         Sid      = \"WriteReceipts\"\n         Effect   = \"Allow\"\n         Action   = [\"s3:PutObject\"]\n-        Resource = \"${aws_s3_bucket.receipts.arn}/invoices/*\"\n+        Resource = \"${aws_s3_bucket.receipts.arn}/receipts/*\"\n       },\n"
+   }
+  },
+  {
+   "id": "s2",
+   "name": "concurrency-starved-consumer",
+   "title": "Worker reserved concurrency starves the SQS consumer (symptom far from cause, no errors logged)",
+   "kind": "iac",
+   "edits": [
+    {
+     "file": "variables.tf",
+     "before": "  description = \"Reserved concurrency for the order worker. -1 means no reservation (uses the account pool).\"\n  type        = number\n  default     = -1",
+     "after": "  description = \"Reserved concurrency for the order worker. -1 means no reservation (uses the account pool).\"\n  type        = number\n  default     = 1"
+    }
+   ],
+   "load": {
+    "rps": 8,
+    "receipt_ratio": 0.2,
+    "large_ratio": 0.3,
+    "get_ratio": 0.2
+   },
+   "symptom": "Orders are piling up: many stay PENDING for minutes and some never complete. The API answers normally and we don't see errors in the worker's logs.",
+   "symptom_check": {
+    "queue_age_s_min": 90,
+    "or_dlq_min": 1
+   },
+   "ground_truth": {
+    "root_cause": "The worker Lambda's reserved concurrency is 1 (var.worker_reserved_concurrency default). The SQS event source needs about 8 to 10 concurrent workers at this load, so invocations are throttled: the backlog and message age grow, and throttled messages exhaust maxReceiveCount=3 and go to the DLQ. No errors appear in the worker's logs because throttled invocations never run.",
+    "blamed_resource": "aws_lambda_function.worker (reserved_concurrent_executions from var.worker_reserved_concurrency)",
+    "faults": [
+     {
+      "id": "A",
+      "root_cause_all": [
+       "concurren",
+       "worker"
+      ],
+      "localize_any": [
+       "cctl-complexapp-worker\\b(?![- ](role|policy))",
+       "worker (lambda|function)",
+       "aws_lambda_function\\.worker",
+       "worker_reserved_concurrency"
+      ],
+      "iac_resources": [
+       "aws_lambda_function.worker",
+       "aws_lambda_event_source_mapping.worker"
+      ],
+      "fix_remove_any": [
+       "default\\s*=\\s*1\\b",
+       "reserved_concurrent_executions\\s*=\\s*1\\b"
+      ],
+      "fix_add_any": [
+       "default\\s*=\\s*(-1|[5-9]|\\d{2,})\\b",
+       "reserved_concurrent_executions\\s*=\\s*(-1|[5-9]|\\d{2,})\\b",
+       "maximum_concurrency"
+      ]
+     }
+    ],
+    "iac_fix_diff": "--- a/variables.tf\n+++ b/variables.tf\n@@ variable \"worker_reserved_concurrency\"\n   description = \"Reserved concurrency for the order worker. -1 means no reservation (uses the account pool).\"\n   type        = number\n-  default     = 1\n+  default     = -1\n"
+   }
+  },
+  {
+   "id": "s3",
+   "name": "bad-env-var-plus-red-herring",
+   "title": "Bad queue URL in a deploy, plus a noisy but harmless cache error from the same deploy",
+   "kind": "iac",
+   "edits": [
+    {
+     "file": "lambda.tf",
+     "before": "      TABLE_NAME = aws_dynamodb_table.orders.name\n      QUEUE_URL  = aws_sqs_queue.orders.url\n",
+     "after": "      TABLE_NAME     = aws_dynamodb_table.orders.name\n      QUEUE_URL      = \"https://sqs.${var.region}.amazonaws.com/${data.aws_caller_identity.current.account_id}/${var.prefix}-orders-v2\"\n      CACHE_ENDPOINT = \"redis://127.0.0.1:6379\"\n"
+    }
+   ],
+   "load": {
+    "rps": 6,
+    "receipt_ratio": 0.2,
+    "large_ratio": 0.1,
+    "get_ratio": 0.75
+   },
+   "symptom": "Customers can't place orders: POST /orders returns 500 Internal Server Error. Looking up existing orders still works. It started right after this afternoon's deploy.",
+   "symptom_check": {
+    "post_5xx_ratio_min": 0.5
+   },
+   "ground_truth": {
+    "root_cause": "The api Lambda's QUEUE_URL env var now points at cctl-complexapp-orders-v2, a queue that doesn't exist, so sqs:SendMessage fails on every POST /orders (the error can show as NonExistentQueue or AccessDenied, because the api role only allows SendMessage on the real queue) and the API returns 500. The 'cache warmup failed ... 127.0.0.1:6379' errors on GET come from the same deploy but are handled and harmless.",
+    "blamed_resource": "aws_lambda_function.api (environment QUEUE_URL)",
+    "red_herring_regex": "cache|redis|6379|connection ?refused",
+    "faults": [
+     {
+      "id": "A",
+      "root_cause_all": [
+       "queue_url|queue url|orders-v2|non-?existent|does not exist|doesn't exist|wrong queue|incorrect queue|missing queue",
+       "sendmessage|send_message|sqs|queue"
+      ],
+      "localize_any": [
+       "cctl-complexapp-api\\b(?![- ](role|policy))",
+       "api (lambda|function)",
+       "aws_lambda_function\\.api",
+       "queue_url"
+      ],
+      "iac_resources": [
+       "aws_lambda_function.api"
+      ],
+      "fix_remove_any": [
+       "orders-v2"
+      ],
+      "fix_add_any": [
+       "aws_sqs_queue\\.orders\\.url"
+      ],
+      "wrong_fix_any": [
+       "sqs:\\*",
+       "resource\\s*=\\s*\"\\*\""
+      ]
+     }
+    ],
+    "iac_fix_diff": "--- a/lambda.tf\n+++ b/lambda.tf\n@@ resource \"aws_lambda_function\" \"api\"\n     variables = {\n-      TABLE_NAME     = aws_dynamodb_table.orders.name\n-      QUEUE_URL      = \"https://sqs.${var.region}.amazonaws.com/${data.aws_caller_identity.current.account_id}/${var.prefix}-orders-v2\"\n-      CACHE_ENDPOINT = \"redis://127.0.0.1:6379\"\n+      TABLE_NAME = aws_dynamodb_table.orders.name\n+      QUEUE_URL  = aws_sqs_queue.orders.url\n     }\n(Removing CACHE_ENDPOINT is optional; the QUEUE_URL line is the fix.)\n"
+   }
+  },
+  {
+   "id": "s4",
+   "name": "two-concurrent-faults",
+   "title": "Two faults at once: worker timeout too short for large orders, and an EventBridge rule that no longer matches",
+   "kind": "iac",
+   "edits": [
+    {
+     "file": "lambda.tf",
+     "before": "  handler          = \"worker.handler\"\n  filename         = data.archive_file.worker.output_path\n  source_code_hash = data.archive_file.worker.output_base64sha256\n  timeout          = 10\n",
+     "after": "  handler          = \"worker.handler\"\n  filename         = data.archive_file.worker.output_path\n  source_code_hash = data.archive_file.worker.output_base64sha256\n  timeout          = 2\n"
+    },
+    {
+     "file": "messaging.tf",
+     "before": "\"detail-type\" = [\"OrderProcessed\"]",
+     "after": "\"detail-type\" = [\"OrderCompleted\"]"
+    }
+   ],
+   "load": {
+    "rps": 6,
+    "receipt_ratio": 0.2,
+    "large_ratio": 0.35,
+    "get_ratio": 0.2
+   },
+   "symptom": "Two complaints since the last deploy: some orders never complete, and customers whose orders do complete aren't getting their confirmation notifications.",
+   "symptom_check": {
+    "dlq_min": 3,
+    "and_processed_unnotified_min": 3
+   },
+   "ground_truth": {
+    "root_cause": "(A) The worker Lambda timeout is 2 s, but orders with 8 to 10 items take 2.6 to 3.2 s (BASE_MS 200 + ITEM_MS 300 per item), so about a third of orders time out ('Task timed out after 2.00 seconds'), retry and go to the DLQ. (B) Separately, the EventBridge rule cctl-complexapp-order-processed now matches detail-type OrderCompleted, while the worker still publishes OrderProcessed, so the notifier is never invoked and no order gets marked notified.",
+    "blamed_resource": "aws_lambda_function.worker (timeout) and aws_cloudwatch_event_rule.order_processed (event_pattern)",
+    "faults": [
+     {
+      "id": "A",
+      "root_cause_all": [
+       "time[sd]? ?out|timing out|duration",
+       "worker"
+      ],
+      "localize_any": [
+       "cctl-complexapp-worker\\b(?![- ](role|policy))",
+       "worker (lambda|function)",
+       "aws_lambda_function\\.worker"
+      ],
+      "iac_resources": [
+       "aws_lambda_function.worker"
+      ],
+      "fix_remove_any": [
+       "timeout\\s*=\\s*2\\b"
+      ],
+      "fix_add_any": [
+       "timeout\\s*=\\s*([4-9]|\\d{2,})\\b"
+      ]
+     },
+     {
+      "id": "B",
+      "root_cause_all": [
+       "eventbridge|event bridge|event rule|rule|event pattern|detail-type|detail type",
+       "ordercompleted|orderprocessed|not match|doesn't match|does not match|mismatch|never (invoked|triggered)|notifier"
+      ],
+      "localize_any": [
+       "cctl-complexapp-order-processed",
+       "event(bridge)? rule",
+       "aws_cloudwatch_event_rule\\.order_processed",
+       "event pattern"
+      ],
+      "iac_resources": [
+       "aws_cloudwatch_event_rule.order_processed"
+      ],
+      "fix_remove_any": [
+       "ordercompleted"
+      ],
+      "fix_add_any": [
+       "\"orderprocessed\""
+      ]
+     }
+    ],
+    "iac_fix_diff": "--- a/lambda.tf\n+++ b/lambda.tf\n@@ resource \"aws_lambda_function\" \"worker\"\n-  timeout          = 2\n+  timeout          = 10\n--- a/messaging.tf\n+++ b/messaging.tf\n@@ resource \"aws_cloudwatch_event_rule\" \"order_processed\"\n-    \"detail-type\" = [\"OrderCompleted\"]\n+    \"detail-type\" = [\"OrderProcessed\"]\n(cctl's IaC fix covers one resource per run, so it can match at most one of these.)\n"
+   }
+  },
+  {
+   "id": "s5",
+   "name": "out-of-band-drift",
+   "title": "Out-of-band change after deploy: the worker's SQS trigger disabled outside Terraform",
+   "kind": "drift",
+   "drift": {
+    "action": "disable_event_source_mapping"
+   },
+   "load": {
+    "rps": 5,
+    "receipt_ratio": 0.2,
+    "large_ratio": 0.1,
+    "get_ratio": 0.2
+   },
+   "symptom": "No orders have completed in the last several minutes. New orders are accepted (202) but stay PENDING. Nobody deployed anything today.",
+   "symptom_check": {
+    "queue_visible_min": 20,
+    "and_esm_state": "Disabled"
+   },
+   "ground_truth": {
+    "root_cause": "The worker's SQS event source mapping was disabled outside Terraform (UpdateEventSourceMapping Enabled=false, visible in CloudTrail and as State=Disabled). Messages accumulate in cctl-complexapp-orders and nothing invokes the worker. The Terraform is already correct (enabled defaults to true), so the fix is terraform plan/apply to revert the drift, not an IaC change and not a direct API call.",
+    "blamed_resource": "aws_lambda_event_source_mapping.worker (drifted, IaC correct)",
+    "expect_no_iac_change": true,
+    "faults": [
+     {
+      "id": "A",
+      "root_cause_all": [
+       "event source mapping|event-source mapping|esm|trigger|mapping|poll",
+       "disabl|paused|stopped|turned off|not enabled"
+      ],
+      "localize_any": [
+       "event[- ]source mapping",
+       "\\besm\\b",
+       "aws_lambda_event_source_mapping\\.worker",
+       "trigger"
+      ],
+      "iac_resources": [
+       "aws_lambda_event_source_mapping.worker"
+      ],
+      "fix_remove_any": [],
+      "fix_add_any": [
+       "enabled\\s*=\\s*true"
+      ]
+     }
+    ],
+    "iac_fix_diff": "(none: the Terraform already says enabled; run terraform plan to see the drift and terraform apply to revert it. A diff that only adds 'enabled = true' to aws_lambda_event_source_mapping.worker is harmless and accepted.)"
+   }
+  },
+  {
+   "id": "s0",
+   "name": "healthy-control",
+   "title": "Control: no fault (checks for false positives). Optional.",
+   "kind": "none",
+   "load": {
+    "rps": 5,
+    "receipt_ratio": 0.2,
+    "large_ratio": 0.1,
+    "get_ratio": 0.3
+   },
+   "symptom": "A customer said the orders API felt slow earlier today. Can you check whether anything is wrong?",
+   "symptom_check": {},
+   "ground_truth": {
+    "root_cause": "Nothing is wrong. Orders complete within about 1 to 3 seconds and there are no errors, throttles or DLQ messages.",
+    "blamed_resource": "none",
+    "expect_no_fault": true,
+    "no_fault_regex": "no (fault|issue|problem|error|evidence|anomal)|healthy|normal|nothing (is )?wrong|not (find|identify|found)|could not (find|identify|confirm)|unable to (find|identify|confirm)|insufficient|no root cause",
+    "faults": []
+   }
+  }
+ ]
+}

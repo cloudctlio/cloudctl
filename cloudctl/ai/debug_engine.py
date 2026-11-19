@@ -83,6 +83,8 @@ class DebugEngine:
         from cloudctl.ai.factory import parse_debug_response  # noqa: PLC0415
         from cloudctl.ai.prompts.debug import debug_prompt, DEBUG_SYSTEM  # noqa: PLC0415
 
+        from cloudctl.debug.context_shaper import fit_to_budget, serialize  # noqa: PLC0415
+
         # ARN dedup — remove duplicate resources that appear under multiple profiles
         self._dedup_arns(context)
 
@@ -90,9 +92,17 @@ class DebugEngine:
         # summarize healthy ones so the AI focuses on the signal, not the noise
         self._prune_context(context)
 
+        # Size budget — trim the lowest-priority data first and tell the model
+        # what was left out, rather than sending an unbounded prompt.
+        budget_notes = fit_to_budget(context)
+
         ai = get_ai(self._cfg, purpose="analysis")
-        prompt = debug_prompt(symptom, context, deploy_method=deploy_method)
-        answer_text = ai._invoke(prompt, system=DEBUG_SYSTEM)  # noqa: SLF001
+        prompt = debug_prompt(
+            symptom, serialize(context),
+            deploy_method=deploy_method, budget_notes=budget_notes,
+        )
+        # Temperature 0: the same incident should get the same diagnosis.
+        answer_text = ai._invoke(prompt, system=DEBUG_SYSTEM, temperature=0)  # noqa: SLF001
         parsed = parse_debug_response(answer_text)
 
         return DebugFinding(
@@ -111,77 +121,25 @@ class DebugEngine:
 
     @staticmethod
     def _prune_context(context: dict) -> None:
-        """Tier resources by health so the AI sees signal, not noise.
+        """Tier compute/database resources by health so the AI sees signal, not noise.
 
-        Tier 1 (full JSON)  — unhealthy: state not running/active, or has errors
-        Tier 2 (name+state) — healthy resources in the same list
-        Tier 3 (count only) — emitted as a summary string appended to the list
-
-        Only applies to compute/database lists; logs and audit trails are left intact.
+        Unhealthy resources keep full JSON; healthy ones are cut to name+state,
+        with up to 3 kept and the rest counted. The inventory is nested as
+        context["aws"][<profile>]["compute"], so this walks the whole tree.
         """
-        _UNHEALTHY = {"stopped", "stopping", "failed", "error", "degraded",
-                      "impaired", "unavailable", "draining", "inactive"}
-        _HEALTHY   = {"running", "active", "available", "ok", "healthy", "started"}
-
-        prunable_keys = {"compute", "database"}
-
-        for key in list(context.keys()):
-            if key not in prunable_keys:
-                continue
-            items = context.get(key)
-            if not isinstance(items, list) or len(items) <= 5:
-                continue  # small lists — no pruning needed
-
-            tier1, tier2 = [], []
-            for item in items:
-                if not isinstance(item, dict):
-                    tier1.append(item)
-                    continue
-                state = str(item.get("state") or item.get("status") or "").lower()
-                if state in _UNHEALTHY or (state and state not in _HEALTHY):
-                    tier1.append(item)  # full JSON
-                else:
-                    tier2.append({  # metadata only
-                        "name":  item.get("name") or item.get("id", ""),
-                        "state": state or "unknown",
-                    })
-
-            healthy_count = len(tier2)
-            pruned: list = tier1
-            pruned.extend(tier2[:3])  # include up to 3 healthy neighbours for context
-            if healthy_count > 3:
-                pruned.append({"_summary": f"{healthy_count - 3} additional healthy {key} resources omitted"})
-            context[key] = pruned
+        from cloudctl.debug.context_shaper import prune_nested  # noqa: PLC0415
+        prune_nested(context)
 
     @staticmethod
     def _dedup_arns(context: dict) -> None:
-        """Remove duplicate resources that appear under multiple profiles/keys.
+        """Remove resources that appear more than once anywhere in the context.
 
-        Walks every list in context and drops items whose ARN (or id/name) was
-        already seen, so the same resource isn't sent twice to the AI.
+        Only items with a stable identity (arn, id or name) are deduped. Log
+        lines, CloudTrail events and other event records share a 'source'
+        value, so keying on it kept only one event per source.
         """
-        seen_arns: set[str] = set()
-        for key, value in context.items():
-            if not isinstance(value, list):
-                continue
-            deduped = []
-            for item in value:
-                if not isinstance(item, dict):
-                    deduped.append(item)
-                    continue
-                arn = (
-                    item.get("arn")
-                    or item.get("ARN")
-                    or item.get("id")
-                    or item.get("name")
-                    or item.get("source")
-                )
-                if arn and arn in seen_arns:
-                    continue
-                if arn:
-                    seen_arns.add(arn)
-                deduped.append(item)
-            context[key] = deduped
+        from cloudctl.debug.context_shaper import dedup_nested  # noqa: PLC0415
+        dedup_nested(context)
 
     # Env var key patterns whose values must be redacted before leaving this process
     _SENSITIVE_PATTERNS = (

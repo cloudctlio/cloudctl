@@ -13,9 +13,12 @@ All tools create a fresh boto3 Session per call so SSO tokens are always current
 """
 from __future__ import annotations
 
+from cloudctl.debug.fetcher import ct_pace as _ct_pace
+
 import json
 import logging
 import re
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -815,6 +818,37 @@ def _enumerate_resources(session, max_total: int = 500) -> list[dict]:
     return resources
 
 
+_ENUM_CACHE: dict = {}
+_ENUM_LOCK = threading.Lock()
+
+
+def _cached_enumeration(profile: str | None, region: str) -> list[dict]:
+    """Account inventory, enumerated ONCE per (profile, region) per cache TTL.
+
+    list_resources is called with many different service_type filters (observe,
+    triage, every branch's phase 1), and each call used to re-run the whole
+    account enumeration (Resource Explorer up to 10 pages + the Tagging API up
+    to 500 resources) just to filter it differently. The filter is applied to
+    this one shared result instead. The lock makes concurrent first calls from
+    parallel branches share a single enumeration."""
+    import time as _time
+    from cloudctl.mcp.tools.recorder import _CACHE_TTL_SECONDS
+    key = (profile or "", region)
+    with _ENUM_LOCK:
+        hit = _ENUM_CACHE.get(key)
+        if hit and _time.monotonic() - hit[0] < _CACHE_TTL_SECONDS:
+            return hit[1]
+        resources = _enumerate_resources(_make_session(profile, region))
+        if resources:   # never pin an empty (possibly failed) enumeration
+            _ENUM_CACHE[key] = (_time.monotonic(), resources)
+        return resources
+
+
+def reset_enumeration_cache() -> None:
+    with _ENUM_LOCK:
+        _ENUM_CACHE.clear()
+
+
 @recordable("list_resources")
 def list_resources(
     service_type: str = "",
@@ -827,8 +861,7 @@ def list_resources(
     (matched against the resource's service namespace or name) — NOT as a router
     to a per-service lister, so discovery is never bounded by a maintained list.
     """
-    session = _make_session(profile, region)
-    resources = _enumerate_resources(session)
+    resources = _cached_enumeration(profile, region)
 
     filt = (service_type or "").strip().lower()
     if filt:
@@ -944,6 +977,20 @@ def tail_logs(
 
     session = _make_session(profile, region)
     fetcher = DebugFetcher(session)
+    # Soft time cap: each fallback stage below can issue several paged
+    # FilterLogEvents calls per group (on a noisy group, ~5 per group), so the
+    # stages stop starting new groups after this many seconds and return what
+    # they have instead of being cut off at the tool timeout with nothing.
+    import os as _os
+    import time as _time
+    try:
+        _soft = float(_os.environ.get("CLOUDCTL_TAIL_LOGS_SOFT_S", "") or 25)
+    except ValueError:
+        _soft = 25.0
+    _t_end = _time.monotonic() + _soft
+
+    def _out_of_time() -> bool:
+        return _time.monotonic() >= _t_end
 
     # Groups that matched and returned events
     discovered: list[str] = []
@@ -963,6 +1010,8 @@ def tail_logs(
         f"/aws/apigateway/{resource_hint}",
     ]
     for lg in candidates:
+        if _out_of_time():
+            break
         try:
             evts = fetcher.cloudwatch_logs(
                 log_group=lg, minutes=minutes,
@@ -977,11 +1026,13 @@ def tail_logs(
             pass
 
     # Fall back to discover_log_groups
-    if not logs:
+    if not logs and not _out_of_time():
         try:
             groups = fetcher.discover_log_groups(resource_hint)
             existing.extend(groups[:5])
             for grp in groups[:5]:
+                if _out_of_time():
+                    break
                 evts = fetcher.cloudwatch_logs(
                     log_group=grp, minutes=minutes,
                     filter_pattern=filter_pattern, max_events=max_events,
@@ -997,6 +1048,8 @@ def tail_logs(
     # the known groups WITHOUT the filter before concluding the logs are clean.
     if not logs and filter_pattern and existing:
         for grp in list(dict.fromkeys(existing))[:3]:
+            if _out_of_time():
+                break
             try:
                 evts = fetcher.cloudwatch_logs(
                     log_group=grp, minutes=minutes, max_events=max_events,
@@ -1031,6 +1084,8 @@ def tail_logs(
         # a template's count is a fact the line sample can miss.
         "log_templates":    _mine_log_templates(logs),
         "events":           _serialise(logs[:max_events]),
+        **({"partial": f"stopped trying more log groups after {_soft:.0f}s"}
+           if _out_of_time() else {}),
     }, separators=(",", ":"))
 
 
@@ -1343,6 +1398,7 @@ def get_deployment_info(
         ])))
 
         for sv in search_values:
+            _ct_pace()  # shared CloudTrail rate limit (see fetcher.ct_pace)
             resp = ct.lookup_events(
                 LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": sv}],
                 StartTime=start, EndTime=end, MaxResults=20,
@@ -1412,6 +1468,105 @@ def get_deployment_info(
 
 # ── Agent mode ────────────────────────────────────────────────────────────────
 
+_ROLE_ARN_RE = re.compile(
+    r"^arn:aws[a-z0-9-]*:(iam|sts)::(\d{12}):(role|assumed-role)/(.+)$")
+_RESOURCE_ARN_RE = re.compile(
+    r"^arn:aws[a-z0-9-]*:[a-z0-9-]+:[a-z0-9-]*:(\d{12})?:.+$")
+
+
+def _iam_glob(pattern: str, value: str, *, ignore_case: bool = False) -> bool:
+    """IAM wildcard match: * is any run of characters, ? is one character."""
+    rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c)
+                 for c in str(pattern))
+    return re.fullmatch(rx, str(value), re.I if ignore_case else 0) is not None
+
+
+def _as_list(v) -> list:
+    if v is None:
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
+
+def _policy_doc(doc) -> dict:
+    """IAM returns policy documents as dicts (boto3 decodes them) or, from
+    some code paths, as URL-encoded JSON strings. Accept both."""
+    if isinstance(doc, dict):
+        return doc
+    from urllib.parse import unquote
+    try:
+        return json.loads(unquote(str(doc)))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _identity_statements(iam, role_name: str, action: str) -> list[dict] | None:
+    """Every statement in the role's inline AND attached managed policies whose
+    Action covers `action`, with the resources it names. Lets the probe tell a
+    missing permission (no statement grants the action anywhere) from a
+    resource mismatch (the role grants it, just not on the ARN probed). None
+    when the role's policies can't be read."""
+    docs: list[tuple[str, str, dict]] = []
+    try:
+        marker = None
+        while True:
+            kw = {"RoleName": role_name, **({"Marker": marker} if marker else {})}
+            page = iam.list_role_policies(**kw)
+            for name in page.get("PolicyNames", []):
+                doc = iam.get_role_policy(RoleName=role_name, PolicyName=name)
+                docs.append((name, "inline", _policy_doc(doc.get("PolicyDocument"))))
+            if not page.get("IsTruncated"):
+                break
+            marker = page.get("Marker")
+        marker = None
+        while True:
+            kw = {"RoleName": role_name, **({"Marker": marker} if marker else {})}
+            page = iam.list_attached_role_policies(**kw)
+            for ap in page.get("AttachedPolicies", []):
+                arn = ap.get("PolicyArn")
+                ver = iam.get_policy(PolicyArn=arn)["Policy"]["DefaultVersionId"]
+                doc = iam.get_policy_version(PolicyArn=arn, VersionId=ver)
+                docs.append((ap.get("PolicyName") or arn, "managed",
+                             _policy_doc(doc["PolicyVersion"].get("Document"))))
+            if not page.get("IsTruncated"):
+                break
+            marker = page.get("Marker")
+    except Exception:  # noqa: BLE001
+        return None
+
+    out: list[dict] = []
+    for name, ptype, doc in docs:
+        for st in _as_list(doc.get("Statement")):
+            if not isinstance(st, dict):
+                continue
+            if "Action" in st:
+                covers = any(_iam_glob(a, action, ignore_case=True)
+                             for a in _as_list(st["Action"]))
+            elif "NotAction" in st:
+                covers = not any(_iam_glob(a, action, ignore_case=True)
+                                 for a in _as_list(st["NotAction"]))
+            else:
+                covers = False
+            if not covers:
+                continue
+            out.append({
+                "policy":        name,
+                "type":          ptype,
+                "effect":        st.get("Effect"),
+                "resources":     [str(r) for r in _as_list(st.get("Resource"))],
+                "not_resources": [str(r) for r in _as_list(st.get("NotResource"))],
+                "has_condition": bool(st.get("Condition")),
+            })
+    return out
+
+
+def _stmt_covers_resource(st: dict, resource: str) -> bool:
+    if st["resources"]:
+        return any(_iam_glob(r, resource) for r in st["resources"])
+    if st["not_resources"]:
+        return not any(_iam_glob(r, resource) for r in st["not_resources"])
+    return False
+
+
 @recordable("probe_permission")
 def probe_permission(
     role:            str,
@@ -1429,60 +1584,165 @@ def probe_permission(
     aws_read) to evaluate identity and resource layers together — this catches
     an identity-Allow overridden by a resource-side Deny, or vice versa. The
     tool never decides which policy to fetch; the caller supplies it.
+
+    An implicitDeny from the simulator is only a measurement of a missing
+    permission when the probe itself was well-formed. It is reported with
+    conclusive=false, and the reason, when it can be an artifact of the probe:
+    no resource ARN (the simulator then tests the literal "*", which never
+    matches a statement scoped to specific resources), a malformed ARN or one
+    in another account, missing condition-context keys, or a role whose own
+    inline/managed policies grant the action on a different resource than the
+    one probed. The identity-only decision is always simulated on its own, so
+    a same-account identity Allow is never lost to the simulator's weak
+    support for resource policies on roles.
     """
     session = _make_session(profile, region)
     iam = session.client("iam")
     try:
-        role_arn = role
-        if not role.startswith("arn:"):
-            role_arn = iam.get_role(RoleName=role.split("/")[-1])["Role"]["Arn"]
-        kwargs: dict = {"PolicySourceArn": role_arn, "ActionNames": [action]}
-        if resource_arn:
-            kwargs["ResourceArns"] = [resource_arn]
+        role = (role or "").strip()
+        m = _ROLE_ARN_RE.match(role)
+        if m and m.group(3) == "role":
+            role_arn = role
+        else:
+            # Role name, path/name, or an STS assumed-role ARN as it appears in
+            # logs (arn:aws:sts::<acct>:assumed-role/<RoleName>/<session>).
+            name = m.group(4).split("/")[0] if m else role.split("/")[-1]
+            role_arn = iam.get_role(RoleName=name)["Role"]["Arn"]
+        role_name = role_arn.rsplit("/", 1)[-1]
+        role_account = (_ROLE_ARN_RE.match(role_arn) or [None, None, ""])[2]
+
+        resource = (resource_arn or "").strip()
+        rm = _RESOURCE_ARN_RE.match(resource) if resource else None
+        resource_account = (rm.group(1) or "") if rm else ""
+        probe_issues: list[str] = []
+        if not resource or resource == "*":
+            probe_issues.append(
+                "no resource ARN was given, so the simulator tested the literal "
+                "'*', which never matches a statement scoped to specific "
+                "resources")
+        elif not rm:
+            probe_issues.append(f"resource {resource!r} is not a full ARN")
+        elif resource_account and role_account and resource_account != role_account:
+            probe_issues.append(
+                f"resource ARN is in account {resource_account} but the role is in "
+                f"{role_account}; check the ARN, a cross-account call also needs "
+                "the resource policy")
+
+        base: dict = {"PolicySourceArn": role_arn, "ActionNames": [action]}
+        if resource and resource != "*":
+            base["ResourceArns"] = [resource]
+        identity = iam.simulate_principal_policy(**base).get("EvaluationResults", [])
+
         resource_policy = (resource_policy or "").strip()
+        combined = None
+        rp_error = ""
         if resource_policy:
-            # Evaluate both layers together; CallerArn anchors the principal.
-            kwargs["ResourcePolicy"] = resource_policy
-            kwargs["CallerArn"] = role_arn
-        try:
-            results = iam.simulate_principal_policy(**kwargs).get("EvaluationResults", [])
-        except Exception:  # noqa: BLE001
-            # Resource policy rejected by the simulator (malformed/unsupported)
-            # — fall back to identity-only rather than failing the probe.
-            kwargs.pop("ResourcePolicy", None); kwargs.pop("CallerArn", None)
-            resource_policy = ""
-            results = iam.simulate_principal_policy(**kwargs).get("EvaluationResults", [])
-        evaluated = [
-            {
+            try:
+                combined = iam.simulate_principal_policy(
+                    **base, ResourcePolicy=resource_policy, CallerArn=role_arn,
+                ).get("EvaluationResults", [])
+            except Exception as exc:  # noqa: BLE001
+                # Malformed policy, or the simulator refusing a role as caller.
+                rp_error = f"{type(exc).__name__}: {exc}"[:200]
+        cross_account = bool(resource_account and role_account
+                             and resource_account != role_account)
+
+        def _key(r):
+            return (r.get("EvalActionName"), r.get("EvalResourceName"))
+        comb_by_key = {_key(r): r for r in (combined or [])}
+
+        stmts = None
+        evaluated = []
+        for r in identity:
+            c = comb_by_key.get(_key(r))
+            d_id = r.get("EvalDecision")
+            d_comb = c.get("EvalDecision") if c else None
+            if "explicitDeny" in (d_id, d_comb):
+                decision = "explicitDeny"
+            elif d_comb is None:
+                decision = d_id
+            elif cross_account:
+                decision = "allowed" if (d_id == "allowed" and d_comb == "allowed") else d_comb
+            elif d_id == "allowed" or d_comb == "allowed":
+                # Same account: either layer's Allow suffices when neither
+                # denies explicitly. A combined implicitDeny next to an
+                # identity Allow is a simulator artifact, not a denial.
+                decision = "allowed"
+            else:
+                decision = "implicitDeny"
+            missing = sorted({*(r.get("MissingContextValues") or []),
+                              *((c or {}).get("MissingContextValues") or [])})
+            reasons: list[str] = []
+            conclusive = True
+            if decision == "implicitDeny":
+                reasons.extend(probe_issues)
+                if missing:
+                    reasons.append(
+                        "the simulation lacked condition-context keys "
+                        f"{missing}; a condition that needs them evaluates false "
+                        "here but may be true at runtime")
+                if stmts is None:
+                    stmts = _identity_statements(iam, role_name, action)
+                allows = [s for s in (stmts or []) if s["effect"] == "Allow"]
+                probed = r.get("EvalResourceName") or resource or "*"
+                if allows:
+                    on_probed = [s for s in allows if _stmt_covers_resource(s, probed)]
+                    if on_probed and any(s["has_condition"] for s in on_probed):
+                        reasons.append(
+                            "the role's policy grants this action on this resource "
+                            "under a condition the simulation did not satisfy")
+                    elif not on_probed:
+                        where = sorted({x for s in allows for x in
+                                        (s["resources"] or ["NotResource " + ",".join(s["not_resources"])])})
+                        reasons.append(
+                            f"the role's own policies DO allow {action} on "
+                            f"{where[:5]}; the probed resource {probed!r} did not "
+                            "match them, so this is a resource mismatch, not a "
+                            "missing permission")
+                conclusive = not reasons
+            evaluated.append({
                 "action":   r.get("EvalActionName"),
                 "resource": r.get("EvalResourceName"),
-                "decision": r.get("EvalDecision"),   # allowed | explicitDeny | implicitDeny
+                "decision": decision,   # allowed | explicitDeny | implicitDeny
+                "identity_decision": d_id,
+                **({"combined_decision": d_comb} if c else {}),
+                "conclusive": conclusive,
+                **({"inconclusive_because": reasons} if not conclusive else {}),
+                **({"missing_context_values": missing} if missing else {}),
                 "matched_statements": [
                     {
-                        "policy": m.get("SourcePolicyId"),
-                        "type":   m.get("SourcePolicyType"),
+                        "policy": mm.get("SourcePolicyId"),
+                        "type":   mm.get("SourcePolicyType"),
                     }
-                    for m in r.get("MatchedStatements", [])
+                    for mm in [*r.get("MatchedStatements", []),
+                               *((c or {}).get("MatchedStatements") or [])]
                 ],
-            }
-            for r in results
-        ]
+            })
+
         layers = ("identity + resource-based policy"
-                  if resource_policy else "identity-based policy only")
+                  if combined is not None else "identity-based policy only")
         note = (
             f"decision evaluates {layers}. "
             + ("SCPs/permission boundaries are still not simulated."
-               if resource_policy else
-               "resource-based policies and SCPs are NOT simulated here (no "
-               "resource ARN given or none attached) — an 'allowed' result can "
-               "still be denied by those layers.")
+               if combined is not None else
+               "resource-based policies and SCPs are NOT simulated here — an "
+               "'allowed' result can still be denied by those layers.")
+            + (f" Resource policy could not be simulated ({rp_error}); "
+               "identity decision shown." if rp_error else "")
+            + (" An implicitDeny marked conclusive=false is NOT evidence of a "
+               "missing permission: fix the probe (exact resource ARN) and "
+               "re-run it before claiming one."
+               if any(not e["conclusive"] for e in evaluated) else "")
         )
-        return json.dumps({
+        out = {
             "role_arn":  role_arn,
-            "resource_policy_evaluated": bool(resource_policy),
+            "resource_policy_evaluated": combined is not None,
             "results":   evaluated,
             "note":      note,
-        }, separators=(",", ":"))
+        }
+        if stmts:
+            out["identity_statements_for_action"] = stmts[:10]
+        return json.dumps(out, separators=(",", ":"))
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"[:400]})
 
@@ -1565,11 +1825,15 @@ def aws_read(
     except Exception:  # noqa: BLE001
         data = str(resp)[:4000]
 
-    return json.dumps({
+    out = {
         "service":   service,
         "operation": op_snake,
         "data":      data,
-    }, separators=(",", ":"), default=str)
+    }
+    if service.lower() == "dynamodb" and op_snake == "describe_table":
+        from cloudctl.debug.notes import DDB_ITEM_COUNT_NOTE
+        out["note"] = "Table ItemCount/TableSizeBytes are " + DDB_ITEM_COUNT_NOTE
+    return json.dumps(out, separators=(",", ":"), default=str)
 
 
 @recordable("get_dependency_graph")
@@ -1984,11 +2248,14 @@ _AGENT_TOOLS = [
                 "Deterministically test whether an IAM role is allowed to perform "
                 "an action on a resource, using the IAM policy simulator. No "
                 "traffic or logs needed — use this to CONFIRM or REFUTE a "
-                "permission hypothesis directly. When a resource ARN is supplied, "
-                "the target's resource-based policy is fetched and evaluated "
-                "together with the role's identity policy, so a deny on either "
-                "layer is caught. SCPs and permission boundaries remain outside "
-                "the simulation."
+                "permission hypothesis directly. Always pass the exact resource ARN "
+                "(region and account included): without it the simulator tests "
+                "'*', which does not match policies scoped to specific resources. "
+                "Pass resource_policy to evaluate the resource layer too. Read "
+                "each result's 'conclusive' flag: an implicitDeny with "
+                "conclusive=false is a flaw in the probe, not a missing "
+                "permission. SCPs and permission boundaries remain outside the "
+                "simulation."
             ),
             "inputSchema": {"json": {
                 "type": "object",
@@ -1998,7 +2265,7 @@ _AGENT_TOOLS = [
                     "action":       {"type": "string",
                                      "description": "IAM action to test, in service:Operation format"},
                     "resource_arn": {"type": "string",
-                                     "description": "Target resource ARN (optional; * if omitted)"},
+                                     "description": "Exact target resource ARN, e.g. arn:aws:dynamodb:<region>:<account>:table/<name>. If omitted the simulator tests '*', and an implicitDeny is then inconclusive."},
                     "resource_policy": {"type": "string",
                                      "description": "Optional: the target's resource-based policy document (fetch it with aws_read, e.g. get_resource_policy / get_bucket_policy / get_key_policy). Supplying it makes the check evaluate identity and resource layers together."},
                 },
@@ -2213,6 +2480,34 @@ _MAX_LOG_LINES_IN_CONTEXT     = 35     # was 50 — enough for pattern detection
 _MAX_TOOL_OUTPUT_CHARS        = 4500   # was 8000 — ~1100 tokens per tool result
 
 
+def _fetched_key(tool_name: str, tool_input: dict) -> str:
+    """Key for one tool result in the fetched-data corpus.
+
+    The corpus is what the grounding checks search, so every distinct call
+    needs its own key. Keying on resource_name alone gave every
+    query_metrics, tail_logs, aws_read, probe_permission and
+    get_event_timeline call the same key ("query_metrics:"), so each call
+    overwrote the one before it and the checks lost the earlier data.
+    Calls that take only resource_name/service_type keep their old key.
+    """
+    import hashlib  # noqa: PLC0415
+    resource = (
+        tool_input.get("resource_name")
+        or tool_input.get("service_type")
+        or tool_input.get("resource_hint")
+        or tool_input.get("metric_name")
+        or tool_input.get("operation")
+        or tool_input.get("role")
+        or ""
+    )
+    if set(tool_input) <= {"resource_name", "service_type"}:
+        return f"{tool_name}:{resource}"
+    digest = hashlib.sha256(
+        json.dumps(tool_input, sort_keys=True, default=str).encode()
+    ).hexdigest()[:8]
+    return f"{tool_name}:{resource}#{digest}"
+
+
 def _truncate_tool_output(result: str, tool_name: str) -> str:
     """Truncate large tool outputs to protect context window.
 
@@ -2302,7 +2597,7 @@ def debug_incident_agent(
 
     # Build 4-layer system prompt
     account_id = _get_account_id(profile, region)
-    system_prompt = build_system_prompt(account_id=account_id or None)
+    system_prompt = build_system_prompt(account_id=account_id or None, region=region)
 
     import time as _time
     from botocore.config import Config as _BotoConfig
@@ -2400,7 +2695,7 @@ def debug_incident_agent(
         try:
             parsed = json.loads(raw)
             sanitised = sanitise_fetched_data(parsed) if isinstance(parsed, dict) else parsed
-            key = f"{tool_name}:{resource_name}"
+            key = _fetched_key(tool_name, tool_input)
             # Data minimisation: only store if under the cumulative size cap
             current_size = len(json.dumps(all_fetched, default=str))
             entry_size   = len(json.dumps(sanitised, default=str))
@@ -2414,7 +2709,7 @@ def debug_incident_agent(
         return _truncate_tool_output(raw, tool_name)
 
     # Prepend any investigation hints from confirmed past patterns
-    hints = get_investigation_hints(symptom)
+    hints = get_investigation_hints(symptom, account_id=account_id or None, region=region)
     user_content = f"Investigate this incident: {symptom}"
     if hints:
         user_content += "\n\nHINTS FROM PAST INCIDENTS IN THIS ACCOUNT:\n" + "\n".join(hints)

@@ -1,4 +1,4 @@
-"""Resolution agent — Bedrock-driven IaC fix after a confirmed diagnosis.
+"""Resolution agent — model-agnostic IaC fix after a confirmed diagnosis.
 
 Flow:
   1. Receives the confirmed diagnosis dict (from debug_incident_agent)
@@ -211,8 +211,8 @@ def run(
                  root_cause, evidence, deployment_source, iac_file_hint.
     iac_root:    Absolute path to the IaC root on local disk.
     base_branch: git branch to base the fix branch on (e.g. "develop").
-    profile:     AWS profile for Bedrock auth.
-    region:      AWS region where Bedrock is called from.
+    profile:     AWS profile (used when the model provider is Bedrock).
+    region:      AWS region for a Bedrock model client.
     approve:     Optional callback (stage: str, detail: str) -> bool. Two
                  gates: "plan" before the FIRST file write (what will change,
                  where) and "push" before commit/push/PR (actual git diff +
@@ -220,20 +220,18 @@ def run(
                  the agent is told to stop and emit manual steps instead.
                  None = no gates (library/test use).
     """
-    import boto3
+    from pathlib import Path
+    from cloudctl.ai.model_providers import default_model, make_model_client
     from cloudctl.mcp.tools.resolve import (
         read_iac_file, write_iac_change, validate_change,
         git_create_branch, git_commit_push, create_pull_request,
     )
 
-    from botocore.config import Config as BotoConfig  # noqa: PLC0415
-    if profile:
-        session = boto3.Session(profile_name=profile, region_name=region)
-    else:
-        session = boto3.Session(region_name=region)
-
-    config = BotoConfig(connect_timeout=10, read_timeout=120)
-    bedrock = session.client("bedrock-runtime", region_name=region, config=config)
+    # Model-agnostic: same provider/model selection as the investigation
+    # (CLOUDCTL_MODEL_PROVIDER / CLOUDCTL_MODEL), not a hardcoded Bedrock id.
+    client = make_model_client(profile, region)
+    model_id = default_model()
+    root = Path(iac_root).resolve()
 
     user_content = json.dumps({
         "root_cause":         diagnosis.get("root_cause", ""),
@@ -253,6 +251,30 @@ def run(
                  "fix as detailed manual_steps for the operator to apply."
     })
     gates = {"plan": approve is None, "push": approve is None}   # True = passed
+    # What the TOOLS actually did. The final report is reconciled against this,
+    # never taken from the model's own claim (a model can say "success" after a
+    # failed commit, push or PR).
+    actual: dict = {"branch": "", "files_written": [], "validated": None,
+                    "pushed": False, "pr_url": "", "errors": []}
+
+    def _ok(result: str) -> tuple[bool, dict]:
+        try:
+            d = json.loads(result)
+        except (ValueError, TypeError):
+            return False, {}
+        return bool(isinstance(d, dict) and d.get("success")), d if isinstance(d, dict) else {}
+
+    def _inside_root(path: str) -> bool:
+        p = Path(path)
+        p = (p if p.is_absolute() else root / p).resolve()
+        return p == root or root in p.parents
+
+    def _outside_error(path: str) -> str:
+        return json.dumps({"error": f"{path!r} is outside the IaC root {str(root)!r}; "
+                                    "only files under --iac-root can be read or changed."})
+
+    def _iac_tool(directory: str) -> str:
+        return "cdk" if (Path(directory) / "cdk.json").exists() else "terraform"
 
     def _gate_plan(tool_input: dict) -> bool:
         if gates["plan"]:
@@ -277,59 +299,89 @@ def run(
             ).stdout
         except Exception:  # noqa: BLE001
             diff = "(git diff unavailable)"
-        validation = validate_change(directory, "terraform")
+        validation = validate_change(directory, _iac_tool(directory))
         detail = (
             f"READY TO COMMIT / PUSH / PR\n"
             f"--- git diff ---\n{diff[:4000]}\n"
             f"--- validation ---\n{validation[:1000]}"
         )
-        if '"success": true' not in validation.lower():
+        if not _ok(validation)[0]:
+            actual["errors"].append("validation failed at the push gate; nothing was pushed")
             return False   # never push an invalid change, regardless of answer
         gates["push"] = bool(approve("push", detail))
         return gates["push"]
 
     def _dispatch(tool_name: str, tool_input: dict) -> str:
-        directory = tool_input.get("directory") or iac_root
+        directory = tool_input.get("directory") or str(root)
+        if tool_name in ("read_iac_file", "write_iac_change") and not _inside_root(tool_input.get("path", "")):
+            return _outside_error(tool_input.get("path", ""))
+        if tool_name in ("validate_change", "git_create_branch", "git_commit_push",
+                         "create_pull_request") and not _inside_root(directory):
+            return _outside_error(directory)
+        path = tool_input.get("path", "")
+        if path and not Path(path).is_absolute():
+            path = str(root / path)
         if tool_name == "read_iac_file":
-            return read_iac_file(tool_input["path"])
+            return read_iac_file(path)
         if tool_name == "write_iac_change":
             if not _gate_plan(tool_input):
                 return _DECLINED
-            return write_iac_change(
-                tool_input["path"],
-                tool_input["old_content"],
-                tool_input["new_content"],
-            )
+            res = write_iac_change(path, tool_input["old_content"], tool_input["new_content"])
+            if _ok(res)[0]:
+                actual["files_written"].append(path)
+            return res
         if tool_name == "validate_change":
-            return validate_change(directory, tool_input.get("tool", "terraform"))
+            res = validate_change(directory, tool_input.get("tool") or _iac_tool(directory))
+            actual["validated"] = _ok(res)[0]
+            return res
         if tool_name == "git_create_branch":
-            return git_create_branch(
+            res = git_create_branch(
                 tool_input["branch_name"],
                 tool_input.get("base_branch", base_branch),
                 directory,
             )
+            ok, d = _ok(res)
+            if ok:
+                actual["branch"] = d.get("branch", tool_input["branch_name"])
+            else:
+                actual["errors"].append(f"git_create_branch: {d.get('error', res)[:300]}")
+            return res
         if tool_name == "git_commit_push":
             if not _gate_push(directory):
                 return _DECLINED
-            return git_commit_push(
+            res = git_commit_push(
                 tool_input["message"],
-                tool_input.get("paths", []),
+                [p if Path(p).is_absolute() else str(root / p) for p in tool_input.get("paths", [])],
                 directory,
             )
+            ok, d = _ok(res)
+            actual["pushed"] = ok
+            if not ok:
+                actual["errors"].append(f"git_commit_push: {d.get('error', res)[:300]}")
+            return res
         if tool_name == "create_pull_request":
-            if not gates["push"]:
+            if not gates["push"] or not actual["pushed"]:
                 return _DECLINED
-            return create_pull_request(
+            res = create_pull_request(
                 tool_input["title"],
                 tool_input["body"],
                 tool_input.get("base_branch", base_branch),
                 directory,
             )
+            ok, d = _ok(res)
+            if ok:
+                actual["pr_url"] = d.get("pr_url", "")
+            else:
+                actual["errors"].append(f"create_pull_request: {d.get('error', res)[:300]}")
+            return res
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
+    def _finish(claimed: dict) -> dict:
+        return _reconcile(claimed, actual)
+
     for _ in range(max_turns):
-        resp = bedrock.converse(
-            modelId="us.anthropic.claude-sonnet-4-6",
+        resp = client.converse(
+            modelId=model_id,
             system=[{"text": _RESOLUTION_SYSTEM}],
             messages=messages,
             toolConfig={"tools": _RESOLUTION_TOOLS},
@@ -342,19 +394,19 @@ def run(
             for block in msg.get("content", []):
                 if "text" in block:
                     text = block["text"].strip()
-                    # Try to extract JSON result
+                    claimed: dict | None = None
                     try:
                         m = re.search(r'\{[^{}]*"status"[^{}]*\}', text, re.DOTALL)
                         if m:
-                            return json.loads(m.group(0))
-                        # Broader match for nested objects
-                        m2 = re.search(r'\{.*"status".*\}', text, re.DOTALL)
-                        if m2:
-                            return json.loads(m2.group(0))
-                    except Exception:
-                        pass
-                    return {"status": "error", "detail": text[:500]}
-            return {"status": "error", "detail": "end_turn with no text block"}
+                            claimed = json.loads(m.group(0))
+                        else:
+                            m2 = re.search(r'\{.*"status".*\}', text, re.DOTALL)
+                            if m2:
+                                claimed = json.loads(m2.group(0))
+                    except Exception:  # noqa: BLE001
+                        claimed = None
+                    return _finish(claimed or {"status": "error", "detail": text[:500]})
+            return _finish({"status": "error", "detail": "end_turn with no text block"})
 
         if stop_reason == "tool_use":
             tool_results = []
@@ -371,4 +423,39 @@ def run(
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
 
-    return {"status": "error", "detail": f"max_turns ({max_turns}) reached without conclusion"}
+    return _finish({"status": "error", "detail": f"max_turns ({max_turns}) reached without conclusion"})
+
+
+def _reconcile(claimed: dict, actual: dict) -> dict:
+    """Build the final result from what the tools did, using the model's JSON
+    only for prose (summary, manual steps). Pure, so it is unit-testable.
+
+    success      requires a successful push AND a PR URL returned by gh.
+    manual_required is honoured only when nothing was pushed.
+    Anything else is an error that names the real failure."""
+    out = {k: v for k, v in (claimed or {}).items() if k in ("pr_summary", "manual_steps", "detail")}
+    out["branch"] = actual.get("branch", "")
+    out["files_changed"] = list(dict.fromkeys(actual.get("files_written") or []))
+    out["pr_url"] = actual.get("pr_url", "")
+    errors = list(actual.get("errors") or [])
+    status = (claimed or {}).get("status", "error")
+
+    if actual.get("pushed") and actual.get("pr_url"):
+        out["status"] = "success"
+    elif status == "manual_required" and not actual.get("pushed"):
+        out["status"] = "manual_required"
+        if out["files_changed"]:
+            out.setdefault("manual_steps", []).insert(
+                0, "Local files were edited on branch "
+                   f"{out['branch'] or '(unknown)'} but not committed: {', '.join(out['files_changed'])}")
+    else:
+        out["status"] = "error"
+        if status == "success":
+            errors.append("the model reported success, but "
+                          + ("the PR was not created" if actual.get("pushed")
+                             else "nothing was committed and pushed"))
+        out["detail"] = "; ".join(errors) or out.get("detail") or "resolution did not complete"
+    if errors and out["status"] != "error":
+        out["warnings"] = errors
+    return out
+

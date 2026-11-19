@@ -18,6 +18,8 @@ import os
 import re
 from pathlib import Path
 
+from cloudctl.ai.live_learner import drop_unknown_names, in_scope
+
 
 # ── Layer 1 — Investigation Structure ─────────────────────────────────────────
 
@@ -207,7 +209,8 @@ When done, respond ONLY with a JSON object (no markdown fences, no extra text):
 }}"""
 
 
-def build_system_prompt(account_id: str | None = None) -> str:
+def build_system_prompt(account_id: str | None = None, region: str | None = None,
+                        known_names: set[str] | None = None) -> str:
     """
     Assemble the full system prompt from all four layers.
 
@@ -226,7 +229,10 @@ def build_system_prompt(account_id: str | None = None) -> str:
                 continue
             try:
                 entry = json.loads(line)
-                for lesson in entry.get("lessons", []):
+                # Only lessons learned in this account and region.
+                if not in_scope(entry, account_id, region):
+                    continue
+                for lesson in drop_unknown_names([str(x) for x in entry.get("lessons", [])], known_names):
                     # Sanitise: limit length, reject if contains injection keywords
                     lesson = str(lesson).strip()[:200]
                     if not lesson:
@@ -268,6 +274,10 @@ def build_system_prompt(account_id: str | None = None) -> str:
                     continue
                 try:
                     entry = json.loads(line)
+                    if entry.get("region") != region:
+                        continue
+                    if not drop_unknown_names([str(entry.get("resource", ""))], known_names):
+                        continue   # names a resource not discovered in this run
                     if entry.get("type") == "hint" and entry.get("confirmed_count", 0) >= 2:
                         # Sanitise fields before injecting into system prompt
                         token    = re.sub(r'[^a-z0-9\-_ ]', '', str(entry.get('symptom_token', '')))[:60]

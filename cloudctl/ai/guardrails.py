@@ -636,8 +636,15 @@ _FAILURE_SIGNAL_PATTERNS = (
     ("http_error_status",     re.compile(r'"?status(?:_?code)?"?\s*[:=]\s*"?[45]\d\d\b', re.I)),
     ("nonzero_error_metric",  re.compile(r'"(errors?|faults?|throttl\w*|[45]xxerror\w*)"\s*:\s*[1-9]', re.I)),
     ("failed_state",          re.compile(r'"?(status|state|health\w*)"?\s*[:=]\s*"?(failed|failing|unhealthy|impaired|critical|timed[_ ]?out|timeout)\b', re.I)),
-    ("aws_error_code",        re.compile(r'\b(accessdenied\w*|throttlingexception|serviceunavailable|provisionedthroughputexceeded|resourcenotfound\w*exception|timeout\w*exception)\b', re.I)),
-    ("error_log_event",       re.compile(r'\b(traceback|exception:|\bfatal\b|panic:|segfault|oomkill\w*)\b', re.I)),
+    # ProvisionedThroughputExceeded and ServiceUnavailable take \w* because AWS
+    # reports them with an "Exception" suffix (DynamoDB's throttle error is
+    # ProvisionedThroughputExceededException); a closing \b right after the
+    # stem never matched that form.
+    ("aws_error_code",        re.compile(r'\b(accessdenied\w*|throttlingexception|serviceunavailable\w*|provisionedthroughputexceeded\w*|resourcenotfound\w*exception|timeout\w*exception)\b', re.I)),
+    # "exception:" and "panic:" end in ':', so a closing \b after them only matched
+    # when a word character followed the colon directly; "Exception: boom" never
+    # matched. They are anchored on their own instead.
+    ("error_log_event",       re.compile(r'\b(?:traceback|fatal|segfault|oomkill\w*)\b|exception:|\bpanic:', re.I)),
 )
 
 
@@ -747,8 +754,15 @@ def enforce_confidence(
     agent_output: dict,
     fetched_data: dict,
     hal_report,
+    side_claims: list | None = None,
 ) -> dict:
-    """Override agent's self-reported confidence if it's not warranted."""
+    """Override agent's self-reported confidence if it's not warranted.
+
+    side_claims: evidence items outside the root-cause chain (see
+    graph_agent._root_cause_chain). They are left out of the provenance
+    weight, so an untraceable extra cannot weaken a verdict whose root cause
+    and supporting evidence are sourced. The caller scopes hal_report the
+    same way. None keeps the old behaviour: every claim counts."""
     output   = copy.deepcopy(agent_output)
     claimed  = output.get("confidence", "MEDIUM")
     sources  = sum(1 for v in fetched_data.values() if v)
@@ -790,17 +804,20 @@ def enforce_confidence(
     # a meaningful share of the report's specific claims. This is a weight, not
     # a cap: a fully-sourced report is untouched at ANY level (HIGH included),
     # and the downgrade is relative to the claimed level, never a forced floor.
+    side = {str(c).strip() for c in (side_claims or [])}
     unsourced = [u for u in (output.get("unsourced_claims") or [])
-                 if isinstance(u, str)]
-    cited = output.get("provenance") or []
+                 if isinstance(u, str) and u.strip() not in side]
+    cited = [p for p in (output.get("provenance") or [])
+             if not (isinstance(p, dict) and str(p.get("claim", "")).strip() in side)]
     if unsourced and claimed in ("HIGH", "MEDIUM"):
         total = len(unsourced) + len(cited)
         rate = len(unsourced) / total if total else 0.0
         if rate >= 0.25:
+            scope = "root-cause" if side_claims is not None else "specific"
             output["confidence"] = {"HIGH": "MEDIUM", "MEDIUM": "LOW"}[claimed]
             output["confidence_override_reason"] = (
                 f"Confidence weakened from {claimed} to {output['confidence']}: "
-                f"{len(unsourced)} of {total} specific claim(s) could not be "
+                f"{len(unsourced)} of {total} {scope} claim(s) could not be "
                 "traced to any fetched data source (see unsourced_claims)."
             )
             return output
