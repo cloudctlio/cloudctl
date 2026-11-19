@@ -196,7 +196,8 @@ def test_run_for_agent_replay_and_disable(tmp_path, monkeypatch):
     out = run_for_agent(None, fx.REGION, _tf_root(tmp_path, state), account=fx.ACCT)
     assert out["explanation"]["causes"]
     monkeypatch.setenv("CLOUDCTL_DIFF_FIRST", "0")
-    assert run_for_agent(None, fx.REGION, None) == {}
+    off = run_for_agent(None, fx.REGION, None)
+    assert off.get("disabled") and "CLOUDCTL_DIFF_FIRST=0" in off["error"]
 
 
 def test_run_for_agent_never_raises(monkeypatch, tmp_path):
@@ -399,3 +400,103 @@ def test_render_shows_diff_first_rows(tmp_path):
         debug_cmd.console = old
     out = con.export_text()
     assert "CHANGE CHECK" in out and "not in the diagnosis above" in out and "WINDOW" in out
+
+
+# ── failures are visible, and recording never loses the result ───────────────
+
+def _fake_aws(monkeypatch, data):
+    """Stand a recording in for AWS so the record path is exercised offline."""
+    import cloudctl.debug.diff_first.live as live_mod
+    import cloudctl.mcp.tools.debug as dbg
+    monkeypatch.setattr(dbg, "_make_session", lambda *a, **k: None)
+    monkeypatch.setattr(live_mod, "AwsLive", lambda session, region: RecordedLive(data))
+
+
+def test_bad_record_path_keeps_the_result(tmp_path, monkeypatch, caplog):
+    state, data = fx.scenario("s5")
+    _fake_aws(monkeypatch, data)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("CLOUDCTL_DIFF_FIRST_RECORD", str(blocker / "sub" / "rec.json"))
+    with caplog.at_level("WARNING", logger="cloudctl.diff_first"):
+        out = run_for_agent(None, fx.REGION, _tf_root(tmp_path, state), account=fx.ACCT)
+    assert not out.get("error")
+    assert out["explanation"]["causes"]                     # checks' result kept
+    assert "could not save the diff-first recording" in out["recording_error"]
+    assert any("could not save" in r.getMessage() for r in caplog.records)
+    shown = apply_to_report({"root_cause": "x", "confidence": "HIGH"}, out)
+    assert shown["diff_first"]["ran"] is True and shown["diff_first"]["recording_error"]
+
+
+def test_record_path_creates_dirs_and_round_trips(tmp_path, monkeypatch):
+    state, data = fx.scenario("s4")
+    _fake_aws(monkeypatch, data)
+    rec = tmp_path / "runs" / "new" / "s4.diff-first.json"
+    monkeypatch.setenv("CLOUDCTL_DIFF_FIRST_RECORD", str(rec))
+    root = _tf_root(tmp_path, state)
+    first = run_for_agent(None, fx.REGION, root, account=fx.ACCT)
+    assert rec.is_file() and first["recording"] == str(rec.resolve())
+    monkeypatch.delenv("CLOUDCTL_DIFF_FIRST_RECORD")
+    monkeypatch.setenv("CLOUDCTL_DIFF_FIRST_REPLAY", str(rec))
+    again = run_for_agent(None, fx.REGION, root, account=fx.ACCT)
+    assert [c["summary"] for c in again["explanation"]["causes"]] == \
+           [c["summary"] for c in first["explanation"]["causes"]]
+
+
+def test_git_bash_paths_become_windows_paths():
+    from cloudctl.debug.diff_first.recording import msys_to_windows
+    assert msys_to_windows("/c/Users/me/runs/s1.json") == "C:/Users/me/runs/s1.json"
+    assert msys_to_windows("/cygdrive/d/x.json") == "D:/x.json"
+    assert msys_to_windows("/mnt/c/x") == "C:/x"
+    assert msys_to_windows("/tmp/x.json") == "/tmp/x.json"
+    assert msys_to_windows("C:/already/fine.json") == "C:/already/fine.json"
+
+
+def test_error_inside_checks_is_logged_and_shown(tmp_path, monkeypatch, caplog):
+    import cloudctl.debug.diff_first.run as run_mod
+    state, data = fx.scenario("s5")
+    _fake_aws(monkeypatch, data)
+
+    def boom(*a, **k):
+        raise KeyError("Arn")
+
+    monkeypatch.setattr(run_mod, "run_diff_first", boom)
+    with caplog.at_level("WARNING", logger="cloudctl.diff_first"):
+        out = run_for_agent(None, fx.REGION, _tf_root(tmp_path, state), account=fx.ACCT)
+    assert "running the checks" in out["error"] and "KeyError" in out["error"]
+    assert any("diff-first checks failed" in r.getMessage() for r in caplog.records)
+    shown = apply_to_report({"root_cause": "x", "confidence": "HIGH"}, out)
+    assert shown["diff_first"] == {"ran": False, "error": out["error"]}
+    assert shown["confidence"] == "HIGH"                    # no cap from checks that didn't run
+
+    from rich.console import Console
+    from cloudctl.commands import debug_cmd
+    con = Console(record=True, width=200)
+    old = debug_cmd.console
+    debug_cmd.console = con
+    try:
+        debug_cmd._render_agent_result(shown, fx.ACCT)
+    finally:
+        debug_cmd.console = old
+    assert "did not run" in con.export_text()
+
+
+def test_graph_result_says_when_checks_did_not_run(monkeypatch):
+    from cloudctl.ai import graph_agent as g
+    import cloudctl.mcp.tools.debug as dbg
+    final = {"final_report": {"root_cause": "worker lacks s3:PutObject", "evidence": [],
+                              "remediation_steps": [], "confidence": "MEDIUM", "severity": "HIGH"},
+             "all_fetched": {}, "hypotheses": [], "branch_results": [],
+             "diff_first": {"error": "diff-first checks failed while creating the AWS session: x"}}
+
+    class _Graph:
+        def invoke(self, arg, config):
+            return final
+
+    monkeypatch.setattr(g, "_get_graph", lambda: _Graph())
+    monkeypatch.setattr(g, "_make_bedrock", lambda *a, **k: None)
+    monkeypatch.setattr(dbg, "_get_account_id", lambda *a, **k: fx.ACCT)
+    raw, _ = g.debug_incident_graph("orders stuck", profile=None, region=fx.REGION)
+    d = json.loads(raw)
+    assert d["diff_first"]["ran"] is False
+    assert "creating the AWS session" in d["diff_first"]["error"]

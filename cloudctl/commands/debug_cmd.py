@@ -228,6 +228,13 @@ def _render_diff_first_rows(t, d: dict) -> None:
     df = d.get("diff_first") or {}
     if not df:
         return
+    if df.get("ran") is False:
+        t.add_row(Text("CHANGE CHECK"),
+                  Text(f"did not run: {df.get('error')}", style="yellow"), end_section=True)
+        return
+    if df.get("recording_error"):
+        t.add_row(Text("RECORDING"), Text(str(df["recording_error"]), style="yellow"),
+                  end_section=True)
     w = df.get("window") or {}
     if w.get("onset"):
         t.add_row(Text("WINDOW"),

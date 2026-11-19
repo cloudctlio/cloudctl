@@ -5,10 +5,34 @@ later with CLOUDCTL_DIFF_FIRST_REPLAY=<file.json> (no AWS needed)."""
 from __future__ import annotations
 
 import json
+import logging
+import os
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from cloudctl.debug.diff_first.model import Resource, iso
+
+
+log = logging.getLogger("cloudctl.diff_first")
+
+
+def normalize_path(path: str) -> Path:
+    """Make a record path usable here. On Windows, a Git Bash / MSYS path
+    (``/c/Users/me/x.json``) becomes ``C:/Users/me/x.json``; ``~`` and
+    environment variables are expanded; the result is absolute."""
+    p = os.path.expandvars(os.path.expanduser(str(path).strip().strip('"')))
+    if os.name == "nt":
+        p = msys_to_windows(p)
+    return Path(p).resolve()
+
+
+def msys_to_windows(p: str) -> str:
+    """``/c/Users/me`` (Git Bash), ``/cygdrive/c/...`` or ``/mnt/c/...`` ->
+    ``C:/Users/me``. Anything else is returned unchanged."""
+    m = re.match(r"^/(?:cygdrive/|mnt/)?([a-zA-Z])(/.*)?$", p)
+    return f"{m.group(1).upper()}:{m.group(2) or '/'}" if m else p
 
 
 class RecordingLive:
@@ -61,6 +85,18 @@ class RecordingLive:
             self.data["config_history"][resource.key] = cfg
         return cfg
 
-    def save(self) -> None:
-        with open(self.path, "w", encoding="utf-8") as fh:
-            json.dump(self.data, fh, default=str, indent=1)
+    def save(self) -> str | None:
+        """Write the recording. Best-effort: a path that can't be written is
+        logged and returned as an error string, never raised, so the checks'
+        own result is kept. Returns None on success."""
+        try:
+            target = normalize_path(self.path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, default=str, indent=1)
+            self.saved_to = str(target)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            msg = f"could not save the diff-first recording to {self.path!r}: {exc}"
+            log.warning(msg)
+            return msg

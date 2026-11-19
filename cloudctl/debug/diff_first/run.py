@@ -9,10 +9,12 @@ change that predates the incident or no longer holds all cap confidence.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -25,6 +27,8 @@ from cloudctl.debug.diff_first.live import NOT_FOUND
 from cloudctl.debug.diff_first.model import to_dt
 from cloudctl.debug.diff_first.topology import build_topology
 from cloudctl.debug.diff_first.window import METRICS, detect_anomaly, fill, incident_window, metric_queries
+
+log = logging.getLogger("cloudctl.diff_first")
 
 _CONF = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 
@@ -292,9 +296,13 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
     """Attach the checks to the agent's answer and cap confidence when the
     answer leaves a found cause out, leaves a symptom unexplained, or rests on
     a change that predates the incident or no longer holds."""
-    if not d or d.get("error") or not isinstance(report, dict):
+    if not isinstance(report, dict) or not d:
         return report
     out = dict(report)
+    if d.get("error"):
+        # Say plainly that the checks did not run, so a run can't look checked.
+        out["diff_first"] = {"ran": False, "error": d["error"]}
+        return out
     ex = d.get("explanation") or {}
     causes = ex.get("causes") or []
     unexplained = ex.get("unexplained_symptoms") or []
@@ -308,7 +316,10 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
                        for c in d.get("changes") or []
                        if c.get("status") in ("before_window", "superseded", "reverted")][-5:],
         "confidence": ex.get("confidence"),
+        "ran": True,
     }
+    if d.get("recording_error"):
+        out["diff_first"]["recording_error"] = d["recording_error"]
     if not causes and not unexplained:
         return out
     text = " ".join([str(out.get("root_cause", ""))] + [str(e) for e in out.get("evidence") or []]).lower()
@@ -341,30 +352,49 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
 def run_for_agent(profile: str | None, region: str, iac_root: str | None,
                   account: str = "", onset_override: str | None = None) -> dict:
     """Pick a live source (AWS, or a recording), run, and return a dict. Never
-    raises: a failure here must not stop the investigation."""
+    raises: a failure here must not stop the investigation. A failure is not
+    silent either: it is logged and returned as ``{"error": ...}`` so the
+    result shows the checks were skipped and why."""
     if os.environ.get("CLOUDCTL_DIFF_FIRST", "1") == "0":
-        return {}
+        return {"error": "skipped: turned off with CLOUDCTL_DIFF_FIRST=0", "disabled": True}
     budget = float(os.environ.get("CLOUDCTL_DIFF_FIRST_BUDGET_S", "90"))
+    stage = "setup"
     try:
         replay = os.environ.get("CLOUDCTL_DIFF_FIRST_REPLAY")
         if replay:
             from cloudctl.debug.diff_first.live import RecordedLive
-            with open(replay, encoding="utf-8") as fh:
+            from cloudctl.debug.diff_first.recording import normalize_path
+            stage = "reading the replay file"
+            with open(normalize_path(replay), encoding="utf-8") as fh:
                 live: Any = RecordedLive(json.load(fh))
         elif os.environ.get("CLOUDCTL_REPLAY"):
-            return {"error": "skipped: tool replay without a diff-first recording"}
+            return {"error": "skipped: tool replay without a diff-first recording", "disabled": True}
         else:
             from cloudctl.debug.diff_first.live import AwsLive
             from cloudctl.mcp.tools.debug import _make_session
+            stage = "creating the AWS session"
             live = AwsLive(_make_session(profile, region), region)
             rec_path = os.environ.get("CLOUDCTL_DIFF_FIRST_RECORD")
             if rec_path:
                 from cloudctl.debug.diff_first.recording import RecordingLive
                 live = RecordingLive(live, rec_path)
+        stage = "running the checks"
         rep = run_diff_first(live, iac_root=iac_root, account=account, region=region,
                              budget_s=budget, onset_override=onset_override)
-        if hasattr(live, "save"):
-            live.save()
-        return rep.to_dict()
+        out = rep.to_dict()
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"diff-first checks failed: {exc}"}
+        import traceback
+        where = traceback.extract_tb(exc.__traceback__)[-1]
+        msg = (f"diff-first checks failed while {stage}: {type(exc).__name__}: {exc} "
+               f"({Path(where.filename).name}:{where.lineno})")
+        log.warning(msg)
+        return {"error": msg}
+    # Saving the recording is a side job: its failure must not lose the result.
+    if hasattr(live, "save"):
+        err = live.save()
+        if err:
+            out.setdefault("notes", []).append(err)
+            out["recording_error"] = err
+        elif getattr(live, "saved_to", None):
+            out["recording"] = live.saved_to
+    return out
