@@ -2658,12 +2658,16 @@ investigated but ruled out. Each entry MUST have both a "hypothesis" and "reason
 explaining why it was not the primary cause. At least 2 alternatives are required for
 MEDIUM or HIGH confidence.
 
+root_cause_evidence lists the 0-based indexes of the evidence items the root
+cause rests on. Leave out context, ruled-out checks and side observations.
+
 Respond ONLY with this JSON object (no markdown, no extra text).
 Keep root_cause under 80 words and each evidence item under 30 words — the JSON
 must fit well within the response limit or it will be truncated and discarded:
 {{
   "root_cause": "specific — what is wrong and why it causes the observed symptom",
   "evidence": ["concrete fact from investigation 1", "concrete fact from investigation 2", ...],
+  "root_cause_evidence": [0, 1],
   "remediation_steps": ["step 1", "step 2", ...],
   "severity": "LOW | MEDIUM | HIGH | CRITICAL",
   "confidence": "LOW | MEDIUM | HIGH",
@@ -2825,6 +2829,96 @@ def _build_report_provenance(
             "quote": _quote_from(entries[best_key], best_matched[0]),
         })
     return provenance, unsourced
+
+
+
+# ── Root-cause chain: what confidence is scored on ────────────────────────────
+
+def _root_cause_chain(report: dict) -> tuple[list[str], list[str]]:
+    """Split the report's evidence into the ROOT-CAUSE CHAIN (what the root
+    cause rests on) and SIDE claims (context, ruled-out checks, extras).
+
+    Membership comes from the verdict's own structure, not keywords:
+      * an evidence item the verdict lists in root_cause_evidence (indexes or
+        exact strings) is in the chain;
+      * an evidence item that shares a specific fact token (identifier, value,
+        ARN, error code; see _salient_tokens) with the root cause is in the
+        chain, whatever the verdict declared. The model can widen the chain,
+        never narrow it below what the root cause itself repeats.
+    Everything else is a side claim. Returns (chain_evidence, side_evidence);
+    root_cause sentences are always chain and are not listed here.
+    """
+    rc = str(report.get("root_cause") or "")
+    evidence = list(dict.fromkeys(
+        e.strip() for e in (report.get("evidence") or [])
+        if isinstance(e, str) and e.strip()))
+    anchors = {t for t in _salient_tokens(rc) if not (t.isdigit() and len(t) < 3)}
+    declared: set[str] = set()
+    for ref in report.get("root_cause_evidence") or []:
+        if isinstance(ref, bool):
+            continue
+        if isinstance(ref, int) and 0 <= ref < len(evidence):
+            declared.add(evidence[ref])
+        elif isinstance(ref, str) and ref.strip() in evidence:
+            declared.add(ref.strip())
+    chain: list[str] = []
+    side: list[str] = []
+    for e in evidence:
+        (chain if e in declared or (set(_salient_tokens(e)) & anchors) else side).append(e)
+    return chain, side
+
+
+def _score_on_root_cause_chain(parsed: dict, all_fetched: dict) -> tuple[dict, object]:
+    """Confidence is earned by the root-cause chain, not by every sentence in
+    the report. Builds provenance, splits chain from side claims, runs the
+    hallucination and provenance weights on the chain only, then moves side
+    claims that could not be traced to fetched data out of `evidence` into
+    `unverified_claims`, so an unchecked extra is neither presented as fact
+    nor allowed to drag down a well-supported root cause. An untraceable
+    claim INSIDE the chain (a root-cause sentence, or evidence the root cause
+    rests on) still weakens or caps confidence exactly as before.
+
+    Returns (report, chain-scoped HallucinationReport)."""
+    from cloudctl.ai.guardrails import (
+        HallucinationReport, detect_hallucinations, enforce_confidence,
+    )
+    _prov, _unsourced = _build_report_provenance(parsed, all_fetched)
+    parsed["provenance"] = _prov
+    parsed["unsourced_claims"] = _unsourced
+
+    chain, side = _root_cause_chain(parsed)
+    side_set = set(side)
+    hal_all = detect_hallucinations(parsed, all_fetched)
+    chain_unsupported = [u for u in hal_all.unsupported
+                         if isinstance(u, str) and u.strip() not in side_set]
+    rate = (len(chain_unsupported) / len(chain)) if chain else 0.0
+    hal_chain = HallucinationReport(
+        hallucination_rate=rate,
+        verdict=("clean" if rate == 0 else "suspect" if rate < 0.3 else "hallucinated"),
+        unsupported=chain_unsupported,
+    )
+    parsed = enforce_confidence(parsed, all_fetched, hal_chain, side_claims=side)
+
+    unverified_side = [e for e in side
+                       if e in set(_unsourced)
+                       or e in {str(u).strip() for u in hal_all.unsupported}]
+    if unverified_side:
+        drop = set(unverified_side)
+        parsed["evidence"] = [e for e in (parsed.get("evidence") or [])
+                              if not (isinstance(e, str) and e.strip() in drop)]
+        parsed["unverified_claims"] = unverified_side
+    parsed["claim_chain"] = {
+        "chain_evidence": len(chain),
+        "side_evidence": len(side),
+        "unverified_side_claims": len(unverified_side),
+        "hallucination_rate_all_evidence": round(hal_all.hallucination_rate, 3),
+        "note": ("Confidence is scored on the root cause and the evidence it "
+                 "rests on (listed in root_cause_evidence, or sharing a specific "
+                 "fact with the root cause). Side claims that could not be traced "
+                 "to fetched data were moved to unverified_claims and did not "
+                 "affect confidence."),
+    }
+    return parsed, hal_chain
 
 
 # ── Observability gap: make the ABSENCE of tracing productive ─────────────────
@@ -4213,12 +4307,9 @@ def debug_incident_graph(
     # critique node may have revised root_cause/evidence after synthesis, and
     # the observation measurements were only folded into the corpus above.
     # Deterministic and cheap, so recomputing beats shipping a stale trail.
-    _prov, _unsourced = _build_report_provenance(parsed, all_fetched)
-    parsed["provenance"] = _prov
-    parsed["unsourced_claims"] = _unsourced
-
-    hal_report = detect_hallucinations(parsed, all_fetched)
-    parsed = enforce_confidence(parsed, all_fetched, hal_report)
+    # Confidence is scored on the root-cause chain; untraceable side claims are
+    # set aside as unverified instead of downgrading the whole verdict.
+    parsed, hal_report = _score_on_root_cause_chain(parsed, all_fetched)
     # Safety net: never let a "this alert is a false positive / not a real fault"
     # verdict ship at high confidence (see cap_speculative_dismissal). Fires only
     # on dismissal language; exempts a grounded misconfigured-alarm diagnosis
