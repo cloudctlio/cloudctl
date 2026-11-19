@@ -337,10 +337,20 @@ def diagnose(sid: str) -> dict:
     cmd = cctl_cmd(sid, out_json)
     log(f"{sid}: running cctl (log: {log_path.name})")
     log("  " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
+    env = {**os.environ, "AWS_REGION": REGION, "PYTHONIOENCODING": "utf-8"}
+    # Record what the diff-first checks read, for offline replay. The path is
+    # built here in Python so it is a real Windows path even when the harness
+    # is started from Git Bash (a POSIX path in the shell can't be opened by
+    # Windows Python). CCTL_DIFF_FIRST_RECORD=0 turns recording off.
+    df_rec = RUNS / f"{sid}.diff-first.json"
+    if os.environ.get("CCTL_DIFF_FIRST_RECORD") != "0":
+        env["CLOUDCTL_DIFF_FIRST_RECORD"] = str(df_rec.resolve())
+    else:
+        env.pop("CLOUDCTL_DIFF_FIRST_RECORD", None)
     start = time.time()
     with open(log_path, "w", encoding="utf-8") as fh:
         r = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                           env={**os.environ, "AWS_REGION": REGION, "PYTHONIOENCODING": "utf-8"})
+                           env=env)
     wall = round(time.time() - start, 1)
     meta = {"scenario": sid, "wall_seconds": wall, "exit_code": r.returncode, "command": cmd,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -348,7 +358,25 @@ def diagnose(sid: str) -> dict:
     log(f"{sid}: cctl finished in {wall} s (exit {r.returncode})")
     if not out_json.exists():
         log(f"{sid}: cctl wrote no JSON; see {log_path}")
+    else:
+        log(f"{sid}: {diff_first_line(out_json)}")
     return meta
+
+
+def diff_first_line(out_json: Path) -> str:
+    """One line on whether the diff-first checks ran, so a skipped run shows."""
+    try:
+        df = json.loads(out_json.read_text(encoding="utf-8")).get("diff_first")
+    except (OSError, ValueError):
+        return "diff-first: could not read the result JSON"
+    if not df:
+        return "diff-first: no diff_first block in the result (older cctl, or the run stopped early)"
+    if df.get("ran") is False:
+        return f"diff-first: DID NOT RUN: {df.get('error')}"
+    causes = "; ".join(c.get("summary", "")[:90] for c in df.get("causes") or []) or "none"
+    extra = f"; recording not saved: {df['recording_error']}" if df.get("recording_error") else ""
+    return (f"diff-first: ran ({df.get('expected_state')}), confidence {df.get('confidence')}, "
+            f"causes: {causes}{extra}")
 
 
 # ── orchestration ─────────────────────────────────────────────────────────────

@@ -86,6 +86,8 @@ Prereqs: Python 3.13, Terraform 1.9.8 (the system 0.12.28 is too old), Bedrock a
    ```
    `scenario` runs: inject, load in the background, wait for the symptom, `cloudctl debug --agent --iac-root app --json-out runs\<id>.json --verdict skip "<symptom>"`, stop load, revert, score. `python run.py cmd s1` prints the exact cctl command. cctl's output goes to `runs\<id>.log`.
 
+The harness also sets `CLOUDCTL_DIFF_FIRST_RECORD` to `runs\<id>.diff-first.json` (built in Python, so it works when started from Git Bash; `CCTL_DIFF_FIRST_RECORD=0` turns it off) and logs one line per run saying whether the diff-first checks ran, and if not, why. Replay a recording offline with `CLOUDCTL_DIFF_FIRST_REPLAY=runs\<id>.diff-first.json`.
+
 If a scenario dies midway, `python run.py revert <id>` puts the files and AWS back; `teardown` also reverts the text edits before destroying.
 
 ## Limits
