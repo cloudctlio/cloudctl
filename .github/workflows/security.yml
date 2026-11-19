@@ -24,14 +24,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13" # pyproject requires-python >= 3.13; 3.11 cannot install the package
 
       - name: Install tools
-        run: pip install bandit pip-audit safety
+        # safety is installed in its own step below: it pins filelock<4, which has
+        # open CVEs, and pip-audit should audit what cctl ships, not that pin.
+        run: pip install bandit pip-audit
 
       # ── 0. Tests + Coverage (required for SonarCloud) ─────────
       - name: Install package and test dependencies
-        run: pip install -e . pytest pytest-cov
+        # [ai] brings langgraph; without it 12 test modules fail to import.
+        run: pip install -e ".[ai]" pytest pytest-cov
 
       - name: Run tests with coverage
         run: pytest tests/ --cov=cloudctl --cov-report=xml:coverage.xml -q
@@ -66,7 +69,9 @@ jobs:
 
       # ── 5. Dependencies — Safety
       - name: Safety
-        run: safety check --json -o safety.json || true
+        run: |
+          pip install safety
+          safety check --json -o safety.json || true
 
       # ── 6. Secrets — Gitleaks
       - name: Gitleaks secret scan

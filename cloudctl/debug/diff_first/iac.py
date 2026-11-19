@@ -240,7 +240,7 @@ def _cfn_yaml_load(text: str) -> Any:
         return {name: loader.construct_mapping(node, deep=True)}
 
     _Loader.add_multi_constructor("!", _tag)
-    return yaml.load(text, Loader=_Loader)  # noqa: S506 - SafeLoader subclass
+    return yaml.load(text, Loader=_Loader)  # noqa: S506  # nosec B506 - SafeLoader subclass that only adds CFN !Ref/!GetAtt tags
 
 
 def _looks_like_template(data: Any) -> bool:

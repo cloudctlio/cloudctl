@@ -582,6 +582,28 @@ def _edited_addresses(loc: Located, edits: list[dict], problems: list[str]) -> l
 
 # ── 4. check ──────────────────────────────────────────────────────────────────
 
+_SHELL_SYNTAX = re.compile(r"[|&;<>`$(){}*?\n]")
+
+
+def _app_argv(app: str) -> list[str] | None:
+    """Turn the cdk.json ``app`` string into an argv list to run without a
+    shell, or None when it needs one (pipes, &&, redirects, variables, globs).
+    The executable is resolved on PATH so ``npx`` finds ``npx.cmd`` on Windows."""
+    import shlex  # noqa: PLC0415
+    if not app.strip() or _SHELL_SYNTAX.search(app):
+        return None
+    try:
+        argv = shlex.split(app, posix=os.name != "nt")
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    exe = shutil.which(argv[0])
+    if exe:
+        argv[0] = exe
+    return argv
+
+
 def _check(root: Path, kind: str, changed: dict[str, tuple[str, str]]) -> dict:
     if os.environ.get("CLOUDCTL_IAC_FIX_CHECK", "1") == "0":
         return {"status": "not_run", "detail": "checks turned off (CLOUDCTL_IAC_FIX_CHECK=0)"}
@@ -606,7 +628,12 @@ def _check(root: Path, kind: str, changed: dict[str, tuple[str, str]]) -> dict:
                 app = None
             if not app:
                 return {"status": "not_run", "detail": "cdk not found on PATH and cdk.json has no app"}
-            cmds = [app]
+            argv = _app_argv(str(app))
+            if argv is None:
+                return {"status": "not_run",
+                        "detail": "cdk.json app needs a shell (pipes, &&, variables); "
+                                  "install the cdk CLI so this check can run"}
+            cmds = [argv]
             label = "CDK synth (cdk.json app)"
     with tempfile.TemporaryDirectory(prefix="cctl-iacfix-") as tmp:
         work = Path(tmp) / "iac"
@@ -616,8 +643,10 @@ def _check(root: Path, kind: str, changed: dict[str, tuple[str, str]]) -> dict:
         env = {**os.environ, "CDK_OUTDIR": str(Path(tmp) / "cdk.out")}
         for cmd in cmds:
             try:
+                # Always an argv list, never a shell: the cdk.json app string is
+                # split by _app_argv, which refuses anything that needs a shell.
                 r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, timeout=240,
-                                   env=env, shell=isinstance(cmd, str))
+                                   env=env)  # nosec B603 - argv list, no shell
             except FileNotFoundError:
                 return {"status": "not_run", "detail": f"{cmd[0]} not found"}
             except subprocess.TimeoutExpired:

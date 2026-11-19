@@ -282,7 +282,7 @@ def read_template_file(path: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         import yaml
-        return yaml.load(text, Loader=_yaml_cfn_loader())
+        return yaml.load(text, Loader=_yaml_cfn_loader())  # noqa: S506  # nosec B506 - SafeLoader subclass that only adds CFN !Ref/!GetAtt tags
 
 
 def load_cdk_out(model: SystemModel, cdk_out_dir: str,

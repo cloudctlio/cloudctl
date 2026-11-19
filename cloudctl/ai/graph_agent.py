@@ -1616,7 +1616,7 @@ def _run_branch(
         # content. Small results are left alone (a reference wouldn't save).
         if len(out) > 400:
             import hashlib
-            key = hashlib.sha1(out.encode("utf-8", "replace")).hexdigest()
+            key = hashlib.sha1(out.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()
             ref = _interned.get(key)
             if ref is not None:
                 return json.dumps({"_identical_to": ref,
@@ -2561,7 +2561,7 @@ def clarify_node(state: GraphState) -> dict:
 
 # ── Node 3: synthesize ─────────────────────────────────────────────────────────
 
-_SYNTHESIZE_PROMPT = """\
+_SYNTH_A = """\
 You are an AWS incident analyst. You have received {n} independent hypothesis investigations
 of the same incident. Each branch investigated a different potential root cause.
 
@@ -2603,9 +2603,11 @@ VERDICT rules (binding):
   5. Root-cause events must precede the measured onset. Events from our own
      deployment activity before onset are not causes.
 
-""" + _INFERRED_INTERACTION_RULE + """\
+"""
+_SYNTH_B = """\
 
-""" + _IAM_DENIAL_SEMANTICS_RULE + """\
+"""
+_SYNTH_C = """\
 
 MECHANISM & FRONTIER (the honesty test — apply to your chosen cause before shipping):
   Trace the causal chain from your root cause to the REPORTED symptom, link by
@@ -2708,6 +2710,10 @@ must fit well within the response limit or it will be truncated and discarded:
   ]
 }}
 """
+# Joined in one place so Bandit sees a single expression. It flags SQL-looking
+# words in concatenated strings; this is LLM prompt text and never reaches a database.
+_SYNTHESIZE_PROMPT = (_SYNTH_A + _INFERRED_INTERACTION_RULE + _SYNTH_B  # nosec B608
+                      + _IAM_DENIAL_SEMANTICS_RULE + _SYNTH_C)  # nosec B608
 
 
 _TRACE_STRUCT = set(".:/_-")
