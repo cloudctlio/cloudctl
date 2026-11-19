@@ -2124,12 +2124,14 @@ class DebugFetcher:
                 }
                 for g in desc.get("GlobalSecondaryIndexes", [])
             ]
+            from cloudctl.debug.notes import DDB_ITEM_COUNT_NOTE
             result: dict = {
                 "table_name":   desc.get("TableName"),
                 "table_status": desc.get("TableStatus"),
                 "billing_mode": desc.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED"),
                 "item_count":   desc.get("ItemCount", 0),
                 "size_bytes":   desc.get("TableSizeBytes", 0),
+                "item_count_note": DDB_ITEM_COUNT_NOTE,
                 "key_schema":   desc.get("KeySchema", []),
                 "provisioned_throughput": {
                     "read_capacity_units":  desc.get("ProvisionedThroughput", {}).get("ReadCapacityUnits", 0),

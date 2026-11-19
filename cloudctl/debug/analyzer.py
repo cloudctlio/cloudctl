@@ -264,7 +264,7 @@ def _build_prompt(symptom: str, timeline: list[dict], context: dict) -> str:
             f"  DynamoDB {ddb_cfg.get('table_name', '—')}: "
             f"status={ddb_cfg.get('table_status')} "
             f"billing={ddb_cfg.get('billing_mode')} "
-            f"items={ddb_cfg.get('item_count')} "
+            f"items~{ddb_cfg.get('item_count')} (refreshed ~6h; not proof of recent writes) "
             f"size={ddb_cfg.get('size_bytes', 0) // 1024}KB "
             f"class={ddb_cfg.get('table_class')}"
         )
