@@ -120,6 +120,8 @@ class GraphState(TypedDict):
     discrimination: dict   # PRISM: causal category verdict before synthesis
     observation: dict      # VERDICT: measured symptom (onset, observable-now, scope)
     failure_map: list      # LOCALIZE: components observed emitting failures now
+    iac_root: str | None   # DIFF-FIRST: IaC root for the expected-state diff
+    diff_first: dict       # DIFF-FIRST: expected-state diff, window, flow, explain
 
 
 # ── Shared Bedrock client factory ──────────────────────────────────────────────
@@ -938,6 +940,29 @@ def _ensure_anchor_hypothesis(
     return hypotheses
 
 
+def diff_first_node(state: GraphState) -> dict:
+    """DIFF-FIRST: deterministic, read-only checks that run before any
+    hypothesis: expected-state diff (any IaC, or a baseline), the incident
+    window, flow along the app's wiring, and an explain-every-symptom cover.
+    Never raises; an empty or error result leaves the rest of the graph as-is."""
+    from cloudctl.debug.diff_first.run import run_for_agent
+    from cloudctl.debug.diff_first.changes import set_active_window
+    from cloudctl.debug.diff_first.model import IncidentWindow
+    d = run_for_agent(state.get("profile"), state["region"], state.get("iac_root"),
+                      account=state.get("account_id") or "")
+    w = (d or {}).get("window") or {}
+    if w.get("start"):
+        set_active_window(IncidentWindow(**{k: w.get(k) for k in
+                                            ("onset", "last_healthy", "start", "end")}))
+    return {"diff_first": d or {}}
+
+
+def _diff_first_text(state: GraphState) -> str:
+    from cloudctl.debug.diff_first.run import prompt_text
+    txt = prompt_text(state.get("diff_first") or {})
+    return f"\n\n{txt}" if txt else ""
+
+
 def triage_node(state: GraphState) -> dict:
     from cloudctl.mcp.tools.debug import _AGENT_TOOLS, list_resources
     from cloudctl.ai.guardrails import validate_tool_call, audit_log_tool_call
@@ -985,6 +1010,7 @@ def triage_node(state: GraphState) -> dict:
     # Budgeted runs prefetched the whole inventory and the dependency graph in
     # observe: seed discovery with them and show the model, so triage does not
     # spend turns enumerating the account again.
+    obs_text += _diff_first_text(state)
     inv_text = ""
     for k, v in (state.get("all_fetched") or {}).items():
         if not str(k).endswith(":prefetch") or not isinstance(v, dict):
@@ -1112,6 +1138,11 @@ def triage_node(state: GraphState) -> dict:
     # every branch investigates AROUND the failing component while sharing the
     # untested assumption that its own configuration is sound.
     hypotheses = _ensure_anchor_hypothesis(hypotheses, obs, discovered)
+
+    # DIFF-FIRST: every cause the deterministic checks found gets a branch, so
+    # a change the model did not think of is still verified.
+    from cloudctl.debug.diff_first.run import seed_hypotheses
+    hypotheses = hypotheses + seed_hypotheses(state.get("diff_first") or {}, hypotheses)
 
     b.mark("triage", time.monotonic() - _t_phase)
     return {
@@ -3360,6 +3391,7 @@ def synthesize_node(state: GraphState) -> dict:
         f"first mention and as the bare id \"E#\" when another branch cites the "
         f"same fact — both refer to the identical evidence):\n{branches_text}"
         f"{arbitration_note}"
+        f"{_diff_first_text(state)}"
     )
 
     try:
@@ -3980,6 +4012,7 @@ def _after_falsify(state: GraphState) -> str:
 def _build_graph():
     workflow = StateGraph(GraphState)
     workflow.add_node("observe",           observe_node)              # VERDICT 0
+    workflow.add_node("diff_first",        diff_first_node)           # DIFF-FIRST
     workflow.add_node("triage",            triage_node)
     workflow.add_node("investigate",       investigate_node)
     workflow.add_node("log_intelligence",  log_intelligence_node)   # PRISM A
@@ -3993,7 +4026,8 @@ def _build_graph():
     # Observe measures the symptom first; triage hypothesizes from measurement.
     # After triage: fan out in parallel to investigate + log_intelligence.
     workflow.add_edge(START,     "observe")
-    workflow.add_edge("observe", "triage")
+    workflow.add_edge("observe", "diff_first")
+    workflow.add_edge("diff_first", "triage")
     workflow.add_edge("triage",  "investigate")
     workflow.add_edge("triage",  "log_intelligence")
 
@@ -4096,6 +4130,7 @@ def debug_incident_graph(
                          # ~10 minutes invisible to logs/the survey (0 events →
                          # "cannot reproduce" on a live, ongoing incident).
     max_turns: int = 24,  # kept for interface compatibility
+    iac_root: str | None = None,
 ) -> tuple[str, dict]:
     """
     LangGraph parallel hypothesis agent.
@@ -4166,6 +4201,8 @@ def debug_incident_graph(
         "log_insights": {},
         "discrimination": {},
         "observation": {},
+        "iac_root": iac_root or _os.environ.get("CLOUDCTL_IAC_ROOT") or None,
+        "diff_first": {},
     }
     from cloudctl.mcp.tools.recorder import reset_usage_stats, usage_report
     reset_usage_stats()
@@ -4361,6 +4398,14 @@ def debug_incident_graph(
     # touch root_cause or confidence, and it never fires when traces were
     # available or the symptom is a different class.
     parsed = _maybe_add_tracing_recommendation(parsed, symptom, all_fetched)
+
+    # DIFF-FIRST: attach the deterministic checks and hold the answer to them
+    # (a found cause left out, a symptom unexplained, or a stale change blamed
+    # caps confidence). No-op when the checks did not run.
+    from cloudctl.debug.diff_first.run import apply_to_report as _df_apply
+    from cloudctl.debug.diff_first.changes import set_active_window as _df_clear
+    parsed = _df_apply(parsed, final_state.get("diff_first") or {})
+    _df_clear(None)
 
     parsed = redact_output(parsed)
 

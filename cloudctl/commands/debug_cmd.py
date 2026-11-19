@@ -222,6 +222,41 @@ def _render_explain(finding) -> None:
     console.print()
 
 
+def _render_diff_first_rows(t, d: dict) -> None:
+    """Rows for the deterministic diff-first checks: the incident window, the
+    causes they found, symptoms nothing explains, and changes ruled out."""
+    df = d.get("diff_first") or {}
+    if not df:
+        return
+    if df.get("ran") is False:
+        t.add_row(Text("CHANGE CHECK"),
+                  Text(f"did not run: {df.get('error')}", style="yellow"), end_section=True)
+        return
+    if df.get("recording_error"):
+        t.add_row(Text("RECORDING"), Text(str(df["recording_error"]), style="yellow"),
+                  end_section=True)
+    w = df.get("window") or {}
+    if w.get("onset"):
+        t.add_row(Text("WINDOW"),
+                  Text(f"last healthy {w.get('last_healthy')}  →  onset {w.get('onset')}  "
+                       f"(expected state: {df.get('expected_state') or 'none'})"),
+                  end_section=True)
+    causes = df.get("causes") or []
+    extra = d.get("additional_causes") or []
+    if causes:
+        lines = []
+        for c in causes:
+            flag = "  **(not in the diagnosis above)**" if c.get("summary") in extra else ""
+            lines.append(f"- {c.get('summary')} → explains {', '.join(c.get('explains') or [])}{flag}")
+        t.add_row(Text("CHANGE CHECK"), Markdown("\n".join(lines)), end_section=True)
+    if df.get("unexplained"):
+        t.add_row(Text("UNEXPLAINED"),
+                  Markdown("\n".join(f"- {s}" for s in df["unexplained"])), end_section=True)
+    if df.get("not_causes"):
+        t.add_row(Text("RULED OUT"),
+                  Markdown("\n".join(f"- {s}" for s in df["not_causes"])), end_section=True)
+
+
 def _render_agent_result(d: dict, account: Optional[str]) -> None:
     """Render the structured JSON from debug_incident_agent in the same table format."""
     from datetime import timezone as _tz
@@ -268,6 +303,8 @@ def _render_agent_result(d: dict, account: Optional[str]) -> None:
             Text(iac_hint),
             end_section=True,
         )
+
+    _render_diff_first_rows(t, d)
 
     evidence = d.get("evidence") or []
     # Provenance trail: under each evidence line, show the fetched-corpus key
@@ -509,6 +546,8 @@ def debug_issue(
         )
 
         console.print(f"\n[bold]Agent investigating:[/bold] {issue}")
+        import os as _os_iac  # noqa: PLC0415
+        iac_root = iac_root or _os_iac.environ.get("CLOUDCTL_IAC_ROOT") or None
 
         if reproduce:
             _enable_active_reproduction()
@@ -520,6 +559,7 @@ def debug_issue(
                 symptom=issue,
                 profile=account,
                 region=region or "us-east-1",
+                iac_root=iac_root,
             )
         else:
             with console.status("[dim]Claude is driving the investigation (3 parallel branches)...[/dim]"):
@@ -527,6 +567,7 @@ def debug_issue(
                     symptom=issue,
                     profile=account,
                     region=region or "us-east-1",
+                    iac_root=iac_root,
                 )
         d = _json.loads(raw)
 
@@ -539,8 +580,6 @@ def debug_issue(
         # on question keywords must not raise it: that added no evidence and
         # put a non-evidence line into the evidence list.
 
-        import os as _os_iac  # noqa: PLC0415
-        iac_root = iac_root or _os_iac.environ.get("CLOUDCTL_IAC_ROOT") or None
         fix = None
         if iac_root and d.get("root_cause"):
             fix = _iac_fix(d, iac_root, account, region)

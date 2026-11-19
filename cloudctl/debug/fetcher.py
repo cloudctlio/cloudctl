@@ -4393,7 +4393,11 @@ class DebugFetcher:
                     seen.add(key)
                     unique.append(ev)
             unique.sort(key=lambda e: e["time"], reverse=True)
-            return unique[:50]
+            # DIFF-FIRST: label each row against the incident window, so a
+            # change from before the last healthy point (or one a later call
+            # undid) can't pass for the cause. No-op outside an investigation.
+            from cloudctl.debug.diff_first.changes import annotate_rows
+            return annotate_rows(unique[:50])
         except Exception:  # noqa: BLE001
             return []
 
