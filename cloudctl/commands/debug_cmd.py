@@ -470,6 +470,7 @@ def debug_issue(
             # ── Resolution agent ───────────────────────────────────────────
             if resolve:
                 import os as _os  # noqa: PLC0415
+                import sys as _sys  # noqa: PLC0415
                 from cloudctl.ai.resolution_agent import run as _resolve_run  # noqa: PLC0415
 
                 root = iac_root
@@ -494,8 +495,6 @@ def debug_issue(
                                 ).strip() or "develop"
                             except (EOFError, KeyboardInterrupt):
                                 pass
-
-                    import sys as _sys  # noqa: PLC0415
 
                     def _approve(stage: str, detail: str) -> bool:
                         """Two-gate operator approval: 'plan' before any file
@@ -544,6 +543,13 @@ def debug_issue(
                             console.print(f"  - {step}")
                     else:
                         warn(f"Resolution failed: {result.get('detail', 'unknown error')}")
+                        if result.get("branch"):
+                            console.print(f"  Branch (local): {result['branch']}")
+                        if result.get("files_changed"):
+                            console.print("  Edited but not pushed: "
+                                          + ", ".join(result["files_changed"]))
+                    for w in result.get("warnings") or []:
+                        warn(w)
 
         elif verdict_value in ("n", "no", "partial"):
             if correction is not None:

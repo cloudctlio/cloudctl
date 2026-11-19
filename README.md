@@ -151,20 +151,20 @@ cloudctl debug --agent --verdict skip "..."
 
 | Command | What it does |
 |---|---|
-| `cloudctl compute list/describe/stop/start` | VMs, Lambda, Cloud Run, ECS, GKE |
+| `cloudctl compute list/describe/stop/start` | VMs, Lambda, Cloud Run, ECS, GKE (`stop`/`start` change real instances) |
 | `cloudctl storage list/describe/ls/du` | S3, Blob Storage, GCS |
 | `cloudctl database list/describe/snapshots` | RDS, Azure SQL, Cloud SQL |
 | `cloudctl network vpcs/security-groups/lb` | VPCs, NSGs, load balancers, DNS |
 | `cloudctl containers list/describe` | ECS, AKS, GKE, ECR, ACR |
 | `cloudctl iam roles/users/check` | IAM roles, users, permission checks |
-| `cloudctl security audit/public-resources` | Security posture and misconfigs |
-| `cloudctl cost summary/by-service` | Cost breakdown across clouds |
+| `cloudctl security audit/public-resources` | Security posture and misconfigs. `audit --fix` changes AWS directly, see below |
+| `cloudctl cost summary/by-service` | Cost breakdown across clouds. `by-service --fix` changes AWS directly, see below |
 | `cloudctl pipeline list/analyze` | CodePipeline, Azure DevOps, Cloud Build |
 | `cloudctl monitoring alerts/metrics` | CloudWatch, Azure Monitor, GCP Monitoring |
 | `cloudctl messaging topics/queues` | SQS/SNS, Service Bus, Pub/Sub |
 | `cloudctl backup list/status` | Backup jobs across clouds |
 | `cloudctl find <query>` | Search resources by name, tag, or type |
-| `cloudctl diff <resource>` | Detect IaC drift |
+| `cloudctl diff` | Compare which resources exist in two accounts or regions (does not read IaC or detect drift) |
 
 ### AI (requires `pip install "cctl[ai]"`)
 
@@ -215,7 +215,8 @@ Once connected, your AI client can query your cloud directly:
 - **Multi-account** — `--account prod` fuzzy-matches any profile name or account ID
 - **Multi-cloud** — `--cloud all` queries AWS + Azure + GCP in parallel
 - **AI is optional** — all CLI commands work without `cctl[ai]`; only `debug` and `ask` need it
-- **Read-only by default** — the agent's tools cannot mutate anything; the only write path is `--resolve`, which is gated behind operator approvals
+- **Read-only by default** — `cloudctl debug` and its agent cannot mutate anything; `--resolve` writes only to your local IaC repo and git, behind operator approvals
+- **Commands that change your cloud directly** — `compute stop/start`, the MCP `stop_compute`/`start_compute` tools (dry run unless `dry_run=false`), and `--fix` on `cost by-service` and `security audit`. After a per-item confirmation, `--fix` calls the cloud API itself: it can stop EC2 instances, **delete** EBS volumes and snapshots, revoke security-group rules, turn on S3 public-access blocks and deactivate IAM access keys (and the Azure/GCP equivalents). These changes are not made through your IaC, so the next `terraform apply` / `cdk deploy` may revert them or show drift
 - **Secrets stay out of context** — secret material is scrubbed from tool output before the model or your terminal sees it
 - **Crash-safe investigations** — an investigation killed mid-flight (expired credentials, Ctrl-C) resumes from its last completed step instead of starting over
 
