@@ -209,34 +209,6 @@ def get_investigation_hints(query: str) -> list[str]:
     return hints[:3]
 
 
-def best_pattern_match(query: str) -> dict | None:
-    """
-    Return the most-confirmed pattern whose symptom tokens overlap the query, or None.
-
-    Used by the agent verdict pipeline to bump confidence on recurring incidents:
-    if a pattern has been confirmed N times and matches the current symptom, the
-    model's self-rated confidence can be promoted (MEDIUM -> HIGH at N >= 3).
-    """
-    patterns     = _load_patterns()
-    query_tokens = set(_tokenise(query))
-    best         = None
-    best_score   = 0
-
-    for p in patterns:
-        overlap = len(query_tokens & set(p.get("symptom_tokens", [])))
-        if overlap == 0:
-            continue
-        # Score = overlap * confirmed_count -- prefer broad token overlap on
-        # frequently-confirmed patterns, but a single strong token match on a
-        # 10x-confirmed pattern still beats a 3-token match on a 1x pattern.
-        s = overlap * max(1, p.get("confirmed_count", 0))
-        if s > best_score:
-            best_score = s
-            best       = p
-
-    return best
-
-
 # ── Pattern extraction ─────────────────────────────────────────────────────────
 
 def _extract_pattern(fixture: IncidentFixture) -> IncidentPattern | None:
