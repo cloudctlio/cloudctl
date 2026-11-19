@@ -4236,7 +4236,8 @@ def debug_incident_graph(
     # blames one that was NOT, it is mis-localized — cap it and surface where the
     # failures actually are. No-op when the failure map is empty (silent fault).
     from cloudctl.debug.localize import enforce_localization_anchor
-    parsed = enforce_localization_anchor(parsed, final_state.get("failure_map") or [])
+    parsed = enforce_localization_anchor(parsed, final_state.get("failure_map") or [],
+                                         all_fetched)
 
     # ANCHORED CAUSAL SEARCH pillar: when ring-ordered anchor evidence exists but
     # the verdict names a cause at ring distance > 0 while the anchor itself was

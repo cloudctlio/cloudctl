@@ -91,3 +91,125 @@ def test_scan_survives_fetcher_exceptions():
         def tail_log_group(self, log_group, lines=60):
             raise RuntimeError("no access")
     assert scan_component_failures(Broken(), ["x", "y"]) == []
+
+
+# ── Upstream / downstream causes ─────────────────────────────────────────────
+# Live regression (small app): a Lambda writing to a DynamoDB table at 1 WCU.
+# The verdict correctly blamed the table's capacity; the errors surfaced on the
+# Lambda. The anchor check capped HIGH to LOW because the root cause did not
+# name the Lambda. A cause that evidence ties to the emitting component is
+# localized; a cause nothing ties to it is still capped.
+
+_LAMBDA_ERRORS = [
+    "[ERROR] ClientError: An error occurred (ProvisionedThroughputExceededException) "
+    "when calling the PutItem operation (reached max retries: 1): The level of "
+    "configured provisioned throughput for the table was exceeded.",
+    "[ERROR] Runtime.UnhandledException ProvisionedThroughputExceededException",
+    '{"level":"INFO","msg":"received order"}',
+]
+
+
+def _fmap():
+    return localize_failures({"cctl-smallapp-ingest": _LAMBDA_ERRORS})
+
+
+def test_failure_map_carries_error_identifiers():
+    fm = _fmap()
+    assert fm[0]["component"] == "cctl-smallapp-ingest"
+    assert "ProvisionedThroughputExceededException" in fm[0]["error_ids"]
+    assert "ClientError" not in fm[0]["error_ids"]          # generic wrapper
+    assert len(fm[0]["samples"]) == 2
+
+
+def test_upstream_cause_explaining_the_emitting_error_is_not_capped():
+    out = {"root_cause": "DynamoDB table cctl-smallapp-orders is provisioned at 1 WCU; "
+                         "writes exceed it and fail with ProvisionedThroughputExceededException.",
+           "confidence": "HIGH"}
+    enforced = enforce_localization_anchor(out, _fmap())
+    assert enforced["confidence"] == "HIGH"
+    assert enforced["localization"]["anchored"] is True
+    assert enforced["localization"]["linked_via"] == "error_id_in_root_cause"
+    assert "confidence_override_reason" not in enforced
+
+
+def test_upstream_cause_named_in_the_emitting_errors_is_not_capped():
+    fm = localize_failures({"orders-api": [
+        "ERROR timeout connecting to payments-db.cluster-x.us-east-1.rds.amazonaws.com:5432"]})
+    out = {"root_cause": "payments-db.cluster-x.us-east-1.rds.amazonaws.com hit max_connections.",
+           "confidence": "HIGH"}
+    enforced = enforce_localization_anchor(out, fm)
+    assert enforced["confidence"] == "HIGH"
+    assert enforced["localization"]["linked_via"] == "error_names_cause"
+
+
+def test_evidence_line_linking_emitting_component_to_cause_is_enough():
+    out = {"root_cause": "Table cctl-smallapp-orders has only 1 WCU and no auto scaling.",
+           "evidence": ["cctl-smallapp-ingest writes to cctl-smallapp-orders and its "
+                        "logs show 1,338 failed PutItem calls"],
+           "confidence": "HIGH"}
+    enforced = enforce_localization_anchor(out, _fmap())
+    assert enforced["confidence"] == "HIGH"
+    assert enforced["localization"]["linked_via"] == "evidence_links"
+
+
+def test_declared_dependency_in_emitting_component_config_is_enough():
+    out = {"root_cause": "Table cctl-smallapp-orders has only 1 WCU and no auto scaling.",
+           "confidence": "HIGH"}
+    fetched = {"get_service_config:lambda:cctl-smallapp-ingest": {
+        "environment": {"TABLE_NAME": "cctl-smallapp-orders"}}}
+    enforced = enforce_localization_anchor(out, _fmap(), fetched)
+    assert enforced["confidence"] == "HIGH"
+    assert enforced["localization"]["linked_via"] == "declared_dependency"
+    # Config of some OTHER component referencing the table is not a link.
+    other = {"get_service_config:lambda:reporting-job": {
+        "environment": {"TABLE_NAME": "cctl-smallapp-orders"}}}
+    assert enforce_localization_anchor(out, _fmap(), other)["confidence"] == "LOW"
+
+
+def test_unconnected_blame_is_still_capped():
+    out = {"root_cause": "The cognito-auth-authorizer role was detached, rejecting requests.",
+           "evidence": ["cctl-smallapp-ingest logs show ProvisionedThroughputExceededException",
+                        "cognito-auth-authorizer role policy changed yesterday"],
+           "confidence": "HIGH"}
+    fetched = {"get_service_config:lambda:cctl-smallapp-ingest": {
+        "environment": {"TABLE_NAME": "cctl-smallapp-orders"}}}
+    enforced = enforce_localization_anchor(out, _fmap(), fetched)
+    assert enforced["confidence"] == "LOW"
+    assert enforced["localization"]["anchored"] is False
+    assert "no evidence links" in enforced["confidence_override_reason"]
+
+
+def test_generic_language_error_is_not_a_link():
+    # pre_auth-shaped: a generic RuntimeError on the emitting Lambda cannot
+    # vouch for a verdict that blames a quiet authorizer.
+    fm = localize_failures({"cognito-auth-pre-auth": [
+        "[ERROR] RuntimeError: PreAuthentication check failed"]})
+    out = {"root_cause": "cognito-auth-authorizer raises RuntimeError on every call.",
+           "confidence": "HIGH"}
+    assert enforce_localization_anchor(out, fm)["confidence"] == "LOW"
+
+
+def test_plain_words_shared_with_logs_are_not_a_link():
+    fm = localize_failures({"checkout-fn": ["ERROR failed to save orders: timeout"]})
+    out = {"root_cause": "The billing-cron schedule drifted, so orders stopped.",
+           "confidence": "HIGH"}
+    assert enforce_localization_anchor(out, fm)["confidence"] == "LOW"
+
+
+def test_old_failure_map_records_without_new_fields_still_link():
+    # Recordings made before error_ids/samples existed carry only "sample".
+    fm = [{"component": "cctl-smallapp-ingest", "error_count": 3,
+           "sample": _LAMBDA_ERRORS[0]}]
+    out = {"root_cause": "cctl-smallapp-orders throttles writes: "
+                         "ProvisionedThroughputExceededException.",
+           "confidence": "HIGH"}
+    assert enforce_localization_anchor(out, fm)["confidence"] == "HIGH"
+
+
+def test_region_and_service_endpoint_are_not_a_link():
+    fm = localize_failures({"checkout-fn": [
+        "ERROR timeout calling dynamodb.us-east-1.amazonaws.com in us-east-1"]})
+    out = {"root_cause": "The us-east-1 billing-authorizer was misconfigured "
+                         "(dynamodb.us-east-1.amazonaws.com unaffected).",
+           "confidence": "HIGH"}
+    assert enforce_localization_anchor(out, fm)["confidence"] == "LOW"
