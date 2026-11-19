@@ -154,3 +154,44 @@ def test_annotate_is_metadata_only():
     out = {"root_cause": "AccessDenied everywhere", "evidence": [], "confidence": "HIGH"}
     a = annotate_failure_grounding(out, {"x": {"ok": 1}})
     assert a["confidence"] == "HIGH" and a["failure_grounding"]["observed_failure"] is False
+
+
+def test_dynamodb_throttle_exception_is_an_observed_failure():
+    # Regression: DynamoDB reports write/read throttling as
+    # ProvisionedThroughputExceededException. The aws_error_code pattern had a
+    # closing \b right after "provisionedthroughputexceeded", so the real error
+    # name (followed by "Exception") never matched, and a correct, fully-cited
+    # throttle verdict was capped to LOW by enforce_failure_grounding.
+    for line in (
+        "ProvisionedThroughputExceededException: orders",
+        "An error occurred (ProvisionedThroughputExceededException) when calling the PutItem operation",
+        "ServiceUnavailableException: try again",
+    ):
+        r = assess_observed_failure_grounding({"_evidence": [line]})
+        assert r.observed_failure and "aws_error_code" in r.signals, line
+
+
+def test_exception_and_panic_log_lines_are_observed_failures():
+    # Regression: "exception:" and "panic:" were followed by \b, which can't
+    # match between ':' and a space, so ordinary log lines never matched.
+    for line in ("Exception: connection pool exhausted",
+                 "ValueError exception: bad payload",
+                 "panic: runtime error: index out of range"):
+        r = assess_observed_failure_grounding({"_evidence": [line]})
+        assert r.observed_failure and "error_log_event" in r.signals, line
+
+
+def test_exception_count_field_is_not_an_observed_failure():
+    # The widened patterns must not fire on benign field names or zero counts.
+    r = assess_observed_failure_grounding(
+        {"query_metrics:x": {"ExceptionCount": 0, "exceptions": 0, "ProvisionedThroughput": {"WriteCapacityUnits": 5}}})
+    assert not r.observed_failure and r.signals == []
+
+
+def test_cited_dynamodb_throttle_verdict_is_not_capped():
+    out = {"root_cause": "The orders table is throttling writes at its provisioned WCU.",
+           "evidence": ["ProvisionedThroughputExceededException on PutItem to orders"],
+           "confidence": "MEDIUM"}
+    enforced = enforce_failure_grounding(out, {"tail_logs:x": {"events": [out["evidence"][0]]}})
+    assert enforced["confidence"] == "MEDIUM"
+    assert "frontier" not in enforced
