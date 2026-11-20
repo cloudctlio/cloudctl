@@ -10,7 +10,7 @@ locals {
 resource "aws_kms_key" "cp" {
   description             = "${var.name}: state table, audit bucket, images"
   enable_key_rotation     = true
-  deletion_window_in_days = 30
+  deletion_window_in_days = var.kms_deletion_window_days
 }
 
 resource "aws_kms_alias" "cp" {
@@ -24,7 +24,7 @@ resource "aws_dynamodb_table" "state" {
   billing_mode                = "PAY_PER_REQUEST"
   hash_key                    = "ns"
   range_key                   = "k"
-  deletion_protection_enabled = true
+  deletion_protection_enabled = var.deletion_protection
 
   attribute {
     name = "ns"

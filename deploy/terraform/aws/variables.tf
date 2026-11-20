@@ -82,3 +82,19 @@ variable "eks_cluster_arn" {
   description = "Cluster the CI role may describe (it deploys with helm via an EKS access entry you grant separately)."
   type        = string
 }
+
+variable "deletion_protection" {
+  description = "DynamoDB deletion protection. Keep true in production; false for a trial you will destroy."
+  type        = bool
+  default     = true
+}
+
+variable "kms_deletion_window_days" {
+  description = "Days a destroyed KMS key waits before AWS deletes it (7 to 30). It can be cancelled during that time."
+  type        = number
+  default     = 30
+  validation {
+    condition     = var.kms_deletion_window_days >= 7 && var.kms_deletion_window_days <= 30
+    error_message = "7 to 30 days."
+  }
+}

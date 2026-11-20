@@ -189,4 +189,4 @@ The model guard and adapter registry are tested.
 Not tested: no real DynamoDB, Cosmos DB, Firestore, S3, Azure Storage or GCS;
 the Dockerfile has not been built, the Helm chart has not been rendered and
 the Terraform has not been planned (only parsed); the workflow has not run.
-Those steps are for a real account.
+Those steps are for a real account. [deploy/LIVE-TEST.md](../deploy/LIVE-TEST.md) is a by-hand live check of the AWS stores (DynamoDB and S3 Object Lock), with teardown.

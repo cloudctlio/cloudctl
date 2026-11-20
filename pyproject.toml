@@ -104,9 +104,10 @@ gate = [
 # boto3 (core); Cosmos DB needs azure-cosmos; Firestore needs google-cloud-firestore.
 service = [
     "cctl[gate]",
-    "fastapi==0.118.0",
-    "uvicorn==0.37.0",
-    "PyJWT[crypto]==2.10.1",
+    "fastapi==0.162.2",
+    "starlette>=1.3.1,<2",          # fastapi allows older starlette with known CVEs; floor it
+    "uvicorn==0.54.0",
+    "PyJWT[crypto]==2.15.1",
 ]
 service-azure = ["cctl[service,gate-azure]", "azure-cosmos>=4.7,<5"]
 service-gcp = ["cctl[service,gate-gcp]", "google-cloud-firestore>=2.16,<3"]
