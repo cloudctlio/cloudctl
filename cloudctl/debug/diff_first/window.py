@@ -163,11 +163,14 @@ def detect_anomaly(series: list[tuple[datetime, float | None]], role: str,
 def incident_window(anomalies: list[Anomaly], components: list[set[str]] | None,
                     period: int, lookback_start: datetime,
                     skew_before: int = 300, skew_after: int = 120,
-                    override_onset: str | None = None) -> IncidentWindow:
+                    override_onset: str | None = None,
+                    metrics_end: datetime | None = None) -> IncidentWindow:
     """Onset = earliest current anomaly in the connected part of the app that
     holds the most anomalies; last healthy = the bucket before it. A cause must
-    sit between (last healthy - clock skew) and (onset + metric skew)."""
-    w = IncidentWindow()
+    sit between (last healthy - clock skew) and (onset + metric skew).
+    ``metrics_end`` is the last bucket the metrics cover: anything after it is
+    not visible in them, so it is recorded for the change checks."""
+    w = IncidentWindow(metrics_end=iso(metrics_end))
     if override_onset:
         onset = to_dt(override_onset)
         if onset:

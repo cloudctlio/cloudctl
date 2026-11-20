@@ -15,7 +15,7 @@ from datetime import timedelta
 
 from cloudctl.debug.diff_first.model import Candidate, Change, DriftItem, Symptom, to_dt
 from cloudctl.debug.diff_first.normalize import identifiers_in
-from cloudctl.debug.diff_first.topology import Topology, service_of_type, services_in
+from cloudctl.debug.diff_first.topology import FLOW_TYPES, Topology, service_of_type, services_in
 
 ONSET_SKEW_S = 120
 
@@ -34,7 +34,7 @@ def build_candidates(drift: list[DriftItem], changes: list[Change], window_start
             by_key_changes.setdefault(k, []).append(c)
     used_drift: set[int] = set()
     for c in changes:
-        if c.status != "candidate":
+        if c.status not in ("candidate", "after_metrics"):
             continue
         keys = [k for k in c.resource_key.split(",") if k]
         drift_here = [d for d in drift if d.resource_key in keys]
@@ -48,7 +48,8 @@ def build_candidates(drift: list[DriftItem], changes: list[Change], window_start
                     + (f"; live differs from declared on {', '.join(f['field'] for d in drift_here for f in d.fields[:4])}"
                        if drift_here else ""),
             evidence={"params": c.params, "drift": [d.to_dict() for d in drift_here],
-                      "holds": c.reason, "event": c.event_name}))
+                      "holds": c.reason, "event": c.event_name,
+                      "after_metrics": c.status == "after_metrics"}))
     for d in drift:
         if id(d) in used_drift:
             continue
@@ -80,12 +81,51 @@ def _changed_values(c: Candidate) -> list:
     return vals
 
 
+def _settings(c: Candidate) -> dict:
+    params = c.evidence.get("params") or {}
+    if not isinstance(params, dict):
+        return {}
+    from cloudctl.debug.diff_first.changes import _value_keys
+    return _value_keys(params)
+
+
+_OFF_WORDS = {"false", "disabled", "disabling", "inactive", "off", "paused", "stopped"}
+
+
+def _switches_off(c: Candidate) -> bool:
+    """True when every value the candidate changed is an on/off switch now set
+    to off (Enabled=false, State=DISABLED). Field names only, any service."""
+    seen = False
+    for d in c.evidence.get("drift") or []:
+        for f in d.get("fields") or []:
+            leaf = str(f.get("field", "")).split(".")[-1].lower()
+            if leaf not in ("enabled", "state", "status"):
+                return False
+            if str(f.get("live")).lower() not in _OFF_WORDS:
+                return False
+            seen = True
+    params = c.evidence.get("params") or {}
+    vals = {k.split(".")[-1].lower(): v for k, v in params.items()
+            if not k.lower().endswith(("name", "arn", "id", "uuid", "url"))} if isinstance(params, dict) else {}
+    for k, v in vals.items():
+        if k not in ("enabled", "state", "status"):
+            return False
+        if str(v).lower() not in _OFF_WORDS:
+            return False
+        seen = True
+    return seen
+
+
 def explains(c: Candidate, s: Symptom, topo: Topology) -> str:
     """'' when it doesn't; else how: direct | link | repointed."""
     t, onset = to_dt(c.time), to_dt(s.onset)
     if t and onset and t > onset + timedelta(seconds=ONSET_SKEW_S):
         return ""
     keys = set(filter(None, c.resource_key.split(",")))
+    if s.kind == "errors_up" and keys and all(topo.is_connector(k) for k in keys) and _switches_off(c):
+        # A connector switched off (a disabled trigger or rule) stops work from
+        # arriving; it raises no errors anywhere, so it can't explain an error rise.
+        return ""
     if keys & set(s.scope):
         return "direct"
     vals = _changed_values(c)
@@ -102,8 +142,55 @@ def explains(c: Candidate, s: Symptom, topo: Topology) -> str:
 
 _STRENGTH = {"direct": 3, "link": 2, "repointed": 1}
 
+# How close to the end of the metrics a fix has to land for the metrics to still
+# be showing the symptom it fixed (CloudWatch fills its last few points late).
+FIX_GRACE_S = 300
+
+
+def mark_may_be_over(symptoms: list[Symptom], changes: list[Change], cands: list[Candidate],
+                     drift: list[DriftItem], read_keys: set[str], metrics_end: str | None,
+                     topo: Topology) -> None:
+    """Flag symptoms a later change has probably already fixed.
+
+    A symptom may be over when, after it began and close to where the metrics
+    end, a change touched something in its scope, live config there now matches
+    what is declared, and no drifted resource explains the symptom. That is
+    what a revert or a fix looks like; the lagging metrics still show what came
+    before it. Such a symptom is still reported, but a diagnosis need not
+    explain it. Needs a declared state to compare with: with none, nothing is
+    flagged."""
+    m_end = to_dt(metrics_end)
+    if not m_end or not read_keys:
+        return
+    drifted = {d.resource_key for d in drift}
+    drift_cands = [c for c in cands if "drift" in c.kind]
+    for s in symptoms:
+        onset = to_dt(s.onset)
+        if not onset:
+            continue
+        scope = set(s.scope) | {s.node}
+        for c in changes:
+            t = to_dt(c.time)
+            if c.error_code or not c.resource_key or not t or t <= onset:
+                continue
+            if t < m_end - timedelta(seconds=FIX_GRACE_S):
+                continue
+            keys = set(filter(None, c.resource_key.split(",")))
+            hit = keys & scope
+            if not hit or not hit <= read_keys or hit & drifted:
+                continue
+            if any(explains(dc, s, topo) for dc in drift_cands):
+                break
+            s.may_be_over = (f"{c.event_name} on {c.resource_name} at {c.time} came after this "
+                             f"symptom began and live config there matches what is declared; the "
+                             f"metrics end at {metrics_end}, so this may already be over")
+            break
+
 
 def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology) -> dict:
+    # A symptom that a later change may already have fixed is reported, not required.
+    over = [s for s in symptoms if s.may_be_over]
+    symptoms = [s for s in symptoms if not s.may_be_over]
     cover_map: dict[str, dict[str, str]] = {}      # cand id -> {symptom id: how}
     for c in cands:
         cover_map[c.id] = {s.id: how for s in symptoms if (how := explains(c, s, topo))}
@@ -126,6 +213,14 @@ def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology)
     alternatives = [c for c in cands if c.id not in chosen_ids and cover_map[c.id]]
     idle = [c for c in cands if not cover_map[c.id]]
     unexplained = [s for s in symptoms if s.id in remaining]
+    # Leads no current metric symptom can place: changes newer than the metrics,
+    # and live state that differs from what's declared on something that moves
+    # work. The metrics lag, so these are exactly what a fresh fault looks like.
+    # An action that sets nothing (a purge, a restart) is not a configuration lead.
+    newer = [c for c in idle if c.evidence.get("after_metrics")
+             and (c.evidence.get("drift") or _settings(c) or str(c.evidence.get("event", "")).startswith("Delete"))]
+    unplaced = [c for c in idle if "drift" in c.kind and c not in newer
+                and any(topo.type_of(k) in FLOW_TYPES for k in c.resource_key.split(",") if k)]
 
     if not symptoms:
         conf, why = "UNKNOWN", "no metric showed a current anomaly, so there is nothing to explain yet"
@@ -143,6 +238,9 @@ def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology)
         "alternatives": [{**c.to_dict(), "explains": cover_map[c.id]} for c in alternatives],
         "changes_explaining_nothing": [c.to_dict() for c in idle],
         "unexplained_symptoms": [s.to_dict() for s in unexplained],
+        "may_be_over": [s.to_dict() for s in over],
+        "newer_than_metrics": [c.to_dict() for c in newer],
+        "unplaced_drift": [c.to_dict() for c in unplaced],
         "confidence": conf,
         "confidence_reason": why,
     }

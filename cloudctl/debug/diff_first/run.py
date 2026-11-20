@@ -20,7 +20,7 @@ from typing import Any
 
 from cloudctl.debug.diff_first.changes import classify, iac_commits, to_changes
 from cloudctl.debug.diff_first.drift import compute_drift
-from cloudctl.debug.diff_first.explain import build_candidates, explain_all
+from cloudctl.debug.diff_first.explain import build_candidates, explain_all, mark_may_be_over
 from cloudctl.debug.diff_first.flow import build_symptoms
 from cloudctl.debug.diff_first.iac import BaselineAdapter, load_expected_state
 from cloudctl.debug.diff_first.live import NOT_FOUND
@@ -126,7 +126,7 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
             if a:
                 anomalies.append(a)
     window = incident_window(anomalies, topo.components(), period, start,
-                             override_onset=onset_override)
+                             override_onset=onset_override, metrics_end=metric_end)
     rep.window = window.to_dict()
 
     # 3. no IaC: the last-known-good snapshot at the last healthy time
@@ -178,8 +178,11 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
     cands, context = build_candidates(drift, changes, window.start, topo)
     rep.drift = [d.to_dict() for d in drift]
     rep.context = context
+    read_keys = {k for k, v in configs.items() if v is not NOT_FOUND} if expected.resources else set()
+    mark_may_be_over(symptoms, changes, cands, drift, read_keys, window.metrics_end, topo)
+    rep.symptoms = [s.to_dict() for s in symptoms]
     expl = explain_all(symptoms, cands, topo)
-    for group in ("causes", "alternatives"):
+    for group in ("causes", "alternatives", "newer_than_metrics", "unplaced_drift"):
         for c in expl[group]:
             c["match_names"] = match_names(c["resource_key"], resources)
     rep.explanation = expl
@@ -228,39 +231,69 @@ def prompt_text(d: dict, max_chars: int = 3500) -> str:
              f"- Expected state: {d.get('expected_kind')} ({d.get('resources')} resources)"
              + (f"; {d['expected_unavailable']}" if d.get("expected_unavailable") else ""),
              f"- Incident window: last healthy {w.get('last_healthy')}, onset {w.get('onset')} "
-             f"({w.get('method')}). Only changes between these can be the cause."]
+             f"({w.get('method')}). Only changes between these can be the cause, except changes "
+             "newer than the metrics (below)."]
+    if w.get("metrics_end"):
+        lines.append(f"- The metrics end at {w['metrics_end']} (CloudWatch lags). A fault newer than "
+                     "that does not show in them yet; what they show may be an earlier problem.")
     for s in d.get("symptoms") or []:
-        lines.append(f"- Symptom {s['id']} ({s['kind']}): {s['detail']}")
+        if s.get("may_be_over"):
+            lines.append(f"- Symptom {s['id']} ({s['kind']}), MAY BE OVER: {s['detail']}. "
+                         f"{s['may_be_over']}")
+        else:
+            lines.append(f"- Symptom {s['id']} ({s['kind']}): {s['detail']}")
     for c in ex.get("causes") or []:
         lines.append(f"- CAUSE CANDIDATE {c['id']}: {c['summary']} -> explains {', '.join(c['explains'])}")
     for c in ex.get("alternatives") or []:
         lines.append(f"- Also consistent {c['id']}: {c['summary']} -> {', '.join(c['explains'])}")
     for s in ex.get("unexplained_symptoms") or []:
         lines.append(f"- UNEXPLAINED {s['id']}: {s['detail']} (keep looking)")
-    dropped = [c for c in d.get("changes") or [] if c.get("status") in ("before_window", "superseded", "reverted")]
-    for c in dropped[-6:]:
-        lines.append(f"- NOT a cause: {c['event_name']} on {c['resource_name']} at {c['time']}: {c['reason']}")
-    for n in (d.get("notes") or [])[:4]:
-        lines.append(f"- Note: {n}")
-    lines.append("Rules: your answer must explain EVERY symptom above, each cause must come "
-                 "before the symptom it explains, and more than one cause is allowed. Do not "
-                 "blame a change listed as NOT a cause.")
-    text = "\n".join(lines)
-    return text if len(text) <= max_chars else text[:max_chars - 20] + "\n- (truncated)"
+    for c in ex.get("newer_than_metrics") or []:
+        lines.append(f"- NEWER THAN THE METRICS {c['id']}: {c['summary']} (its effect can't show "
+                     "yet; check it directly)")
+    for c in ex.get("unplaced_drift") or []:
+        lines.append(f"- LIVE DIFFERS FROM DECLARED {c['id']}: {c['summary']} (on something that "
+                     "moves work, and no current metric explains it: it may be a fault too new "
+                     "to show; check it directly)")
+    dropped = [c for c in d.get("changes") or []
+               if c.get("status") in ("before_window", "superseded", "reverted", "restored")]
+    not_causes = [f"- NOT a cause: {c['event_name']} on {c['resource_name']} at {c['time']}: {c['reason']}"
+                  for c in dropped[-6:]]
+    notes = [f"- Note: {n}" for n in (d.get("notes") or [])[:4]]
+    rules = ("Rules: your answer must explain every CURRENT symptom above (one marked MAY BE "
+                 "OVER need not be explained), each cause must come before the symptom it "
+                 "explains, and more than one cause is allowed. Check every item marked NEWER "
+                 "THAN THE METRICS or LIVE DIFFERS FROM DECLARED: either name it as a cause or "
+                 "say why it is not one. Do not blame a change listed as NOT a cause.")
+    # The rules and the leads matter most: drop context lines before cutting them.
+    while not_causes or notes:
+        if len("\n".join(lines + not_causes + notes + [rules])) <= max_chars:
+            break
+        notes.pop() if notes else not_causes.pop(0)
+    head = "\n".join(lines + not_causes + notes)
+    room = max_chars - len(rules) - 1
+    if len(head) > room:
+        head = head[:max(0, room - 16)] + "\n- (truncated)"
+    return head + "\n" + rules
 
 
 def seed_hypotheses(d: dict, existing: list[dict], limit: int = 2) -> list[dict]:
     """One hypothesis per cause candidate the model's hypotheses don't already target."""
     out: list[dict] = []
     blob = json.dumps(existing).lower()
-    for c in ((d or {}).get("explanation") or {}).get("causes") or []:
+    ex = (d or {}).get("explanation") or {}
+    for c in (ex.get("causes") or []) + (ex.get("newer_than_metrics") or []) \
+            + (ex.get("unplaced_drift") or []):
         names = [n for n in c.get("match_names") or [] if n]
         if any(n.lower() in blob for n in names):
             continue
         name = names[0] if names else c["resource_key"]
         out.append({
             "service": name,
-            "reason": f"diff-first check: {c['summary']}; it explains symptoms {', '.join(c['explains'])}",
+            "reason": (f"diff-first check: {c['summary']}; it explains symptoms {', '.join(c['explains'])}"
+                       if c.get("explains") else
+                       f"diff-first check: {c['summary']}; too new for the metrics or not placed by "
+                       "them, so check it directly"),
             "focus": f"{name} — confirm this change/drift and that it explains the observed symptoms",
             "predictions": [{
                 "if_true": f"{name}'s live configuration still shows the change, and the symptoms began after it",
@@ -314,25 +347,38 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
         "unexplained": [f"{s['id']}: {s['detail']}" for s in unexplained],
         "not_causes": [f"{c['event_name']} on {c['resource_name']} at {c['time']}: {c['reason']}"
                        for c in d.get("changes") or []
-                       if c.get("status") in ("before_window", "superseded", "reverted")][-5:],
+                       if c.get("status") in ("before_window", "superseded", "reverted", "restored")][-5:],
         "confidence": ex.get("confidence"),
         "ran": True,
     }
+    leads = (ex.get("newer_than_metrics") or []) + (ex.get("unplaced_drift") or [])
+    if leads:
+        out["diff_first"]["unchecked_leads"] = [c["summary"] for c in leads]
+    over = [s for s in d.get("symptoms") or [] if s.get("may_be_over")]
+    if over:
+        out["diff_first"]["may_be_over"] = [f"{s['id']}: {s['detail']}" for s in over]
     if d.get("recording_error"):
         out["diff_first"]["recording_error"] = d["recording_error"]
+    text = " ".join([str(out.get("root_cause", ""))] + [str(e) for e in out.get("evidence") or []]).lower()
+    ignored = [c for c in leads if not _mentioned(c.get("match_names") or [], text)]
+    if ignored:
+        # Too new for the metrics, or live differs from declared on something
+        # that moves work: the answer must at least look at it.
+        _cap(out, "MEDIUM", "the diagnosis does not address a lead the metrics can't place yet: "
+                            + "; ".join(c["summary"] for c in ignored))
+        out["additional_causes"] = [c["summary"] for c in ignored]
     if not causes and not unexplained:
         return out
-    text = " ".join([str(out.get("root_cause", ""))] + [str(e) for e in out.get("evidence") or []]).lower()
     root = str(out.get("root_cause", "")).lower()
     missed = [c for c in causes if not _mentioned(c.get("match_names") or [], text)]
     if causes and len(missed) == len(causes):
         _cap(out, "LOW", "diff-first checks found a cause the diagnosis does not mention: "
                          + "; ".join(c["summary"] for c in missed))
-        out["additional_causes"] = [c["summary"] for c in missed]
+        out["additional_causes"] = out.get("additional_causes", []) + [c["summary"] for c in missed]
     elif missed:
         _cap(out, "MEDIUM", "the diagnosis leaves out a cause the diff-first checks found: "
                             + "; ".join(c["summary"] for c in missed))
-        out["additional_causes"] = [c["summary"] for c in missed]
+        out["additional_causes"] = out.get("additional_causes", []) + [c["summary"] for c in missed]
     if unexplained:
         _cap(out, "MEDIUM", f"{len(unexplained)} observed symptom(s) are not explained by any "
                             "cause found; the search is not finished")
@@ -350,7 +396,8 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
 # ── Entry point used by the agent ────────────────────────────────────────────
 
 def run_for_agent(profile: str | None, region: str, iac_root: str | None,
-                  account: str = "", onset_override: str | None = None) -> dict:
+                  account: str = "", onset_override: str | None = None,
+                  budget_s: float | None = None) -> dict:
     """Pick a live source (AWS, or a recording), run, and return a dict. Never
     raises: a failure here must not stop the investigation. A failure is not
     silent either: it is logged and returned as ``{"error": ...}`` so the
@@ -358,6 +405,8 @@ def run_for_agent(profile: str | None, region: str, iac_root: str | None,
     if os.environ.get("CLOUDCTL_DIFF_FIRST", "1") == "0":
         return {"error": "skipped: turned off with CLOUDCTL_DIFF_FIRST=0", "disabled": True}
     budget = float(os.environ.get("CLOUDCTL_DIFF_FIRST_BUDGET_S", "90"))
+    if budget_s is not None:
+        budget = min(budget, budget_s)
     stage = "setup"
     try:
         replay = os.environ.get("CLOUDCTL_DIFF_FIRST_REPLAY")
