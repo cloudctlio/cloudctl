@@ -164,7 +164,12 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
                     cfg = None
                 if cfg is not None:
                     configs[k] = cfg
-    classify(changes, window, {k: v for k, v in configs.items() if v is not NOT_FOUND})
+    # Resources read live that match what is declared: a change on one of them
+    # left nothing behind that differs from the IaC.
+    drifted = {d.resource_key for d in drift}
+    in_line = ({k for k, v in configs.items() if v is not NOT_FOUND and k not in drifted}
+               if expected.resources else None)
+    classify(changes, window, {k: v for k, v in configs.items() if v is not NOT_FOUND}, in_line)
     rep.changes = [c.to_dict() for c in changes if c.resource_key][-60:]
     rep.iac_commits = [c.to_dict() for c in iac_commits(iac_root, to_dt(window.start), to_dt(window.end))]
 
@@ -182,7 +187,8 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
     mark_may_be_over(symptoms, changes, cands, drift, read_keys, window.metrics_end, topo)
     rep.symptoms = [s.to_dict() for s in symptoms]
     expl = explain_all(symptoms, cands, topo)
-    for group in ("causes", "alternatives", "newer_than_metrics", "unplaced_drift"):
+    for group in ("causes", "alternatives", "newer_than_metrics", "unplaced_drift",
+                  "likely_reverts", "one_off_actions"):
         for c in expl[group]:
             c["match_names"] = match_names(c["resource_key"], resources)
     rep.explanation = expl
@@ -255,6 +261,14 @@ def prompt_text(d: dict, max_chars: int = 3500) -> str:
         lines.append(f"- LIVE DIFFERS FROM DECLARED {c['id']}: {c['summary']} (on something that "
                      "moves work, and no current metric explains it: it may be a fault too new "
                      "to show; check it directly)")
+    for c in ex.get("likely_reverts") or []:
+        lines.append(f"- LIKELY A REVERT {c['id']}: {c['summary']} -> fits {', '.join(c['explains'])} "
+                     "on timing, but it puts back earlier values and live now matches what is "
+                     "declared. Blame it only if a check shows the values it put back are wrong.")
+    for c in ex.get("one_off_actions") or []:
+        lines.append(f"- ONE-OFF ACTION {c['id']}: {c['summary']} -> fits {', '.join(c['explains'])} "
+                     "on timing, but it set no settings and left config as declared, so it can't "
+                     "keep a symptom going.")
     dropped = [c for c in d.get("changes") or []
                if c.get("status") in ("before_window", "superseded", "reverted", "restored")]
     not_causes = [f"- NOT a cause: {c['event_name']} on {c['resource_name']} at {c['time']}: {c['reason']}"
@@ -264,7 +278,9 @@ def prompt_text(d: dict, max_chars: int = 3500) -> str:
                  "OVER need not be explained), each cause must come before the symptom it "
                  "explains, and more than one cause is allowed. Check every item marked NEWER "
                  "THAN THE METRICS or LIVE DIFFERS FROM DECLARED: either name it as a cause or "
-                 "say why it is not one. Do not blame a change listed as NOT a cause.")
+                 "say why it is not one. Do not blame a change listed as NOT a cause. Errors "
+                 "or log lines dated before the last healthy point come from an earlier state "
+                 "and are not evidence of the current fault.")
     # The rules and the leads matter most: drop context lines before cutting them.
     while not_causes or notes:
         if len("\n".join(lines + not_causes + notes + [rules])) <= max_chars:
@@ -354,6 +370,9 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
     leads = (ex.get("newer_than_metrics") or []) + (ex.get("unplaced_drift") or [])
     if leads:
         out["diff_first"]["unchecked_leads"] = [c["summary"] for c in leads]
+    for group in ("likely_reverts", "one_off_actions"):
+        if ex.get(group):
+            out["diff_first"][group] = [c["summary"] for c in ex[group]]
     over = [s for s in d.get("symptoms") or [] if s.get("may_be_over")]
     if over:
         out["diff_first"]["may_be_over"] = [f"{s['id']}: {s['detail']}" for s in over]

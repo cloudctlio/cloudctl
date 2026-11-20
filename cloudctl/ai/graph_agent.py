@@ -943,6 +943,7 @@ def _ensure_anchor_hypothesis(
 
 _DIFF_FIRST_KEY = "diff_first"
 _POST_PROBE_S = 30.0
+_CEILING_POLL_S = 5.0     # how often the run's deadline is checked
 # Set when the outer ceiling abandons a graph run: the command can then exit
 # without waiting for leftover worker threads (see debug_cmd).
 _ABANDONED = threading.Event()
@@ -4251,6 +4252,7 @@ def debug_incident_graph(
     run_budget = _budget_mod.RunBudget.from_env()
     _budget_mod.register(session_id, run_budget)
     _ceiling_s = _budget_mod.ceiling_s(run_budget)
+    _ceiling_at = time.monotonic() + _ceiling_s
 
     initial_state = None if resume_thread else {
         "symptom": symptom,
@@ -4307,11 +4309,20 @@ def debug_incident_graph(
                 box.put((False, exc))
 
         _threading.Thread(target=_target, daemon=True, name="cctl-graph").start()
-        try:
-            ok, value = box.get(timeout=_ceiling_s)
-        except _queue.Empty:
-            _stop_reason["why"] = f"exceeded the {_ceiling_s}s time ceiling"
-            return None
+        # One deadline for the whole run, the resume after a clarify question
+        # included, checked against the clock every few seconds. A single long
+        # wait is not enough: on Windows a wait's timeout stops counting while
+        # the machine sleeps, and a resume would otherwise get a fresh ceiling.
+        while True:
+            left = _ceiling_at - time.monotonic()
+            if left <= 0:
+                _stop_reason["why"] = f"exceeded the {_ceiling_s}s time ceiling"
+                return None
+            try:
+                ok, value = box.get(timeout=min(_CEILING_POLL_S, left))
+                break
+            except _queue.Empty:
+                continue
         if ok:
             return value
         if isinstance(value, BudgetExceededError):
@@ -4324,6 +4335,29 @@ def debug_incident_graph(
         raise value
 
     final_state = _invoke_bounded(initial_state)
+    if final_state is not None and final_state.get("__interrupt__"):
+        # Human-in-the-loop: clarify_node may interrupt when no hypothesis
+        # survived. Prompt the operator on a real terminal and resume from the
+        # checkpoint; otherwise resume with an empty answer (no-op). The resume
+        # runs under the same deadline; if it breaches, report as below.
+        from langgraph.types import Command
+        answer = ""
+        try:
+            intr = final_state["__interrupt__"]
+            payload = intr[0].value if isinstance(intr, (list, tuple)) else getattr(intr, "value", {})
+            question = (payload or {}).get("question", "Additional context?")
+            import sys as _sys
+            if _sys.stdin.isatty():
+                print(f"\n[agent] {question}")
+                _asked = time.monotonic()
+                try:
+                    answer = input("> ").strip()
+                finally:
+                    # Time a person spends answering is not the agent's time.
+                    _ceiling_at += time.monotonic() - _asked
+        except Exception:  # noqa: BLE001
+            answer = ""
+        final_state = _invoke_bounded(Command(resume=answer))
     if final_state is None:
         # Ceiling or budget breached. Stop the abandoned worker first: every
         # node checks this flag, so it stops calling the model and AWS instead
@@ -4350,26 +4384,6 @@ def debug_incident_graph(
         })
         _budget_mod.unregister(session_id)
         return json.dumps(report), checkpointed.get("all_fetched", {}) or {}
-
-    # Human-in-the-loop: clarify_node may interrupt when no hypothesis
-    # survived. Prompt the operator on a real terminal and resume from the
-    # checkpoint; otherwise resume with an empty answer (no-op).
-    if final_state.get("__interrupt__"):
-        from langgraph.types import Command
-        answer = ""
-        try:
-            intr = final_state["__interrupt__"]
-            payload = intr[0].value if isinstance(intr, (list, tuple)) else getattr(intr, "value", {})
-            question = (payload or {}).get("question", "Additional context?")
-            import sys as _sys
-            if _sys.stdin.isatty():
-                print(f"\n[agent] {question}")
-                answer = input("> ").strip()
-        except Exception:  # noqa: BLE001
-            answer = ""
-        resumed = _invoke_bounded(Command(resume=answer))
-        if resumed is not None:
-            final_state = resumed
 
     parsed = final_state["final_report"]
     all_fetched = final_state.get("all_fetched", {})

@@ -25,14 +25,21 @@ def series(fn, born=None):
         out.append([t(ago), round(max(fn(ago), 0.0), 3)])
     return out
 
-def build(last="s5", deploy_ago=60, inj_ago=2.5):
+def build(last="s5", deploy_ago=60, inj_ago=2.5, run3=False):
     """(terraform state, RecordedLive data) for a run started ``inj_ago``
-    minutes after the last scenario's fault was injected."""
+    minutes after the last scenario's fault was injected.
+
+    ``run3`` matches live run 3 more closely: the s4 load hit the Lambda
+    concurrency limit, so the api returned 5xx all through it, and the s3
+    revert and its queue purge landed seconds after that load began."""
     # load windows (from_ago, to_ago, profile)
     if last == "s5":
         loads = {"s1": (55, 46), "s3": (44, 35), "s4": (33, 4), "s5": (inj_ago, 0)}
     else:  # s4 is the last scenario
         loads = {"s1": (55, 46), "s3": (44, 35), "s4": (inj_ago, 0)}
+    if run3 and last == "s5":
+        # healthy traffic between s3's revert and the s4 load
+        loads.update({"s3": (44, 37), "gap": (37, 33.01)})
     def in_load(ago, sid):
         a, b = loads.get(sid, (None, None))
         return a is not None and b <= ago <= a
@@ -41,7 +48,10 @@ def build(last="s5", deploy_ago=60, inj_ago=2.5):
     rps = 6
     def api_count(ago): return rps * 60 if active(ago) else 0
     def post(ago): return 0.6 * api_count(ago)
-    def api_5xx(ago): return post(ago) if in_load(ago, "s3") else 0
+    def api_5xx(ago):
+        if in_load(ago, "s3"): return post(ago)
+        # run 3: the api stayed at the concurrency limit from the s4 load on
+        return 0.3 * post(ago) if run3 and (in_load(ago, "s4") or in_load(ago, "s5")) else 0
     def q_sent(ago): return 0 if in_load(ago, "s3") else post(ago)
     def w_inv(ago):
         if in_load(ago, "s5"): return 0
@@ -104,13 +114,13 @@ def build(last="s5", deploy_ago=60, inj_ago=2.5):
         ev(45, "PurgeQueue", "sqs.amazonaws.com", {"queueUrl": fx.Q_URL}),
         # s3
         ev(44.5, "UpdateFunctionConfiguration20150331v2", lam, {"functionName": f"{P}-api", "environment": {"variables": bad_env}}),
-        ev(34.5, "UpdateFunctionConfiguration20150331v2", lam, {"functionName": f"{P}-api", "environment": {"variables": good_env}}),
-        ev(34, "PurgeQueue", "sqs.amazonaws.com", {"queueUrl": fx.Q_URL}),
+        ev(32.9 if run3 else 34.5, "UpdateFunctionConfiguration20150331v2", lam, {"functionName": f"{P}-api", "environment": {"variables": good_env}}),
+        ev(32.75 if run3 else 34, "PurgeQueue", "sqs.amazonaws.com", {"queueUrl": fx.Q_URL}),
     ]
     if last == "s5":
         events += [
-            ev(33.5, "UpdateFunctionConfiguration20150331v2", lam, {"functionName": f"{P}-worker", "timeout": 2}),
-            ev(33.4, "PutRule", "events.amazonaws.com", {"name": f"{P}-order-processed", "eventBusName": f"{P}-bus", "eventPattern": PATTERN_BAD}),
+            ev(32.4 if run3 else 33.5, "UpdateFunctionConfiguration20150331v2", lam, {"functionName": f"{P}-worker", "timeout": 2}),
+            ev(32.3 if run3 else 33.4, "PutRule", "events.amazonaws.com", {"name": f"{P}-order-processed", "eventBusName": f"{P}-bus", "eventPattern": PATTERN_BAD}),
             ev(3.5, "UpdateFunctionConfiguration20150331v2", lam, {"functionName": f"{P}-worker", "timeout": 10}),
             ev(3.4, "PutRule", "events.amazonaws.com", {"name": f"{P}-order-processed", "eventBusName": f"{P}-bus", "eventPattern": PATTERN_OK}),
             ev(3, "PurgeQueue", "sqs.amazonaws.com", {"queueUrl": fx.Q_URL}),

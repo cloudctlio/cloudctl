@@ -100,6 +100,12 @@ class Change:
     status: str = ""                   # candidate | after_metrics | before_window | after_onset | superseded | reverted | failed_call | unmatched
     reason: str = ""
     superseded_by: str = ""
+    # Set for an in-window change that puts back the values in force before an
+    # earlier change while live now matches what is declared: likely a revert.
+    restores: bool = False
+    # Set for a call that sets no settings (a purge, a restart) on a resource
+    # whose live config matches what is declared: it left nothing behind.
+    one_off: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

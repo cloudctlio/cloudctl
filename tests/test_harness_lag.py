@@ -39,8 +39,8 @@ def _isolate(monkeypatch, tmp_path):
     set_active_window(None)
 
 
-def _run(last: str, inj_ago: float, tmp_path: Path) -> dict:
-    state, data = ht.build(last, inj_ago=inj_ago)
+def _run(last: str, inj_ago: float, tmp_path: Path, run3: bool = False) -> dict:
+    state, data = ht.build(last, inj_ago=inj_ago, run3=run3)
     (tmp_path / "main.tf").write_text("# app\n")
     (tmp_path / "terraform.tfstate").write_text(json.dumps(state))
     return run_diff_first(RecordedLive(data), iac_root=str(tmp_path), account=fx.ACCT,
@@ -69,9 +69,29 @@ def test_s5_after_s4_old_symptoms_are_flagged_and_the_disabled_trigger_is_a_lead
     assert "event source mapping" in leads[0]["match_names"]
     txt = prompt_text(d)
     assert "LIVE DIFFERS FROM DECLARED" in txt and "MAY BE OVER" in txt
-    assert txt.rstrip().endswith("Do not blame a change listed as NOT a cause.")
+    assert txt.rstrip().endswith("are not evidence of the current fault.")
     seeds = seed_hypotheses(d, [])
     assert seeds and "check it directly" in seeds[0]["reason"]
+
+
+def test_s5_run3_revert_and_purge_inside_the_window_are_not_causes(tmp_path):
+    # Live run 3: the api kept returning 5xx under load, so the window opened
+    # at the start of the s4 load, and the s3 revert on the api and the queue
+    # purge landed just inside it. Both were ranked as causes and the agent
+    # blamed them. Now one is a likely revert and the other a one-off action.
+    d = _run("s5", 2.5, tmp_path, run3=True)
+    ex = d["explanation"]
+    blamed = " ".join(c["summary"] for c in ex["causes"] + ex["alternatives"])
+    assert "PurgeQueue" not in blamed and f"{fx.P}-api " not in blamed
+    assert [c["resource_name"] for c in ex["likely_reverts"]] == [f"{fx.P}-api"]
+    assert [c["event"] for c in [{"event": x["summary"].split(" ")[0]} for x in ex["one_off_actions"]]] == ["PurgeQueue"]
+    # The api's 5xx are a current symptom nothing in config explains: say so.
+    assert any(s["node"] == "aws_lambda_function.api" for s in ex["unexplained_symptoms"])
+    assert [c["resource_key"] for c in ex["unplaced_drift"]] == [ESM]
+    txt = prompt_text(d)
+    assert "LIKELY A REVERT" in txt and "ONE-OFF ACTION" in txt
+    out = apply_to_report({"root_cause": "x", "confidence": "HIGH"}, d)
+    assert out["diff_first"]["likely_reverts"] and out["diff_first"]["one_off_actions"]
 
 
 def test_s5_answer_that_blames_the_old_worker_errors_is_capped(tmp_path):
@@ -128,13 +148,48 @@ def test_a_change_that_puts_back_earlier_values_is_restored_not_a_cause():
     chs = [_change(60, "Create", {"functionName": "f", "timeout": 10}, "fn"),
            _change(33, "Update", {"functionName": "f", "timeout": 2}, "fn"),
            _change(3.5, "Update", {"functionName": "f", "timeout": 10}, "fn")]
-    classify(chs, w, {"fn": {"timeout": 10}})
+    classify(chs, w, {"fn": {"timeout": 10}}, in_line={"fn"})
     assert chs[2].status == "restored"
+    # Without a declared state to compare with, nothing is called a revert.
+    classify(chs, w, {"fn": {"timeout": 10}})
+    assert chs[2].status == "after_metrics"
     # A first-time change this recent is a lead the metrics can't judge yet.
     chs = [_change(60, "Create", {"functionName": "f", "timeout": 10}, "fn"),
            _change(3.5, "Update", {"functionName": "f", "timeout": 2}, "fn")]
-    classify(chs, w, {"fn": {"timeout": 2}})
+    classify(chs, w, {"fn": {"timeout": 2}}, in_line=set())
     assert chs[1].status == "after_metrics"
+
+
+def test_a_fault_applied_again_is_not_taken_for_a_revert():
+    # A -> B (fault), A (revert), B again: the last change "puts back" B, but
+    # live now differs from what is declared, so it stays a lead.
+    w = IncidentWindow(onset=fx.t(30), last_healthy=fx.t(31), start=fx.t(36), end=fx.t(28),
+                       metrics_end=fx.t(3))
+    chs = [_change(60, "Create", {"functionName": "f", "timeout": 10}, "fn"),
+           _change(50, "Update", {"functionName": "f", "timeout": 2}, "fn"),
+           _change(40, "Update", {"functionName": "f", "timeout": 10}, "fn"),
+           _change(3.5, "Update", {"functionName": "f", "timeout": 2}, "fn")]
+    classify(chs, w, {"fn": {"timeout": 2}}, in_line=set())
+    assert chs[3].status == "after_metrics" and not chs[3].restores
+
+
+def test_an_in_window_revert_and_a_purge_are_leads_not_causes():
+    # Run 3 s5: the s3 revert on the api (21:23:05) and the harness's queue
+    # purge (21:23:15) landed in the window and were ranked as causes.
+    w = IncidentWindow(onset=fx.t(30), last_healthy=fx.t(31), start=fx.t(36), end=fx.t(28),
+                       metrics_end=fx.t(3))
+    chs = [_change(60, "Create", {"functionName": "api", "memorySize": 256}, "api"),
+           _change(40, "Update", {"functionName": "api", "memorySize": 64}, "api"),
+           _change(30.5, "Update", {"functionName": "api", "memorySize": 256}, "api"),
+           _change(30.4, "PurgeQueue", {"queueUrl": "https://q/orders"}, "q"),
+           _change(30.3, "DeleteQueue", {"queueUrl": "https://q/other"}, "q2")]
+    classify(chs, w, {"api": {"memorySize": 256}, "q": {}, "q2": {}}, in_line={"api", "q", "q2"})
+    assert chs[2].status == "candidate" and chs[2].restores and not chs[2].one_off
+    assert chs[3].status == "candidate" and chs[3].one_off and not chs[3].restores
+    assert not chs[4].one_off      # a call that takes something away can leave a lasting fault
+    # Not read live, or no declared state: neither flag.
+    classify(chs, w, {"api": {"memorySize": 256}}, in_line=set())
+    assert not chs[2].restores and not chs[3].one_off
 
 
 def test_an_old_change_after_the_onset_is_still_after_onset():
@@ -219,6 +274,51 @@ def test_command_exits_at_the_ceiling_instead_of_waiting_for_the_abandoned_graph
     assert out["elapsed"] < 5
     # The process used to stay until the 30 s worker finished.
     assert wall < 15, (wall, r.stderr[-500:])
+
+
+_RESUME_SCRIPT = textwrap.dedent("""
+    import concurrent.futures, json, time
+    import cloudctl.ai.graph_agent as g
+    import cloudctl.mcp.tools.debug as dbg
+
+    class Intr:
+        value = {"question": "more context?"}
+
+    class Graph:
+        def invoke(self, arg, config):
+            if isinstance(arg, dict):          # first run: ends in a clarify question
+                time.sleep(2.5)
+                return {"__interrupt__": [Intr()]}
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            return ex.submit(time.sleep, 30).result()   # the resume hangs
+        def get_state(self, config):
+            return None
+
+    g._get_graph = lambda: Graph()
+    dbg._get_account_id = lambda *a, **k: "111122223333"
+    g._start_diff_first = lambda *a, **k: None
+    import cloudctl.ai.guardrails as gr
+    gr.check_rate_limit = lambda: gr.GuardrailResult(True, "", "")
+    t0 = time.monotonic()
+    raw, _ = g.debug_incident_graph("orders fail", profile=None)
+    print(json.dumps({"timed_out": json.loads(raw).get("_timed_out"),
+                      "elapsed": round(time.monotonic() - t0, 1)}), flush=True)
+    import os
+    os._exit(0)
+""")
+
+
+def test_a_resume_after_a_clarify_question_shares_the_run_deadline(tmp_path):
+    # The resume used to get a fresh ceiling of its own, so a run could last
+    # about twice the ceiling. Run 3 s4 lasted 912 s against a 540 s ceiling.
+    env = {**__import__("os").environ, "CLOUDCTL_TIME_BUDGET_S": "2",
+           "CLOUDCTL_TIME_GRACE_S": "1.5", "CLOUDCTL_HOME": str(tmp_path / "home"),
+           "CLOUDCTL_DIFF_FIRST": "0", "HOME": str(tmp_path)}
+    r = subprocess.run([sys.executable, "-c", _RESUME_SCRIPT], capture_output=True, text=True,
+                       timeout=60, env=env, stdin=subprocess.DEVNULL)
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out["timed_out"] is True, r.stderr[-500:]
+    assert out["elapsed"] < 5, out      # one 3.5 s ceiling, not 2.5 s + a fresh 3.5 s
 
 
 def test_iac_fix_proposal_and_check_stop_at_the_command_deadline(tmp_path, monkeypatch):

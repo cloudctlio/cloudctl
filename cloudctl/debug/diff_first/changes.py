@@ -49,10 +49,13 @@ def match_resources(row: dict, rs: Resolver) -> list[str]:
 
 
 def _value_keys(params: dict) -> dict[str, Any]:
-    """Request parameters minus the ones that only identify the target."""
+    """Request parameters minus the ones that only identify the target. Only
+    top-level parameters identify it (as in ``_id_params``): a nested
+    ``Environment.Variables.QUEUE_URL`` or ``VpcConfig.SubnetIds`` is a setting
+    even though its name ends like an identifier."""
     flat = flatten(params or {})
     return {k: v for k, v in flat.items()
-            if not k.split(".")[-1].endswith(_ID_SUFFIXES)}
+            if "." in k or not k.endswith(_ID_SUFFIXES)}
 
 
 def to_changes(rows: list[dict], resources: dict[str, Resource]) -> list[Change]:
@@ -88,14 +91,25 @@ def too_new(t: datetime | None, metrics_end: datetime | None) -> bool:
     return bool(t and metrics_end and t > metrics_end - timedelta(seconds=SHOW_DELAY_S))
 
 
+# Verbs that take something away. A call like this can leave a lasting fault
+# without setting any value, so it is never treated as a one-off action.
+_TAKES_AWAY = ("Delete", "Remove", "Detach", "Revoke", "Disassociate", "Deregister")
+
+
 def classify(changes: list[Change], window: IncidentWindow,
-             live_configs: dict[str, dict] | None = None) -> list[Change]:
-    """Set ``status`` and ``reason`` on every change (in place) and return them."""
+             live_configs: dict[str, dict] | None = None,
+             in_line: set[str] | None = None) -> list[Change]:
+    """Set ``status`` and ``reason`` on every change (in place) and return them.
+
+    ``in_line`` holds the resources whose live config was read and matches
+    what is declared. Without it (no declared state) no change is called a
+    revert or a one-off action, because nothing shows where things should be."""
     start, end = to_dt(window.start), to_dt(window.end)
     metrics_end = to_dt(getattr(window, "metrics_end", None))
     live_configs = live_configs or {}
     for i, c in enumerate(changes):
         t = to_dt(c.time)
+        c.restores = c.one_off = False
         if c.error_code:
             c.status, c.reason = "failed_call", f"the call failed ({c.error_code}), so it changed nothing"
             continue
@@ -133,7 +147,10 @@ def classify(changes: list[Change], window: IncidentWindow,
             c.status = "reverted"
             c.reason = "live config no longer has the values this change set"
             continue
-        if newer and _restores(c, changes[:i], mine, keys):
+        settled = in_line is not None and mine <= in_line
+        back = settled and _restores(c, changes[:i], mine, keys)
+        c.one_off = bool(settled and not keys and not c.event_name.startswith(_TAKES_AWAY))
+        if newer and back:
             # A recent change that puts back the values in force before an
             # earlier change undoes that change: a revert or a fix, not a fault.
             c.status = "restored"
@@ -149,6 +166,16 @@ def classify(changes: list[Change], window: IncidentWindow,
         c.status = "candidate"
         c.reason = ("inside the incident window and live config still has its values"
                     if verdict else "inside the incident window; nothing later undid it")
+        if back:
+            # Timing alone can't clear it, but A -> B -> A with live now as
+            # declared is what a revert or a fix looks like. Kept as a lead to
+            # check, never ranked as a cause on timing alone.
+            c.restores = True
+            c.reason += ("; it puts back the values in force before an earlier change and live "
+                         "now matches what is declared, so it is most likely a revert or a fix")
+        elif c.one_off:
+            c.reason += ("; it sets no settings and live config matches what is declared, so it "
+                         "left nothing behind that could keep a symptom going")
     return changes
 
 

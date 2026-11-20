@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from cloudctl.debug.diff_first.changes import _value_keys
 from cloudctl.debug.diff_first.model import Candidate, Change, DriftItem, Symptom, to_dt
 from cloudctl.debug.diff_first.normalize import identifiers_in
 from cloudctl.debug.diff_first.topology import FLOW_TYPES, Topology, service_of_type, services_in
@@ -49,7 +50,9 @@ def build_candidates(drift: list[DriftItem], changes: list[Change], window_start
                        if drift_here else ""),
             evidence={"params": c.params, "drift": [d.to_dict() for d in drift_here],
                       "holds": c.reason, "event": c.event_name,
-                      "after_metrics": c.status == "after_metrics"}))
+                      "after_metrics": c.status == "after_metrics",
+                      "restores": c.restores and not drift_here,
+                      "one_off": c.one_off and not drift_here}))
     for d in drift:
         if id(d) in used_drift:
             continue
@@ -173,6 +176,8 @@ def mark_may_be_over(symptoms: list[Symptom], changes: list[Change], cands: list
             t = to_dt(c.time)
             if c.error_code or not c.resource_key or not t or t <= onset:
                 continue
+            if c.one_off or not c.params or not _value_keys(c.params):
+                continue        # sets nothing (a purge, a restart): not a fix
             if t < m_end - timedelta(seconds=FIX_GRACE_S):
                 continue
             keys = set(filter(None, c.resource_key.split(",")))
@@ -196,7 +201,11 @@ def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology)
         cover_map[c.id] = {s.id: how for s in symptoms if (how := explains(c, s, topo))}
     remaining = {s.id for s in symptoms}
     chosen: list[Candidate] = []
-    pool = list(cands)
+    # A likely revert, or a call that left nothing behind, can fit a symptom on
+    # timing and still not be what keeps it going. Show it as a lead; never
+    # rank it as a cause.
+    held = [c for c in cands if c.evidence.get("restores") or c.evidence.get("one_off")]
+    pool = [c for c in cands if c not in held]
     while remaining and pool:
         def score(c: Candidate):
             hits = {sid: how for sid, how in cover_map[c.id].items() if sid in remaining}
@@ -210,7 +219,9 @@ def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology)
         remaining -= set(cover_map[best.id])
         pool.remove(best)
     chosen_ids = {c.id for c in chosen}
-    alternatives = [c for c in cands if c.id not in chosen_ids and cover_map[c.id]]
+    alternatives = [c for c in cands if c.id not in chosen_ids and c not in held and cover_map[c.id]]
+    reverts = [c for c in held if c.evidence.get("restores") and cover_map[c.id]]
+    one_offs = [c for c in held if not c.evidence.get("restores") and cover_map[c.id]]
     idle = [c for c in cands if not cover_map[c.id]]
     unexplained = [s for s in symptoms if s.id in remaining]
     # Leads no current metric symptom can place: changes newer than the metrics,
@@ -241,6 +252,8 @@ def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology)
         "may_be_over": [s.to_dict() for s in over],
         "newer_than_metrics": [c.to_dict() for c in newer],
         "unplaced_drift": [c.to_dict() for c in unplaced],
+        "likely_reverts": [{**c.to_dict(), "explains": cover_map[c.id]} for c in reverts],
+        "one_off_actions": [{**c.to_dict(), "explains": cover_map[c.id]} for c in one_offs],
         "confidence": conf,
         "confidence_reason": why,
     }
