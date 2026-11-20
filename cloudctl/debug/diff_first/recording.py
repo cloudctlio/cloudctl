@@ -44,6 +44,10 @@ class RecordingLive:
     def now(self) -> datetime:
         return self.inner.now()
 
+    @property
+    def notes(self) -> list[str]:
+        return list(getattr(self.inner, "notes", None) or [])
+
     def read(self, resource: Resource):
         cfg = self.inner.read(resource)
         if cfg is not None:

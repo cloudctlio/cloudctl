@@ -79,6 +79,16 @@ class DriftItem:
     changed_at: str | None = None      # matched CloudTrail time, when known
     changed_by: str = ""
     note: str = ""
+    # A monitor (alarm, alert rule, dashboard, log pipeline): its drift is a
+    # finding to report, never a cause of an outage.
+    observer: bool = False
+    # How the change got there (see attribution.py): route is manual | iac |
+    # automation | outside_iac | unknown; route_label says it in words.
+    route: str = ""
+    route_label: str = ""
+    route_confidence: str = ""
+    fix_direction: str = ""
+    route_evidence: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -97,9 +107,26 @@ class Change:
     params: dict = field(default_factory=dict)
     error_code: str = ""
     origin: str = "cloudtrail"         # cloudtrail | iac_commit
-    status: str = ""                   # candidate | before_window | after_onset | superseded | reverted | failed_call | unmatched
+    status: str = ""                   # candidate | before_window | after_onset | superseded | reverted | failed_call | unmatched | observer
     reason: str = ""
     superseded_by: str = ""
+    # Caller evidence from the audit trail (any cloud), and the route label.
+    cloud: str = "aws"
+    principal: str = ""
+    principal_type: str = ""
+    user_agent: str = ""
+    source_ip: str = ""
+    invoked_by: str = ""
+    console: bool = False
+    client_app: str = ""
+    correlation_id: str = ""
+    route: str = ""                    # manual | iac | automation | outside_iac | unknown
+    route_how: str = ""
+    route_confidence: str = ""
+    matches_iac: bool | None = None
+    route_label: str = ""
+    fix_direction: str = ""
+    route_evidence: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

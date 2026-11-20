@@ -37,7 +37,7 @@ def build_candidates(drift: list[DriftItem], changes: list[Change], window_start
         if c.status != "candidate":
             continue
         keys = [k for k in c.resource_key.split(",") if k]
-        drift_here = [d for d in drift if d.resource_key in keys]
+        drift_here = [d for d in drift if d.resource_key in keys and not d.observer]
         for d in drift_here:
             used_drift.add(id(d))
             d.changed_at, d.changed_by = c.time, c.actor
@@ -46,11 +46,20 @@ def build_candidates(drift: list[DriftItem], changes: list[Change], window_start
             resource_key=",".join(keys), resource_name=c.resource_name, time=c.time,
             summary=f"{c.event_name} on {c.resource_name} at {c.time} by {c.actor or 'unknown'}"
                     + (f"; live differs from declared on {', '.join(f['field'] for d in drift_here for f in d.fields[:4])}"
-                       if drift_here else ""),
+                       if drift_here else "")
+                    + (f" [{c.route_label}]" if c.route_label else ""),
             evidence={"params": c.params, "drift": [d.to_dict() for d in drift_here],
-                      "holds": c.reason, "event": c.event_name}))
+                      "holds": c.reason, "event": c.event_name, "route": c.route,
+                      "route_label": c.route_label, "route_confidence": c.route_confidence,
+                      "fix_direction": c.fix_direction, "route_evidence": c.route_evidence}))
     for d in drift:
         if id(d) in used_drift:
+            continue
+        if d.observer:
+            # A monitor's drift is reported (run.py lists it as observer_drift)
+            # but never offered as a cause: it can hide an outage, not make one.
+            d.note = d.note or ("a monitor: its drift can hide an outage but cannot cause one")
+            context.append({"drift": d.to_dict(), "why_not_a_cause": d.note, "observer": True})
             continue
         hist = sorted(by_key_changes.get(d.resource_key, []), key=lambda c: c.time or "")
         last = hist[-1] if hist else None
@@ -67,8 +76,11 @@ def build_candidates(drift: list[DriftItem], changes: list[Change], window_start
             id=f"C{len(cands) + 1}", kind="drift", resource_key=d.resource_key,
             resource_name=d.resource_name, time=d.changed_at,
             summary=f"{d.resource_name or d.resource_key}: {what}"
-                    + ("" if d.changed_at else " (when it changed is unknown)"),
-            evidence={"drift": [d.to_dict()]}))
+                    + ("" if d.changed_at else " (when it changed is unknown)")
+                    + (f" [{d.route_label}]" if d.route_label else ""),
+            evidence={"drift": [d.to_dict()], "route": d.route, "route_label": d.route_label,
+                      "route_confidence": d.route_confidence, "fix_direction": d.fix_direction,
+                      "route_evidence": d.route_evidence}))
     return cands, context
 
 

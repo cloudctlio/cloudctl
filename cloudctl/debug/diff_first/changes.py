@@ -55,6 +55,10 @@ def _value_keys(params: dict) -> dict[str, Any]:
             if not k.split(".")[-1].endswith(_ID_SUFFIXES)}
 
 
+_CALLER_FIELDS = ("cloud", "principal", "principal_type", "user_agent", "source_ip", "invoked_by",
+                  "console", "client_app", "correlation_id")
+
+
 def to_changes(rows: list[dict], resources: dict[str, Resource]) -> list[Change]:
     rs = Resolver(resources)
     points_at: dict[str, set[str]] = {}
@@ -71,7 +75,8 @@ def to_changes(rows: list[dict], resources: dict[str, Resource]) -> list[Change]
             keys = specific or keys
         ch = Change(time=row.get("time") or "", event_name=row.get("event_name", ""),
                     event_source=row.get("event_source", ""), actor=row.get("actor", ""),
-                    params=row.get("params") or {}, error_code=row.get("error_code", ""))
+                    params=row.get("params") or {}, error_code=row.get("error_code", ""),
+                    **{k: row[k] for k in _CALLER_FIELDS if row.get(k) not in (None, "")})
         ch.resource_key = ",".join(keys)
         ch.resource_name = ", ".join(dict.fromkeys(resources[k].label() for k in keys))
         out.append(ch)
@@ -79,8 +84,11 @@ def to_changes(rows: list[dict], resources: dict[str, Resource]) -> list[Change]
 
 
 def classify(changes: list[Change], window: IncidentWindow,
-             live_configs: dict[str, dict] | None = None) -> list[Change]:
-    """Set ``status`` and ``reason`` on every change (in place) and return them."""
+             live_configs: dict[str, dict] | None = None,
+             observer_keys: set[str] | None = None) -> list[Change]:
+    """Set ``status`` and ``reason`` on every change (in place) and return them.
+    ``observer_keys``: resources that only watch the system; a change that
+    touches nothing else gets status ``observer``."""
     start, end = to_dt(window.start), to_dt(window.end)
     live_configs = live_configs or {}
     for i, c in enumerate(changes):
@@ -90,6 +98,11 @@ def classify(changes: list[Change], window: IncidentWindow,
             continue
         if not c.resource_key:
             c.status, c.reason = "unmatched", "touches nothing in the app's resources"
+            continue
+        if observer_keys and set(c.resource_key.split(",")) <= observer_keys:
+            c.status = "observer"
+            c.reason = ("changes a monitor (alarm, alert rule, dashboard or log pipeline): it can hide "
+                        "an outage but cannot stop work flowing, so it is never a cause")
             continue
         if start and t and t < start:
             c.status = "before_window"

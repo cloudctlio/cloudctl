@@ -60,9 +60,17 @@ class RecordedLive:
         return [Resource(**{**r, "source": "live"}) for r in self.data.get("discovered") or []]
 
     def write_events(self, start: datetime, end: datetime) -> list[dict]:
+        """Rows from ``events`` (already in row shape), plus raw audit records
+        under ``audit`` ({"aws": [LookupEvents records], "azure": [Activity Log
+        records], "gcp": [audit LogEntry]}), normalised the way the live
+        sources do it, so a replay exercises the same parsing."""
+        from cloudctl.debug.diff_first.attribution import is_write, normalize_audit
         self.calls.append("write_events")
+        rows = list(self.data.get("events") or [])
+        for cloud, records in (self.data.get("audit") or {}).items():
+            rows += [r for r in (normalize_audit(x, cloud) for x in records or []) if is_write(r)]
         out = []
-        for e in self.data.get("events") or []:
+        for e in rows:
             t = to_dt(e.get("time"))
             if t and start <= t <= end:
                 out.append(e)
@@ -113,6 +121,15 @@ def _cc_identifier(r: Resource) -> str:
     if t in ("AWS::Lambda::Function", "AWS::IAM::Role", "AWS::DynamoDB::Table",
              "AWS::S3::Bucket", "AWS::Events::EventBus"):
         return r.name or r.physical_id
+    if t in ("AWS::CloudWatch::Alarm", "AWS::CloudWatch::CompositeAlarm"):
+        return str(get_field(cfg, "alarm_name", "AlarmName") or r.name or r.physical_id)
+    if t == "AWS::CloudWatch::Dashboard":
+        return str(get_field(cfg, "dashboard_name", "DashboardName") or r.name or r.physical_id)
+    if t in ("AWS::Logs::MetricFilter", "AWS::Logs::SubscriptionFilter"):
+        name = get_field(cfg, "name", "filter_name", "FilterName") or r.name
+        group = get_field(cfg, "log_group_name", "LogGroupName") or ""
+        if name and group:     # Cloud Control's compound primary identifiers
+            return f"{group}|{name}" if t == "AWS::Logs::MetricFilter" else f"{name}|{group}"
     return r.physical_id or r.name
 
 
@@ -170,6 +187,28 @@ class AwsLive:
             if r.type == "AWS::IAM::RolePolicy":
                 pol, _, role = _cc_identifier(r).partition("|")
                 return self._c("iam").get_role_policy(RoleName=role, PolicyName=pol)
+            if r.type in ("AWS::CloudWatch::Alarm", "AWS::CloudWatch::CompositeAlarm"):
+                name = _cc_identifier(r)
+                resp = self._c("cloudwatch").describe_metric_alarms(AlarmNames=[name]) \
+                    if r.type == "AWS::CloudWatch::Alarm" else \
+                    self._c("cloudwatch").describe_alarms(AlarmNames=[name], AlarmTypes=["CompositeAlarm"])
+                found = resp.get("MetricAlarms") or resp.get("CompositeAlarms") or []
+                return found[0] if found else NOT_FOUND
+            if r.type == "AWS::Logs::LogGroup":
+                name = r.name or r.physical_id
+                groups = self._c("logs").describe_log_groups(logGroupNamePrefix=name).get("logGroups", [])
+                hit = [g for g in groups if g.get("logGroupName") == name]
+                return hit[0] if hit else NOT_FOUND
+            if r.type == "AWS::Logs::MetricFilter":
+                group, _, name = _cc_identifier(r).partition("|")
+                fs = self._c("logs").describe_metric_filters(logGroupName=group, filterNamePrefix=name)
+                hit = [f for f in fs.get("metricFilters", []) if f.get("filterName") == name]
+                return hit[0] if hit else NOT_FOUND
+            if r.type == "AWS::Logs::SubscriptionFilter":
+                name, _, group = _cc_identifier(r).partition("|")
+                fs = self._c("logs").describe_subscription_filters(logGroupName=group, filterNamePrefix=name)
+                hit = [f for f in fs.get("subscriptionFilters", []) if f.get("filterName") == name]
+                return hit[0] if hit else NOT_FOUND
         except ClientError as exc:
             if "NotFound" in exc.response.get("Error", {}).get("Code", ""):
                 return NOT_FOUND
@@ -314,21 +353,8 @@ class AwsLive:
 
 
 def cloudtrail_row(e: dict) -> dict:
-    """One LookupEvents record -> the row shape the checks use."""
-    try:
-        detail = json.loads(e.get("CloudTrailEvent") or "{}")
-    except ValueError:
-        detail = {}
-    uid = detail.get("userIdentity") or {}
-    actor = (uid.get("userName")
-             or (uid.get("sessionContext") or {}).get("sessionIssuer", {}).get("userName", "")
-             or str(uid.get("arn", "")).split("/")[-1])
-    return {
-        "time": iso(to_dt(e.get("EventTime") or detail.get("eventTime"))),
-        "event_name": e.get("EventName") or detail.get("eventName", ""),
-        "event_source": e.get("EventSource") or detail.get("eventSource", ""),
-        "actor": actor,
-        "resources": [r.get("ResourceName", "") for r in e.get("Resources", []) or []],
-        "params": detail.get("requestParameters") or {},
-        "error_code": detail.get("errorCode", ""),
-    }
+    """One LookupEvents record -> the row shape the checks use, with the caller
+    evidence (user agent, principal, console flag, invoking service) that tells
+    a hand change from an IaC deploy."""
+    from cloudctl.debug.diff_first.attribution import normalize_cloudtrail
+    return normalize_cloudtrail(e)

@@ -18,6 +18,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from cloudctl.debug.diff_first.attribution import FIX_TEXT, apply_attribution
 from cloudctl.debug.diff_first.changes import classify, iac_commits, to_changes
 from cloudctl.debug.diff_first.drift import compute_drift
 from cloudctl.debug.diff_first.explain import build_candidates, explain_all
@@ -25,6 +26,7 @@ from cloudctl.debug.diff_first.flow import build_symptoms
 from cloudctl.debug.diff_first.iac import BaselineAdapter, load_expected_state
 from cloudctl.debug.diff_first.live import NOT_FOUND
 from cloudctl.debug.diff_first.model import to_dt
+from cloudctl.debug.diff_first.normalize import cloud_of_type, is_observer
 from cloudctl.debug.diff_first.topology import build_topology
 from cloudctl.debug.diff_first.window import METRICS, detect_anomaly, fill, incident_window, metric_queries
 
@@ -41,7 +43,9 @@ class DiffFirstReport:
     resources: int = 0
     window: dict = field(default_factory=dict)
     drift: list[dict] = field(default_factory=list)
+    observer_drift: list[dict] = field(default_factory=list)   # monitors: findings, never causes
     drift_stats: dict = field(default_factory=dict)
+    clouds: list[str] = field(default_factory=list)
     changes: list[dict] = field(default_factory=list)
     iac_commits: list[dict] = field(default_factory=list)
     topology: dict = field(default_factory=dict)
@@ -103,6 +107,10 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
         except Exception as exc:  # noqa: BLE001
             rep.notes.append(f"discovery failed: {exc}")
     rep.resources = len(resources)
+    rep.clouds = sorted({cloud_of_type(r.type, r.source_type) for r in resources.values()})
+    if set(rep.clouds) - {"aws"}:
+        rep.notes.append("Azure / Google Cloud resources: drift, monitor drift and who-made-each-change "
+                         "ran for them; the incident window and flow checks only read AWS metrics today")
     topo = build_topology(resources)
     rep.topology = topo.to_dict()
 
@@ -145,6 +153,7 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
     drift, stats, configs = ([], {}, {})
     if expected.resources:
         drift, stats, configs = compute_drift(expected, live, deadline)
+    compared_keys = set(stats.pop("compared_keys", []) or [])
     rep.drift_stats = stats
 
     # 5. changes in the window that still hold
@@ -164,9 +173,19 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
                     cfg = None
                 if cfg is not None:
                     configs[k] = cfg
-    classify(changes, window, {k: v for k, v in configs.items() if v is not NOT_FOUND})
+    observer_keys = {k for k, r in resources.items() if is_observer(r.type)}
+    classify(changes, window, {k: v for k, v in configs.items() if v is not NOT_FOUND},
+             observer_keys=observer_keys)
+    # who made each change: by hand, by the IaC, or by other automation
+    apply_attribution(changes, drift, compared_keys, expected.kind, rows)
+    commits = iac_commits(iac_root, to_dt(window.start), to_dt(window.end))
+    if commits:
+        for c in changes:
+            if c.route == "iac" and c.fix_direction == "edit_iac":
+                c.route_evidence.append(f"{len(commits)} IaC commit(s) in the incident window, latest "
+                                        f"{commits[-1].event_name[:60]}")
     rep.changes = [c.to_dict() for c in changes if c.resource_key][-60:]
-    rep.iac_commits = [c.to_dict() for c in iac_commits(iac_root, to_dt(window.start), to_dt(window.end))]
+    rep.iac_commits = [c.to_dict() for c in commits]
 
     # 6. flow checks and symptoms
     symptoms, flow_table, notes = build_symptoms(topo, anomalies, series, window)
@@ -177,12 +196,16 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
     # 7. explain everything
     cands, context = build_candidates(drift, changes, window.start, topo)
     rep.drift = [d.to_dict() for d in drift]
+    rep.observer_drift = [d.to_dict() for d in drift if d.observer]
     rep.context = context
     expl = explain_all(symptoms, cands, topo)
     for group in ("causes", "alternatives"):
         for c in expl[group]:
             c["match_names"] = match_names(c["resource_key"], resources)
     rep.explanation = expl
+    for n in getattr(live, "notes", None) or []:
+        if n not in rep.notes:
+            rep.notes.append(n)
     if time.monotonic() > deadline:
         rep.notes.append(f"stopped at the {budget_s:.0f}s budget; some reads were skipped")
     rep.elapsed_s = round(time.monotonic() - t0, 2)
@@ -233,10 +256,15 @@ def prompt_text(d: dict, max_chars: int = 3500) -> str:
         lines.append(f"- Symptom {s['id']} ({s['kind']}): {s['detail']}")
     for c in ex.get("causes") or []:
         lines.append(f"- CAUSE CANDIDATE {c['id']}: {c['summary']} -> explains {', '.join(c['explains'])}")
+        fix = (c.get("evidence") or {}).get("fix_direction")
+        if fix in FIX_TEXT:
+            lines.append(f"  Fix direction for {c['id']}: {FIX_TEXT[fix]}")
     for c in ex.get("alternatives") or []:
         lines.append(f"- Also consistent {c['id']}: {c['summary']} -> {', '.join(c['explains'])}")
     for s in ex.get("unexplained_symptoms") or []:
         lines.append(f"- UNEXPLAINED {s['id']}: {s['detail']} (keep looking)")
+    for o in (d.get("observer_drift") or [])[:4]:
+        lines.append(f"- MONITOR DRIFT (report it as a finding; it is never the cause): {_drift_text(o)}")
     dropped = [c for c in d.get("changes") or [] if c.get("status") in ("before_window", "superseded", "reverted")]
     for c in dropped[-6:]:
         lines.append(f"- NOT a cause: {c['event_name']} on {c['resource_name']} at {c['time']}: {c['reason']}")
@@ -244,9 +272,23 @@ def prompt_text(d: dict, max_chars: int = 3500) -> str:
         lines.append(f"- Note: {n}")
     lines.append("Rules: your answer must explain EVERY symptom above, each cause must come "
                  "before the symptom it explains, and more than one cause is allowed. Do not "
-                 "blame a change listed as NOT a cause.")
+                 "blame a change listed as NOT a cause. Say how each cause got there as labelled "
+                 "in [brackets] (by hand outside the IaC, or deployed by the IaC) and follow its fix "
+                 "direction: a hand change is undone by re-applying the IaC, an IaC-deployed one is "
+                 "fixed in the code.")
     text = "\n".join(lines)
     return text if len(text) <= max_chars else text[:max_chars - 20] + "\n- (truncated)"
+
+
+def _drift_text(d: dict) -> str:
+    name = d.get("resource_name") or d.get("resource_key")
+    if d.get("kind") == "deleted":
+        what = "deleted"
+    else:
+        what = "; ".join(f"{f.get('field')} declared {f.get('expected')!r}, live {f.get('live')!r}"
+                         for f in (d.get("fields") or [])[:4])
+    label = f" [{d['route_label']}]" if d.get("route_label") else ""
+    return f"{name} ({d.get('resource_type')}): {what}{label}"
 
 
 def seed_hypotheses(d: dict, existing: list[dict], limit: int = 2) -> list[dict]:
@@ -310,7 +352,11 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
         "expected_state": d.get("expected_kind"),
         "window": {k: (d.get("window") or {}).get(k) for k in ("last_healthy", "onset", "method")},
         "symptoms": [f"{s['id']}: {s['detail']}" for s in d.get("symptoms") or []],
-        "causes": [{"summary": c["summary"], "explains": sorted(c["explains"])} for c in causes],
+        "causes": [{"summary": c["summary"], "explains": sorted(c["explains"]),
+                    "route": (c.get("evidence") or {}).get("route", ""),
+                    "fix_direction": (c.get("evidence") or {}).get("fix_direction", "")}
+                   for c in causes],
+        "monitor_drift": [_drift_text(o) for o in d.get("observer_drift") or []],
         "unexplained": [f"{s['id']}: {s['detail']}" for s in unexplained],
         "not_causes": [f"{c['event_name']} on {c['resource_name']} at {c['time']}: {c['reason']}"
                        for c in d.get("changes") or []
@@ -373,7 +419,12 @@ def run_for_agent(profile: str | None, region: str, iac_root: str | None,
             from cloudctl.debug.diff_first.live import AwsLive
             from cloudctl.mcp.tools.debug import _make_session
             stage = "creating the AWS session"
-            live = AwsLive(_make_session(profile, region), region)
+            from cloudctl.debug.diff_first.live_clouds import AzureLive, GcpLive, MultiCloudLive
+            live = MultiCloudLive(
+                AwsLive(_make_session(profile, region), region),
+                azure=lambda: AzureLive(subscription_id=os.environ.get("AZURE_SUBSCRIPTION_ID", "")),
+                gcp=lambda: GcpLive(project=os.environ.get("GOOGLE_CLOUD_PROJECT")
+                                    or os.environ.get("CLOUDSDK_CORE_PROJECT", "")))
             rec_path = os.environ.get("CLOUDCTL_DIFF_FIRST_RECORD")
             if rec_path:
                 from cloudctl.debug.diff_first.recording import RecordingLive
