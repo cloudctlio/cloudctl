@@ -100,6 +100,16 @@ gate = [
     "cedarpy==4.12.2",
     "cryptography>=46,<51",
 ]
+# The control-plane HTTP service (cloudctl serve). State backends: DynamoDB uses
+# boto3 (core); Cosmos DB needs azure-cosmos; Firestore needs google-cloud-firestore.
+service = [
+    "cctl[gate]",
+    "fastapi==0.118.0",
+    "uvicorn==0.37.0",
+    "PyJWT[crypto]==2.10.1",
+]
+service-azure = ["cctl[service,gate-azure]", "azure-cosmos>=4.7,<5"]
+service-gcp = ["cctl[service,gate-gcp]", "google-cloud-firestore>=2.16,<3"]
 # Native cloud guardrail checks and immutable audit sinks for Azure and GCP.
 gate-azure = ["cctl[gate,azure]", "azure-mgmt-policyinsights>=1.0", "azure-storage-blob>=12.19"]
 gate-gcp = ["cctl[gate,gcp]"]

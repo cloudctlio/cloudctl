@@ -1,0 +1,8 @@
+apiVersion: v2
+name: cctl-control-plane
+description: cctl policy-gated control plane (HTTP API, drift loop) for EKS, AKS and GKE
+type: application
+version: 0.1.0
+appVersion: "0.3.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/cloudctlio/cloudctl

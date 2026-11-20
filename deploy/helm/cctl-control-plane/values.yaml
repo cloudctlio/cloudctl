@@ -1,0 +1,62 @@
+# Defaults are cloud-neutral. Layer one of values-eks.yaml, values-aks.yaml or
+# values-gke.yaml on top, then your own overrides.
+
+image:
+  repository: ""            # required, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/cctl-control-plane
+  digest: ""                # required: deploy by digest (sha256:...), never by a moving tag
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicaCount: 2
+
+cloud: ""                   # aws | azure | gcp (sets the workload-identity wiring)
+
+serviceAccount:
+  name: cctl-control-plane
+  annotations: {}           # filled by the cloud values file (IRSA role, Azure client id, GCP SA)
+
+# Service settings (rendered to /etc/cctl/service.yaml). gate_config is set by the chart.
+settings:
+  state: {}                 # e.g. {backend: dynamodb, table: cctl-control-plane, region: us-east-1}
+  auth: {}                  # issuer, audience, role_map, ...
+  model: {adapter: converse, region: us-east-1, tokens_per_hour: 2000000}
+  drift: {interval_seconds: 900, repair: true}
+  workers: 4
+  max_body_bytes: 1048576
+
+# The policy gate's own config (rendered to /etc/cctl/controlplane.yaml).
+# IaC roots in it must live under iac.mountPath.
+gateConfig: {}
+
+# The IaC the control plane plans and applies, checked out at a pinned commit into a pod-private volume
+# by an init container. Use a deploy key or token in an existing secret for private repos.
+iac:
+  repo: ""                  # https://github.com/<org>/<infra-repo>.git
+  ref: ""                   # full 40-character commit SHA (required: no branches)
+  mountPath: /workspace/iac
+  tokenSecret: ""           # secret with key "token" (read-only), optional
+
+trustedProxies: "127.0.0.1"  # CIDRs of your ingress / load balancer, for X-Forwarded-For
+
+resources:
+  requests: {cpu: 500m, memory: 1Gi}
+  limits: {memory: 2Gi}
+
+service:
+  type: ClusterIP
+  port: 80
+
+podDisruptionBudget:
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  ingressFrom: []           # list of NetworkPolicy peers allowed to call the API (e.g. your ingress namespace)
+  egressCIDRs: ["0.0.0.0/0"]  # cloud APIs, IdP JWKS, git; narrow to your VPC endpoints / proxy if you have them
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+podAnnotations: {}
+podLabels: {}

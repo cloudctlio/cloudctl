@@ -108,3 +108,5 @@ paths, and the CLI. The executors are tested with faked tool runs and faked
 CloudFormation and ARM clients. No executor has been run against a real
 cloud account or a real Terraform, Pulumi, CDK or kubectl yet, and the
 compiler has not been tried against a live model.
+
+To run all of this as a shared HTTP service, see [service.md](service.md).

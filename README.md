@@ -193,6 +193,7 @@ Every `--fix` and `--resolve` change goes through a five-stage gate: short-lived
 | `cloudctl gate policy eval plan.json --env <name>` | Run the engines on a Terraform plan JSON (exit 2 on HIGH/CRITICAL) |
 | `cloudctl gate keygen --approver <name>` | Make an approver's Ed25519 key |
 | `cloudctl gate approvals list` / `cloudctl gate approve <id>` | Review and sign approval requests |
+| `cloudctl gate sign req.json --approver <name>` | Sign a request fetched from the control-plane service, offline |
 | `cloudctl gate audit verify` | Check the audit hash chain |
 
 ### Change requests (requires `pip install "cctl[gate]"`)
@@ -218,6 +219,14 @@ Find where live state no longer matches IaC (Terraform/OpenTofu, Pulumi, ARM/Bic
 | `cloudctl drift list` / `cloudctl drift show <event>` | Drift events, with class, severity, confidence and decision |
 | `cloudctl drift repair <event> [--override "why"]` | A person's go-ahead to repair one event |
 | `cloudctl drift table` | The autonomy table in force |
+
+### Control-plane service (requires `pip install "cctl[service]"`)
+
+Run the gate, change runs and the drift loop as an HTTP API for a team: OIDC sign-in with roles, approvals signed offline, shared state on DynamoDB, Cosmos DB or Firestore, immutable audit on S3, Azure Storage or GCS, and a container, Helm chart, Terraform and an OIDC deploy workflow for EKS, AKS and GKE. See [docs/service.md](docs/service.md).
+
+| Command | What it does |
+|---|---|
+| `cloudctl serve --config service.yaml` | Run the API (127.0.0.1:8080 by default) |
 
 ### Setup
 

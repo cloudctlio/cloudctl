@@ -1,0 +1,152 @@
+name: Control plane deploy
+
+# Manual only. The deploy job runs in a GitHub environment: protect it with
+# required reviewers. Cloud access is OIDC federation, no stored keys.
+#
+# Environment variables to set (Settings > Environments > <env> > Variables):
+#   common:  TERRAFORM_SHA256, KUBECTL_SHA256, HELM_VALUES (your values file, multi-line), K8S_NAMESPACE
+#   aws:     AWS_CI_ROLE_ARN, AWS_REGION, ECR_REPOSITORY_URL, EKS_CLUSTER
+#   azure:   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, ACR_NAME, AKS_RESOURCE_GROUP, AKS_CLUSTER
+#   gcp:     GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_CI_SERVICE_ACCOUNT, GAR_REPOSITORY (region-docker.pkg.dev/project/repo),
+#            GKE_CLUSTER, GKE_LOCATION
+#   BASE_IMAGE: python:3.13-slim-bookworm@sha256:<digest>
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Target cloud
+        type: choice
+        options: [aws, azure, gcp]
+        required: true
+      environment:
+        description: GitHub environment to deploy through
+        type: string
+        default: production
+
+permissions:
+  contents: read
+
+concurrency:
+  group: control-plane-deploy-${{ inputs.environment }}-${{ inputs.cloud }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[ai,gate,service]" pytest pytest-cov bandit
+      - run: pytest tests/ -q
+      - run: bandit -r cloudctl/ -ll -x tests/
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write          # OIDC token for the cloud login
+    env:
+      CLOUD: ${{ inputs.cloud }}
+      NAMESPACE: ${{ vars.K8S_NAMESPACE || 'cctl' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # ── cloud login (OIDC) ──────────────────────────────────────────────
+      - name: AWS login
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: cctl-deploy-${{ github.run_id }}
+      - name: Azure login
+        if: inputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: GCP login
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+      - name: GCP SDK
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      # ── registry and cluster credentials ────────────────────────────────
+      - name: Registry login and cluster context
+        id: target
+        run: |
+          set -euo pipefail
+          case "$CLOUD" in
+            aws)
+              repo="${{ vars.ECR_REPOSITORY_URL }}"
+              aws ecr get-login-password --region "${{ vars.AWS_REGION }}" | docker login --username AWS --password-stdin "${repo%%/*}"
+              aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER }}" --region "${{ vars.AWS_REGION }}"
+              values=values-eks.yaml ;;
+            azure)
+              repo="${{ vars.ACR_NAME }}.azurecr.io/cctl-control-plane"
+              az acr login --name "${{ vars.ACR_NAME }}"
+              az aks get-credentials --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" --name "${{ vars.AKS_CLUSTER }}" --overwrite-existing
+              values=values-aks.yaml ;;
+            gcp)
+              repo="${{ vars.GAR_REPOSITORY }}/cctl-control-plane"
+              gcloud auth configure-docker "${repo%%/*}" --quiet
+              gcloud container clusters get-credentials "${{ vars.GKE_CLUSTER }}" --location "${{ vars.GKE_LOCATION }}"
+              values=values-gke.yaml ;;
+          esac
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "values=$values" >> "$GITHUB_OUTPUT"
+
+      # ── build and push by digest ────────────────────────────────────────
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.target.outputs.repo }}:${{ github.sha }}
+          build-args: |
+            BASE_IMAGE=${{ vars.BASE_IMAGE }}
+            TERRAFORM_SHA256=${{ vars.TERRAFORM_SHA256 }}
+            KUBECTL_SHA256=${{ vars.KUBECTL_SHA256 }}
+            EXTRAS=${{ inputs.cloud == 'aws' && 'service' || inputs.cloud == 'azure' && 'service-azure' || 'service-gcp' }}
+
+      # ── deploy ──────────────────────────────────────────────────────────
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Helm upgrade
+        env:
+          HELM_VALUES: ${{ vars.HELM_VALUES }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REPO: ${{ steps.target.outputs.repo }}
+          CLOUD_VALUES: ${{ steps.target.outputs.values }}
+        run: |
+          set -euo pipefail
+          test -n "$HELM_VALUES" || { echo "HELM_VALUES is not set on the environment" >&2; exit 1; }
+          printf '%s\n' "$HELM_VALUES" > "$RUNNER_TEMP/values.yaml"
+          chart=deploy/helm/cctl-control-plane
+          helm upgrade --install cctl "$chart" --namespace "$NAMESPACE" --create-namespace \
+            -f "$chart/$CLOUD_VALUES" -f "$RUNNER_TEMP/values.yaml" \
+            --set image.repository="$REPO" --set image.digest="$DIGEST" \
+            --atomic --wait --timeout 10m
+          kubectl -n "$NAMESPACE" rollout status deploy/cctl --timeout=5m

@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+coverage.xml
+tests
+e2e
+docs
+deploy
+!deploy/docker
+*.pem
+*.key
+.env

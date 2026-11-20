@@ -397,6 +397,53 @@ def approve(
     console.print(f"[green]Signed.[/green] The requester re-runs the same command with --approval {req.request_id}.")
 
 
+@app.command("sign")
+def sign_request(
+    request_file: str = typer.Argument(..., help="The request as the service returns it "
+                                                 "(GET /v1/approvals/<id>), saved to a file."),
+    approver: str = typer.Option(..., "--approver", help="Your approver name."),
+    key: Optional[str] = typer.Option(None, "--key", help="Private key path."),
+    yes: bool = typer.Option(False, "--yes", help="Sign without the confirmation prompt."),
+) -> None:
+    """Sign an approval request fetched from the control-plane service, offline.
+    Prints {"signature", "signed_at"} to POST to /v1/approvals/<id>; the key never leaves this machine."""
+    from cloudctl.gate.approval import load_private_key, sign  # noqa: PLC0415
+    from cloudctl.gate.approval.signing import ApprovalRequest  # noqa: PLC0415
+    from cloudctl.gate.models import ApprovalError  # noqa: PLC0415
+    err = Console(stderr=True)                     # stdout carries only the JSON to post
+    try:
+        req = ApprovalRequest.from_dict(json.loads(Path(request_file).read_text(encoding="utf-8")))
+    except (OSError, ValueError, KeyError, TypeError, ApprovalError) as e:
+        err.print(f"[red]Cannot read the request: {e}[/red]")
+        raise typer.Exit(1) from None
+    if req.expired():
+        err.print("[red]Cannot approve: the request has expired.[/red]")
+        raise typer.Exit(1)
+    if req.requester == approver:
+        err.print("[red]Cannot approve: you requested this change.[/red]")
+        raise typer.Exit(1)
+    key_path = Path(key).expanduser() if key else _default_key(approver)
+    try:
+        encrypted = key_path.is_file() and b"ENCRYPTED" in key_path.read_bytes()[:64]
+        priv = load_private_key(key_path, _passphrase(encrypted))
+    except ApprovalError as e:
+        err.print(f"[red]Cannot approve: {e}[/red]")
+        raise typer.Exit(1) from None
+    c = req.counts
+    err.print(f"[bold]Request {req.request_id}[/bold] in {req.environment} ({req.tier})\n"
+                  f"  requested by {req.requester} at {req.created_at}, expires {req.expires_at}\n"
+                  f"  plan {req.plan_digest[:16]}…: +{c.get('add', 0)} ~{c.get('modify', 0)} "
+                  f"-{c.get('destroy', 0)}, highest finding {req.max_severity}\n"
+                  f"  {req.summary}", highlight=False)
+    for r in req.reasons:
+        err.print(f"  - {r}", highlight=False)
+    if not yes and not typer.confirm("Sign this approval?", default=False, err=True):
+        err.print("Not signed.")
+        raise typer.Exit(1)
+    signed = sign(req, approver, priv)
+    typer.echo(json.dumps({"approver": approver, "signature": signed.signature, "signed_at": signed.signed_at}))
+
+
 # ── audit ────────────────────────────────────────────────────────────────────
 
 @audit_app.command("verify")

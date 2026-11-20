@@ -1,0 +1,7 @@
+cloud: gcp
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: ""      # terraform output service_account_email
+settings:
+  state: {backend: firestore, project: "", database: "(default)", prefix: cctl}
+  model: {adapter: converse, region: us-east-1}   # or an installed adapter for Vertex AI

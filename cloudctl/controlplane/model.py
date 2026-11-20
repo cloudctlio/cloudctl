@@ -53,3 +53,100 @@ class ConverseAdapter:
         usage = resp.get("usage") or {}
         return ModelReply(text=text, input_tokens=int(usage.get("inputTokens") or 0),
                           output_tokens=int(usage.get("outputTokens") or 0), model=self.model_id)
+
+
+# ── registry and guard ──────────────────────────────────────────────────────
+
+class ModelAdapterError(Exception):
+    pass
+
+
+_REGISTRY: dict[str, Any] = {}
+ENTRY_POINT_GROUP = "cloudctl.model_adapters"
+
+
+def register_adapter(name: str, factory: Any) -> None:
+    """Register ``factory(**settings) -> ModelAdapter`` under *name*."""
+    if not name.isidentifier():
+        raise ModelAdapterError(f"invalid adapter name {name!r}")
+    _REGISTRY[name] = factory
+
+
+def _converse_factory(**settings: Any) -> ConverseAdapter:
+    return ConverseAdapter.from_environment(profile=settings.get("profile"),
+                                            region=settings.get("region", "us-east-1"))
+
+
+register_adapter("converse", _converse_factory)
+
+
+def load_adapter(name: str = "converse", **settings: Any) -> ModelAdapter:
+    """A registered adapter, or one an installed package publishes under the
+    ``cloudctl.model_adapters`` entry-point group. Nothing is imported from a
+    module path given at run time: only installed, named adapters load."""
+    factory = _REGISTRY.get(name)
+    if factory is None:
+        from importlib.metadata import entry_points  # noqa: PLC0415
+        found = [ep for ep in entry_points(group=ENTRY_POINT_GROUP) if ep.name == name]
+        if not found:
+            known = sorted(set(_REGISTRY) | {ep.name for ep in entry_points(group=ENTRY_POINT_GROUP)})
+            raise ModelAdapterError(f"no model adapter {name!r}; installed: {known}")
+        factory = found[0].load()
+    adapter = factory(**settings)
+    if not callable(getattr(adapter, "complete", None)):
+        raise ModelAdapterError(f"adapter {name!r} has no complete(system, user) method")
+    return adapter
+
+
+class GuardedAdapter:
+    """Wraps any adapter with the limits a shared service needs: a cap on
+    prompt size, bounded retries with backoff on errors, and an hourly token
+    budget. Every call (and every refusal) goes to *audit*."""
+
+    def __init__(self, inner: ModelAdapter, *, max_prompt_chars: int = 200_000, retries: int = 2,
+                 backoff_seconds: float = 2.0, tokens_per_hour: int = 2_000_000,
+                 audit: Any = None, sleep: Any = None, clock: Any = None) -> None:
+        import threading  # noqa: PLC0415
+        import time  # noqa: PLC0415
+        self.inner = inner
+        self.max_prompt_chars = max_prompt_chars
+        self.retries = max(0, min(retries, 5))
+        self.backoff = backoff_seconds
+        self.tokens_per_hour = tokens_per_hour
+        self.audit = audit
+        self._sleep = sleep or time.sleep
+        self._clock = clock or time.time
+        self._window: list[tuple[float, int]] = []
+        self._lock = threading.Lock()
+
+    def _used(self, now: float) -> int:
+        self._window = [(t, n) for t, n in self._window if now - t < 3600]
+        return sum(n for _, n in self._window)
+
+    def _log(self, event: str, data: dict) -> None:
+        if self.audit:
+            self.audit(event, data)
+
+    def complete(self, system: str, user: str) -> ModelReply:
+        size = len(system) + len(user)
+        if size > self.max_prompt_chars:
+            self._log("model.refused", {"reason": "prompt too large", "chars": size})
+            raise ModelAdapterError(f"prompt is {size} characters; the limit is {self.max_prompt_chars}")
+        with self._lock:
+            if self._used(self._clock()) >= self.tokens_per_hour:
+                self._log("model.refused", {"reason": "hourly token budget spent"})
+                raise ModelAdapterError("the hourly model token budget is spent")
+        last: Optional[Exception] = None
+        for attempt in range(self.retries + 1):
+            try:
+                reply = self.inner.complete(system, user)
+            except Exception as e:  # noqa: BLE001 — provider SDKs raise many types
+                last = e
+                self._log("model.error", {"attempt": attempt + 1, "error": str(e)[:300]})
+                if attempt < self.retries:
+                    self._sleep(self.backoff * (2 ** attempt))
+                continue
+            with self._lock:
+                self._window.append((self._clock(), reply.input_tokens + reply.output_tokens))
+            return reply
+        raise ModelAdapterError(f"the model failed after {self.retries + 1} attempts: {last}")

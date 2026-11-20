@@ -33,8 +33,8 @@ jobs:
 
       # ── 0. Tests + Coverage (required for SonarCloud) ─────────
       - name: Install package and test dependencies
-        # [ai] brings langgraph; without it 12 test modules fail to import.
-        run: pip install -e ".[ai,gate]" pytest pytest-cov
+        # [ai] brings langgraph; without it 12 test modules fail to import. [service] runs the API tests.
+        run: pip install -e ".[ai,gate,service]" pytest pytest-cov
 
       - name: Run tests with coverage
         run: pytest tests/ --cov=cloudctl --cov-report=xml:coverage.xml -q

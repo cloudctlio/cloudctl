@@ -1,0 +1,6 @@
+cloud: aws
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: ""     # terraform output service_role_arn
+settings:
+  state: {backend: dynamodb, table: cctl-control-plane, region: us-east-1}

@@ -129,6 +129,26 @@ class Orchestrator:
 
     # ── public ──────────────────────────────────────────────────────────────
     def start(self, graph: ChangeGraph) -> S.RunState:
+        """Validate, record and run a graph to its first stop."""
+        run = self.prepare(graph)
+        return self.drive(run.run_id)
+
+    def drive(self, run_id: str) -> S.RunState:
+        """Run a prepared graph that has not started yet (the service calls this
+        from a worker after answering the request)."""
+        with self.store.lock(run_id):
+            run = self.store.load(run_id)
+            if run.requester != self.requester:
+                raise OrchestratorError(f"run {run_id} belongs to {run.requester!r}")
+            if any(n.status != S.PENDING for n in run.nodes.values()):
+                raise OrchestratorError(f"run {run_id} has already started; use resume")
+            graph = parse_graph(run.graph)
+            if graph.digest() != run.graph_digest:
+                raise OrchestratorError(f"run {run_id}: the stored graph does not match its digest")
+            return self._drive(run, graph, {})
+
+    def prepare(self, graph: ChangeGraph) -> S.RunState:
+        """Validate a graph and store it as a pending run. Applies nothing."""
         if graph.questions:
             raise OrchestratorError("the graph still has open questions; answer them and compile again")
         if not graph.nodes:
@@ -143,8 +163,7 @@ class Orchestrator:
         self.gate.record("orchestrator.run.start", {"run_id": run.run_id, "graph_digest": run.graph_digest,
                                                     "request": graph.request[:500], "order": order,
                                                     "requester": self.requester})
-        with self.store.lock(run.run_id):
-            return self._drive(run, graph, {})
+        return run
 
     def resume(self, run_id: str, approvals: Optional[Mapping[str, str]] = None) -> S.RunState:
         approvals = dict(approvals or {})

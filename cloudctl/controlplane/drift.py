@@ -557,15 +557,24 @@ class DriftLoop:
     # ── one pass ────────────────────────────────────────────────────────────
     def scan_once(self, environments: Optional[Iterable[str]] = None, *, repair: bool = True) -> list[DriftEvent]:
         with self.store.lock():
-            targets = self.targets(environments)
-            self.gate.record("drift.scan.start", {"targets": [[e.name, r] for e, r in targets],
-                                                  "repair": repair})
-            out = []
-            for env, root in targets:
-                ev = self._scan_target(env, root, repair=repair)
-                if ev is not None:
-                    out.append(ev)
-            return out
+            return self._scan_all(environments, repair=repair)
+
+    def pass_once(self, environments: Optional[Iterable[str]] = None, *, repair: bool = True,
+                  rollbacks: Any = None) -> list[DriftEvent]:
+        """One locked pass: take rollback requests, then scan."""
+        with self.store.lock():
+            taken = self._take_rollbacks(rollbacks) if rollbacks is not None else []
+            return taken + self._scan_all(environments, repair=repair)
+
+    def _scan_all(self, environments: Optional[Iterable[str]], *, repair: bool) -> list[DriftEvent]:
+        targets = self.targets(environments)
+        self.gate.record("drift.scan.start", {"targets": [[e.name, r] for e, r in targets], "repair": repair})
+        out = []
+        for env, root in targets:
+            ev = self._scan_target(env, root, repair=repair)
+            if ev is not None:
+                out.append(ev)
+        return out
 
     def _scan_target(self, env: Any, root: str, *, repair: bool, failed_change: bool = False,
                      rollback_id: str = "") -> Optional[DriftEvent]:
@@ -691,7 +700,11 @@ class DriftLoop:
     # ── rollback requests from failed change runs ───────────────────────────
     def take_rollbacks(self, queue: Any) -> list[DriftEvent]:
         """Turn queued rollback requests into ``failed_change`` events (never
-        auto-repaired). Each request is moved to ``done/`` once handled."""
+        auto-repaired). Each request is marked done once handled."""
+        with self.store.lock():
+            return self._take_rollbacks(queue)
+
+    def _take_rollbacks(self, queue: Any) -> list[DriftEvent]:
         out = []
         for req in queue.pending():
             target = req.get("target") or {}
@@ -724,9 +737,7 @@ class DriftLoop:
             raise ValueError("interval must be at least 60 seconds")
         passes = 0
         while max_passes is None or passes < max_passes:
-            if rollbacks is not None:
-                self.take_rollbacks(rollbacks)
-            self.scan_once(environments, repair=repair)
+            self.pass_once(environments, repair=repair, rollbacks=rollbacks)
             passes += 1
             if max_passes is None or passes < max_passes:
                 sleep(interval)
