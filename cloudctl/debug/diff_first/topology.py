@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 from cloudctl.debug.diff_first.model import Resource
 from cloudctl.debug.diff_first.normalize import (
-    ATTACHMENT_TYPES, OBSERVER_TYPES, get_field, identifiers_in, norm_key,
+    ATTACHMENT_TYPES, get_field, identifiers_in, is_observer, norm_key,
 )
 from cloudctl.debug.diff_first.resolve import Resolver
 
@@ -98,7 +98,7 @@ class Topology:
         for c in self.flow_rev.get(key, set()):
             if self.is_connector(c):
                 out.add(c)
-        return {k for k in out if self.type_of(k) not in OBSERVER_TYPES}
+        return {k for k in out if not is_observer(self.type_of(k))}
 
     def downstream(self, key: str) -> set[str]:
         return set(self.flow.get(key, set()))

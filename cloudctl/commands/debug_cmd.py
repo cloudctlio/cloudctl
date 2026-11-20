@@ -249,6 +249,9 @@ def _render_diff_first_rows(t, d: dict) -> None:
             flag = "  **(not in the diagnosis above)**" if c.get("summary") in extra else ""
             lines.append(f"- {c.get('summary')} → explains {', '.join(c.get('explains') or [])}{flag}")
         t.add_row(Text("CHANGE CHECK"), Markdown("\n".join(lines)), end_section=True)
+    if df.get("monitor_drift"):
+        t.add_row(Text("MONITOR DRIFT"),
+                  Markdown("\n".join(f"- {s}" for s in df["monitor_drift"])), end_section=True)
     if df.get("unexplained"):
         t.add_row(Text("UNEXPLAINED"),
                   Markdown("\n".join(f"- {s}" for s in df["unexplained"])), end_section=True)
