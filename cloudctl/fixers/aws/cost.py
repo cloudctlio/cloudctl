@@ -1,8 +1,25 @@
-"""AWS cost fixers — stop idle instances, delete orphaned volumes, remove old snapshots."""
+"""AWS cost fixers — stop idle instances, delete orphaned volumes, remove old snapshots.
+
+Deleting a volume or snapshot destroys data. Under the policy gate that is a
+MEDIUM finding outside production and a CRITICAL one (rejected) in
+production: the gate does not let an automated cost fix delete prod data.
+"""
 from __future__ import annotations
 
-from cloudctl.fixers.base import BaseFixer
+import re
+from typing import Any
+
+from cloudctl.fixers.aws.security import _act, _rc, _region
+from cloudctl.fixers.base import BaseFixer, aws_session
 from cloudctl.fixers.registry import register
+
+
+def _find(pattern: str, issue: dict, what: str) -> str:
+    resource = issue.get("resource", "")
+    match = re.search(pattern, resource)
+    if not match:
+        raise ValueError(f"Could not parse {what} from: {resource}")
+    return match.group(1)
 
 
 @register
@@ -19,21 +36,16 @@ class AWSStopIdleInstanceFixer(BaseFixer):
             "idle" in issue_text or "unused" in issue_text or "low cpu" in issue_text
         )
 
-    def apply(self, issue: dict, fix_proposal: dict) -> None:
-        import re  # noqa: PLC0415
-        import boto3  # noqa: PLC0415
+    def plan(self, issue: dict, fix_proposal: dict, *, creds: Any, env: Any) -> list:
+        iid = _find(r"(i-[a-z0-9]+)", issue, "instance ID")
+        region = _region(issue, env)
+        return [_rc(address=f"ec2/{iid}", type="aws_instance", action=_act("update"), name=iid,
+                    location=region or "", before={"instance_state": "running", "region": region},
+                    after={"instance_state": "stopped", "region": region}, operations=("ec2:StopInstances",))]
 
-        resource = issue.get("resource", "")
-        match    = re.search(r"(i-[a-z0-9]+)", resource)
-        if not match:
-            raise ValueError(f"Could not parse instance ID from: {resource}")
-
-        instance_id = match.group(1)
-        account     = issue.get("account", "default")
-        region      = issue.get("region")
-
-        session = boto3.Session(profile_name=account, region_name=region)
-        ec2     = session.client("ec2")
+    def apply(self, issue: dict, fix_proposal: dict, creds: Any = None) -> None:
+        instance_id = _find(r"(i-[a-z0-9]+)", issue, "instance ID")
+        ec2 = aws_session(issue, creds, issue.get("region")).client("ec2")
         ec2.stop_instances(InstanceIds=[instance_id])
 
 
@@ -51,21 +63,26 @@ class AWSDeleteOrphanedVolumeFixer(BaseFixer):
             "orphan" in issue_text or "unattached" in issue_text or "unused" in issue_text
         )
 
-    def apply(self, issue: dict, fix_proposal: dict) -> None:
-        import re  # noqa: PLC0415
-        import boto3  # noqa: PLC0415
+    def plan(self, issue: dict, fix_proposal: dict, *, creds: Any, env: Any) -> list:
+        vid = _find(r"(vol-[a-z0-9]+)", issue, "volume ID")
+        region = _region(issue, env)
+        ec2 = aws_session(issue, creds, region).client("ec2")
+        vols = ec2.describe_volumes(VolumeIds=[vid]).get("Volumes") or []
+        if not vols:
+            return []
+        v = vols[0]
+        if v.get("Attachments"):
+            from cloudctl.gate.models import PlanError  # noqa: PLC0415
+            raise PlanError(f"{vid} is attached to an instance; it is not orphaned")
+        return [_rc(address=f"ebs/{vid}", type="aws_ebs_volume", action=_act("delete"), name=vid,
+                    location=region or "",
+                    before={"size": v.get("Size"), "state": v.get("State"), "encrypted": v.get("Encrypted"),
+                            "region": region},
+                    after=None, operations=("ec2:DeleteVolume",))]
 
-        resource = issue.get("resource", "")
-        match    = re.search(r"(vol-[a-z0-9]+)", resource)
-        if not match:
-            raise ValueError(f"Could not parse volume ID from: {resource}")
-
-        volume_id = match.group(1)
-        account   = issue.get("account", "default")
-        region    = issue.get("region")
-
-        session = boto3.Session(profile_name=account, region_name=region)
-        ec2     = session.client("ec2")
+    def apply(self, issue: dict, fix_proposal: dict, creds: Any = None) -> None:
+        volume_id = _find(r"(vol-[a-z0-9]+)", issue, "volume ID")
+        ec2 = aws_session(issue, creds, issue.get("region")).client("ec2")
         ec2.delete_volume(VolumeId=volume_id)
 
 
@@ -83,19 +100,14 @@ class AWSDeleteOldSnapshotFixer(BaseFixer):
             "old" in issue_text or "retention" in issue_text or "expired" in issue_text
         )
 
-    def apply(self, issue: dict, fix_proposal: dict) -> None:
-        import re  # noqa: PLC0415
-        import boto3  # noqa: PLC0415
+    def plan(self, issue: dict, fix_proposal: dict, *, creds: Any, env: Any) -> list:
+        sid = _find(r"(snap-[a-z0-9]+)", issue, "snapshot ID")
+        region = _region(issue, env)
+        return [_rc(address=f"snapshot/{sid}", type="aws_ebs_snapshot", action=_act("delete"), name=sid,
+                    location=region or "", before={"region": region}, after=None,
+                    operations=("ec2:DeleteSnapshot",))]
 
-        resource = issue.get("resource", "")
-        match    = re.search(r"(snap-[a-z0-9]+)", resource)
-        if not match:
-            raise ValueError(f"Could not parse snapshot ID from: {resource}")
-
-        snapshot_id = match.group(1)
-        account     = issue.get("account", "default")
-        region      = issue.get("region")
-
-        session = boto3.Session(profile_name=account, region_name=region)
-        ec2     = session.client("ec2")
+    def apply(self, issue: dict, fix_proposal: dict, creds: Any = None) -> None:
+        snapshot_id = _find(r"(snap-[a-z0-9]+)", issue, "snapshot ID")
+        ec2 = aws_session(issue, creds, issue.get("region")).client("ec2")
         ec2.delete_snapshot(SnapshotId=snapshot_id)
