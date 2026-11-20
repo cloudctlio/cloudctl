@@ -14,13 +14,17 @@ def register(cls: type[BaseFixer]) -> type[BaseFixer]:
     return cls
 
 
-def get_fixer(issue: dict) -> Optional[BaseFixer]:
+def get_fixer(issue: dict, cloud: Optional[str] = None) -> Optional[BaseFixer]:
     """
     Return the first registered fixer that can handle this issue.
+    With *cloud*, only fixers for that cloud (or for every cloud) are tried,
+    so an issue worded alike on two clouds goes to the right one.
     Returns None if no fixer is available.
     """
     _ensure_loaded()
     for cls in _REGISTRY:
+        if cloud and cls.cloud and cls.cloud != cloud:
+            continue
         try:
             instance = cls()
             if instance.can_fix(issue):

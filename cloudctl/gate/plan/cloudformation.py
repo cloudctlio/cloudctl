@@ -154,13 +154,15 @@ class CdkPlanner:
 
     def __init__(self, root: Path | str, *, binary_path: Optional[str] = None,
                  pinned_version: Optional[str] = None, stacks: tuple[str, ...] = (),
-                 template_bucket: Optional[str] = None, timeout: int = 900) -> None:
+                 template_bucket: Optional[str] = None, timeout: int = 900,
+                 keep_change_sets: bool = False) -> None:
         self.root = Path(root).expanduser().resolve()
         self.binary_path = binary_path
         self.pinned_version = pinned_version
         self.only = stacks
         self.template_bucket = template_bucket
         self.timeout = timeout
+        self.keep = keep_change_sets
 
     def plan(self, *, env: Any, creds: Any, workdir: Path) -> Plan:
         if not (self.root / "cdk.json").is_file():
@@ -179,7 +181,7 @@ class CdkPlanner:
         stacks = stacks_from_manifest(out, only=self.only)
         if not stacks:
             raise PlanError("cdk synth produced no stacks")
-        inner = CloudFormationPlanner(stacks, template_bucket=self.template_bucket)
+        inner = CloudFormationPlanner(stacks, template_bucket=self.template_bucket, keep_change_sets=self.keep)
         return inner.plan(env=env, creds=creds, workdir=workdir, platform="cdk", source=str(self.root))
 
 

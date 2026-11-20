@@ -106,20 +106,27 @@ class ArmWhatIfPlanner:
         doc = json.loads(self.parameters.read_text(encoding="utf-8"))
         return doc.get("parameters", doc)
 
+    def client(self, env: Any, creds: Any) -> Any:
+        """A ResourceManagementClient for the environment's subscription,
+        signed with the scoped credentials only."""
+        sub = env.scope["subscription_id"]
+        if self._rm_factory is not None:
+            return self._rm_factory(creds.client("credential"), sub)
+        try:
+            from azure.mgmt.resource import ResourceManagementClient  # noqa: PLC0415
+        except ImportError as e:
+            raise PlanError("ARM what-if needs azure-mgmt-resource (pip install 'cctl[azure]')") from e
+        return ResourceManagementClient(creds.client("credential"), sub)
+
+    def deployment_body(self, template: Mapping[str, Any]) -> dict:
+        return {"properties": {"mode": self.mode, "template": dict(template), "parameters": self._params()}}
+
     def plan(self, *, env: Any, creds: Any, workdir: Path) -> Plan:
         template = self._template_json(creds)
         (workdir / "template.json").write_text(json.dumps(template), encoding="utf-8")
-        sub = env.scope["subscription_id"]
         rg = env.scope["resource_group"]
-        if self._rm_factory is not None:
-            client = self._rm_factory(creds.client("credential"), sub)
-        else:
-            try:
-                from azure.mgmt.resource import ResourceManagementClient  # noqa: PLC0415
-            except ImportError as e:
-                raise PlanError("ARM what-if needs azure-mgmt-resource (pip install 'cctl[azure]')") from e
-            client = ResourceManagementClient(creds.client("credential"), sub)
-        body = {"properties": {"mode": self.mode, "template": template, "parameters": self._params()}}
+        client = self.client(env, creds)
+        body = self.deployment_body(template)
         try:
             poller = client.deployments.begin_what_if(rg, "cctl-whatif", body)
             result = poller.result(timeout=self.timeout)

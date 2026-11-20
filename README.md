@@ -195,6 +195,18 @@ Every `--fix` and `--resolve` change goes through a five-stage gate: short-lived
 | `cloudctl gate approvals list` / `cloudctl gate approve <id>` | Review and sign approval requests |
 | `cloudctl gate audit verify` | Check the audit hash chain |
 
+### Change requests (requires `pip install "cctl[gate]"`)
+
+Compile a plain-language request into a change graph (validated against a fixed schema; ambiguous requests get questions back), then run it node by node through the policy gate. A failed node is never retried: everything after it is skipped and a targeted rollback request is queued. See [docs/control-plane.md](docs/control-plane.md).
+
+| Command | What it does |
+|---|---|
+| `cloudctl change compile "<request>" -o graph.json` | Ask the model for a change graph; applies nothing |
+| `cloudctl change run graph.json` | Run the graph through the gate, in dependency order |
+| `cloudctl change resume <run> --approval <node>=<id>` | Carry on after approvals |
+| `cloudctl change status <run>` / `cloudctl change list` | Where runs stand |
+| `cloudctl change rollbacks` | Rollback requests waiting for the drift repair loop |
+
 ### Setup
 
 | Command | What it does |
