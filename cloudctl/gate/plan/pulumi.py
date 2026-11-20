@@ -75,8 +75,10 @@ class PulumiPlanner:
     platform = "pulumi"
 
     def __init__(self, root: Path | str, stack: str, *, binary_path: Optional[str] = None,
-                 pinned_version: Optional[str] = None, timeout: int = 900) -> None:
+                 pinned_version: Optional[str] = None, timeout: int = 900, refresh: bool = False) -> None:
         self.root = Path(root).expanduser().resolve()
+        #: ``--refresh`` reads live state first, so the preview shows drift.
+        self.refresh = refresh
         self.stack = stack
         self.binary_path = binary_path
         self.pinned_version = pinned_version
@@ -89,8 +91,10 @@ class PulumiPlanner:
         ver = run_tool([exe, "version"], cwd=self.root, env=senv, timeout=60, what="pulumi version")
         if not tool_version_matches(ver.stdout, self.pinned_version):
             raise PlanError(f"pulumi version mismatch: pinned {self.pinned_version}, found {ver.stdout.strip()}")
-        res = run_tool([exe, "preview", "--json", "--diff", "--non-interactive", "--stack", self.stack],
-                       cwd=self.root, env=senv, timeout=self.timeout, what="pulumi preview")
+        argv = [exe, "preview", "--json", "--diff", "--non-interactive", "--stack", self.stack]
+        if self.refresh:
+            argv.append("--refresh")
+        res = run_tool(argv, cwd=self.root, env=senv, timeout=self.timeout, what="pulumi preview")
         try:
             doc = json.loads(res.stdout)
         except ValueError as e:

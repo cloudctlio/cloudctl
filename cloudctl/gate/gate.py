@@ -183,6 +183,10 @@ class PolicyGate:
         return cls(config, audit=build_audit_log(config, actor=actor or default_requester()))
 
     # ── public ──────────────────────────────────────────────────────────────
+    def policy(self) -> tuple[list[Any], list[Any]]:
+        """(enrichers, engines) this gate evaluates with."""
+        return self._policy if self._policy is not None else build_policy(self.config)
+
     def record(self, event: str, data: Mapping[str, Any]) -> None:
         """Audit an operator action, model call or tool call (fails closed)."""
         self.audit.append(event, data)
@@ -229,7 +233,7 @@ class PolicyGate:
             # 3. policy
             ctx = PolicyContext(plan=plan, env=env, request=request, creds=creds)
             try:
-                enrichers, engines = self._policy if self._policy is not None else build_policy(self.config)
+                enrichers, engines = self.policy()
                 result = evaluate_policy(ctx, enrichers=enrichers, engines=engines,
                                          severity_overrides=self.config.policy.severity_overrides,
                                          disabled_rules=env.disabled_rules)

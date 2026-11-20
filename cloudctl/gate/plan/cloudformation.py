@@ -165,6 +165,12 @@ class CdkPlanner:
         self.keep = keep_change_sets
 
     def plan(self, *, env: Any, creds: Any, workdir: Path) -> Plan:
+        stacks = self.synth(env=env, creds=creds, workdir=workdir)
+        inner = CloudFormationPlanner(stacks, template_bucket=self.template_bucket, keep_change_sets=self.keep)
+        return inner.plan(env=env, creds=creds, workdir=workdir, platform="cdk", source=str(self.root))
+
+    def synth(self, *, env: Any, creds: Any, workdir: Path) -> dict[str, Path]:
+        """``cdk synth`` into *workdir*; returns stack name → template."""
         if not (self.root / "cdk.json").is_file():
             raise PlanError(f"{self.root} has no cdk.json")
         exe = find_binary("cdk", self.binary_path)
@@ -181,8 +187,7 @@ class CdkPlanner:
         stacks = stacks_from_manifest(out, only=self.only)
         if not stacks:
             raise PlanError("cdk synth produced no stacks")
-        inner = CloudFormationPlanner(stacks, template_bucket=self.template_bucket, keep_change_sets=self.keep)
-        return inner.plan(env=env, creds=creds, workdir=workdir, platform="cdk", source=str(self.root))
+        return stacks
 
 
 def stacks_from_manifest(assembly: Path, *, only: tuple[str, ...] = ()) -> dict[str, Path]:

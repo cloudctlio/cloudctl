@@ -24,6 +24,7 @@ from cloudctl.commands import cost as cost_cmd
 from cloudctl.commands import database as database_cmd
 from cloudctl.commands import debug_cmd
 from cloudctl.commands import change_cmd
+from cloudctl.commands import drift_cmd
 from cloudctl.commands import gate_cmd
 from cloudctl.commands import diff as diff_cmd
 from cloudctl.commands import feedback_cmd
@@ -62,6 +63,7 @@ app.add_typer(containers_cmd.app, name="containers")
 app.add_typer(cost_cmd.app,       name="cost")
 app.add_typer(gate_cmd.app,       name="gate")
 app.add_typer(change_cmd.app,     name="change")
+app.add_typer(drift_cmd.app,      name="drift")
 app.add_typer(database_cmd.app,   name="database")
 app.command("debug", help="Debug a cloud infrastructure issue using AI analysis of real data.")(debug_cmd.debug_issue)
 app.add_typer(diff_cmd.app,       name="diff")

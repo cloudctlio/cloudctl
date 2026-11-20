@@ -261,8 +261,10 @@ class PulumiExecutor(_ReplanExecutor):
         exe = _tool(lambda: find_binary("pulumi", p.binary_path), "pulumi up")
         senv = creds.subprocess_env()
         senv.update({"PULUMI_SKIP_UPDATE_CHECK": "true", "PULUMI_SKIP_CONFIRMATIONS": "true"})
-        res = _tool(lambda: run_tool([exe, "up", "--yes", "--skip-preview", "--non-interactive",
-                                      "--stack", p.stack], cwd=p.root, env=senv, timeout=p.timeout,
+        argv = [exe, "up", "--yes", "--skip-preview", "--non-interactive", "--stack", p.stack]
+        if getattr(p, "refresh", False):
+            argv.append("--refresh")
+        res = _tool(lambda: run_tool(argv, cwd=p.root, env=senv, timeout=p.timeout,
                                      what="pulumi up"), "pulumi up")
         return {"tool": "pulumi", "stack": p.stack, "output_tail": res.stdout[-500:]}
 

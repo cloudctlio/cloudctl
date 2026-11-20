@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -101,6 +102,15 @@ class QueuedRollback:
             except ValueError:
                 continue
         return out
+
+    def done(self, request_id: str) -> None:
+        """Move a handled request to ``done/`` so it is not taken twice."""
+        if not re.fullmatch(r"[0-9a-f]{32}", request_id or ""):
+            raise ValueError(f"not a rollback request id: {request_id!r}")
+        src = self.dir / f"{request_id}.json"
+        dst = self.dir / "done"
+        dst.mkdir(exist_ok=True)
+        os.replace(src, dst / src.name)
 
 
 class OrchestratorError(Exception):

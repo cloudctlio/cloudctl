@@ -73,8 +73,9 @@ never credentials. The person's own wording is kept as the graph's
 - Failed while applying: never retried, not even on resume. Downstream nodes
   are skipped, and a targeted rollback request for that one node (with the
   list of nodes already applied before it) is queued in
-  `~/.cloudctl/rollbacks` for the drift repair loop. `change rollbacks` lists
-  them. The queue itself changes nothing.
+  `~/.cloudctl/rollbacks` for the [drift repair loop](drift-loop.md), which
+  turns each into a `failed_change` event that is never repaired without a
+  person. `change rollbacks` lists them. The queue itself changes nothing.
 - A process that stopped while a node was running leaves that node as
   failed on resume (its outcome is unknown), with a rollback request.
 - Run state lives in `~/.cloudctl/runs/<run-id>.json` (0600, written

@@ -207,6 +207,18 @@ Compile a plain-language request into a change graph (validated against a fixed 
 | `cloudctl change status <run>` / `cloudctl change list` | Where runs stand |
 | `cloudctl change rollbacks` | Rollback requests waiting for the drift repair loop |
 
+### Drift repair loop (requires `pip install "cctl[gate]"`)
+
+Find where live state no longer matches IaC (Terraform/OpenTofu, Pulumi, ARM/Bicep, Kubernetes, CloudFormation/CDK on AWS, Azure and GCP), and repair it only through the gate, within an autonomy table: class first (a security incident is never auto-repaired), then environment tier × severity, then confidence θ. See [docs/drift-loop.md](docs/drift-loop.md).
+
+| Command | What it does |
+|---|---|
+| `cloudctl drift scan [--no-repair]` | One pass over every IaC root |
+| `cloudctl drift loop --interval 900` | Keep scanning; also takes rollback requests |
+| `cloudctl drift list` / `cloudctl drift show <event>` | Drift events, with class, severity, confidence and decision |
+| `cloudctl drift repair <event> [--override "why"]` | A person's go-ahead to repair one event |
+| `cloudctl drift table` | The autonomy table in force |
+
 ### Setup
 
 | Command | What it does |

@@ -203,6 +203,8 @@ class GateConfig:
     audit: AuditConfig
     approvals_dir: Path
     source: str = ""
+    #: The drift loop's autonomy table (cloudctl.controlplane.autonomy.AutonomyTable).
+    drift: Any = None
 
     def environment(self, name: str) -> EnvironmentConfig:
         try:
@@ -468,7 +470,8 @@ def _builtin_severities() -> dict[str, Severity]:
 def parse_config(data: Any, *, source: str = "<memory>") -> GateConfig:
     if not isinstance(data, Mapping):
         raise ConfigError(f"{source}: top level must be a mapping")
-    _check_keys("config", data, {"version", "environments", "approvers", "policy", "audit", "approvals_dir"},
+    _check_keys("config", data,
+                {"version", "environments", "approvers", "policy", "audit", "approvals_dir", "drift"},
                 {"version", "environments"})
     if data["version"] != 1:
         raise ConfigError(f"config.version: unsupported version {data['version']!r}; expected 1")
@@ -500,10 +503,16 @@ def parse_config(data: Any, *, source: str = "<memory>") -> GateConfig:
         if env.is_prod:
             _check_prod_policy(env, policy)
 
+    from cloudctl.controlplane.autonomy import AutonomyConfigError, parse_autonomy  # noqa: PLC0415
+    try:
+        drift = parse_autonomy(data.get("drift"))
+    except AutonomyConfigError as e:
+        raise ConfigError(str(e)) from None
+
     return GateConfig(
         environments=envs, approvers=approvers, policy=policy, audit=audit,
         approvals_dir=_path(data.get("approvals_dir", "~/.cloudctl/approvals")),
-        source=source,
+        source=source, drift=drift,
     )
 
 
