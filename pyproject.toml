@@ -57,7 +57,7 @@ azure = [
     # Network
     "azure-mgmt-network>=25.0",
     "azure-mgmt-dns>=8.0",
-    "azure-mgmt-apimanagement>=10.0",
+    "azure-mgmt-apimanagement>=4.0",
     # IAM / Security
     "azure-mgmt-authorization>=4.0",
     "azure-mgmt-keyvault>=10.0",
