@@ -1,0 +1,9 @@
+cloud: azure
+serviceAccount:
+  annotations:
+    azure.workload.identity/client-id: ""   # terraform output service_identity_client_id
+podLabels:
+  azure.workload.identity/use: "true"
+settings:
+  state: {backend: cosmos, endpoint: "", database: cctl, container: state}
+  model: {adapter: converse, region: us-east-1}   # or an installed adapter for Azure OpenAI

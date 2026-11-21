@@ -151,7 +151,9 @@ def cost_by_service(
     cloud:   str           = _CLOUD,
     account: Optional[str] = _ACCOUNT,
     days:    int           = _DAYS,
-    fix:     bool          = typer.Option(False, "--fix", help="Propose AI-generated cost optimizations (requires AI configured)."),
+    fix:     bool          = typer.Option(False, "--fix", help="Propose AI-generated cost optimizations and apply confirmed ones through the policy gate (requires AI and `cloudctl gate init`)."),
+    env:     Optional[str] = typer.Option(None, "--env", help="Gate environment for --fix (default: matched from the account)."),
+    approval: Optional[str] = typer.Option(None, "--approval", help="Signed approval request id to use for --fix."),
 ) -> None:
     """Show cost breakdown by service."""
     cfg = require_init()
@@ -172,10 +174,11 @@ def cost_by_service(
     print_table(rows, title=f"Cost by Service (last {days} days)")
 
     if fix and rows:
-        _apply_cost_fixes(cfg, rows)
+        _apply_cost_fixes(cfg, rows, env_name=env, approval_id=approval)
 
 
-def _apply_cost_fixes(cfg, rows: list[dict]) -> None:
+def _apply_cost_fixes(cfg, rows: list[dict], env_name: Optional[str] = None,
+                      approval_id: Optional[str] = None) -> None:
     """Propose AI cost optimizations for the top spending services."""
     try:
         from cloudctl.ai.fixer import AIFixer  # noqa: PLC0415
@@ -195,7 +198,7 @@ def _apply_cost_fixes(cfg, rows: list[dict]) -> None:
     fixer     = AIFixer(cfg)
     proposals = fixer.propose(issues)
     proposals = fixer.present_and_confirm(proposals)
-    fixer.apply(proposals)
+    fixer.apply(proposals, env_name=env_name, approval_id=approval_id)
 
 
 def _aws_budget_rows(cfg, account) -> list[dict]:

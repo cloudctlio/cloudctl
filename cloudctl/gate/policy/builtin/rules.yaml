@@ -1,0 +1,149 @@
+# Built-in gate rules. Each rule follows the gate's contract: id, severity
+# (LOW, MEDIUM, HIGH, CRITICAL), condition (a Rego body), fix hint.
+# HIGH and CRITICAL findings reject a change outright.
+#
+# scope: change  → the condition runs once per planned change, with `change` bound.
+# scope: plan    → the condition runs once for the whole plan.
+# Helpers live in lib.rego (package cloudctl.lib).
+#
+# These rules cover what the gate itself must guarantee on AWS, Azure and GCP
+# (blast radius, scope, exposure, cost). Broad CIS / NIST / vendor baselines
+# come from the Trivy and Checkov engines, AWS-specific CloudFormation rules
+# from cfn-guard, and Kubernetes admission rules from Kyverno.
+rules:
+  - id: CCTL-SCOPE-001
+    title: Change targets a resource outside the environment's scope
+    severity: CRITICAL
+    condition: |
+      data.cloudctl.lib.out_of_scope(change)
+    message: "{resource} is outside this environment's account, subscription/resource group, project or region."
+    fix_hint: Run the change under the environment that owns this resource, or fix the provider configuration.
+
+  - id: CCTL-SCOPE-002
+    title: Change touches a different cloud than the environment
+    severity: CRITICAL
+    condition: |
+      change.cloud in {"aws", "azure", "gcp"}
+      change.cloud != input.environment.cloud
+      data.cloudctl.lib.mutating(change)
+    message: "{resource} is in another cloud than this environment; the scoped credentials do not cover it."
+    fix_hint: Split the IaC root per cloud, or plan each cloud under its own environment.
+
+  - id: CCTL-DEL-001
+    title: Stateful resource destroyed in production
+    severity: CRITICAL
+    tiers: [prod]
+    condition: |
+      data.cloudctl.lib.destroying(change)
+      data.cloudctl.lib.is_stateful(change)
+    message: "{resource} holds data and would be deleted or replaced in production."
+    fix_hint: Take a backup or snapshot, enable deletion protection / prevent_destroy, and change the attribute that forces replacement.
+
+  - id: CCTL-DEL-002
+    title: Stateful resource destroyed outside production
+    severity: MEDIUM
+    tiers: [dev, test, staging]
+    condition: |
+      data.cloudctl.lib.destroying(change)
+      data.cloudctl.lib.is_stateful(change)
+    message: "{resource} holds data and would be deleted or replaced."
+    fix_hint: Confirm the data is disposable or back it up first.
+
+  - id: CCTL-NET-001
+    title: Ingress opened to the internet on a non-web port
+    severity: HIGH
+    condition: |
+      data.cloudctl.lib.mutating(change)
+      data.cloudctl.lib.open_ingress(change)
+    message: "{resource} allows inbound traffic from anywhere on a port other than 80/443."
+    fix_hint: Restrict the source to known CIDRs, a load balancer, or a private endpoint / IAP / bastion.
+
+  - id: CCTL-IAM-001
+    title: Administrator-level grant
+    severity: HIGH
+    condition: |
+      data.cloudctl.lib.mutating(change)
+      data.cloudctl.lib.admin_grant(change)
+    message: "{resource} grants full administrative access (Action * on Resource *, Owner/Contributor on a subscription, or roles/owner|editor)."
+    fix_hint: Grant the specific actions or a narrower built-in role at the narrowest scope.
+
+  - id: CCTL-IAM-002
+    title: Grant to the public or to any principal
+    severity: HIGH
+    condition: |
+      data.cloudctl.lib.mutating(change)
+      data.cloudctl.lib.public_principal(change)
+    message: "{resource} grants access to everyone (Principal *, allUsers / allAuthenticatedUsers, or public blob access)."
+    fix_hint: Name the principals that need access, or add a condition that limits the source.
+
+  - id: CCTL-STG-001
+    title: Storage made publicly accessible
+    severity: HIGH
+    condition: |
+      data.cloudctl.lib.mutating(change)
+      data.cloudctl.lib.public_storage(change)
+    message: "{resource} turns off public-access protection on storage."
+    fix_hint: Keep S3 Block Public Access, Azure allowBlobPublicAccess=false and GCS public access prevention enforced; serve public content through a CDN with an origin identity.
+
+  - id: CCTL-ENC-001
+    title: Encryption at rest or in transit weakened
+    severity: MEDIUM
+    condition: |
+      data.cloudctl.lib.mutating(change)
+      data.cloudctl.lib.weak_encryption(change)
+    message: "{resource} disables encryption at rest or allows weak / unencrypted transport."
+    fix_hint: Enable storage encryption (customer-managed keys where required) and require TLS 1.2+.
+
+  - id: CCTL-PLAN-001
+    title: The plan tool could not predict a change
+    severity: HIGH
+    condition: |
+      object.get(change.after, "_whatif_change_type", "") == "Unsupported"
+    message: "Azure what-if cannot predict the effect on {resource}."
+    fix_hint: Resolve the unsupported construct (often a reference() or nested deployment) so what-if can evaluate it.
+
+  - id: CCTL-COST-001
+    title: Monthly cost increase above the environment limit
+    severity: HIGH
+    scope: plan
+    condition: |
+      lim := input.environment.cost.max_monthly_increase_usd
+      lim != null
+      input.cost.estimated == true
+      input.cost.monthly_delta_usd > lim
+    message: "The plan raises estimated monthly cost by more than this environment allows."
+    fix_hint: Right-size the resources, or have the environment's cost limit raised through review.
+
+  - id: CCTL-COST-002
+    title: Cost limit set but the cost could not be estimated
+    severity: HIGH
+    scope: plan
+    condition: |
+      input.environment.cost.max_monthly_increase_usd != null
+      input.cost.estimated != true
+      input.environment.cost.allow_unestimated != true
+    message: "This environment has a cost limit, but the plan's cost could not be estimated."
+    fix_hint: Enable the infracost engine (Terraform/OpenTofu plans), or set cost.allow_unestimated for this environment.
+
+  - id: CCTL-COST-003
+    title: Model spend for this change above the environment limit
+    severity: HIGH
+    scope: plan
+    condition: |
+      lim := input.environment.cost.max_model_cost_usd
+      lim != null
+      input.model.cost_usd != null
+      input.model.cost_usd > lim
+    message: "The model calls behind this change cost more than this environment allows."
+    fix_hint: Re-run with a cheaper model (CLOUDCTL_MODEL) or raise cost.max_model_cost_usd through review.
+
+  - id: CCTL-COST-004
+    title: Model spend limit set but the spend is unknown
+    severity: HIGH
+    scope: plan
+    condition: |
+      input.environment.cost.max_model_cost_usd != null
+      input.model.cost_usd == null
+      input.environment.cost.allow_unestimated != true
+    message: "This environment limits model spend, but the model spend behind this change is unknown."
+    fix_hint: Set CLOUDCTL_MODEL_PRICE_USD_PER_MTOK (input,output USD per million tokens), or set cost.allow_unestimated.

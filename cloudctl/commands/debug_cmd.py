@@ -503,9 +503,20 @@ def debug_issue(
     ),
     resolve_yes: bool = typer.Option(
         False, "--yes",
-        help="With --resolve: skip the two approval gates (fix plan, and "
-             "diff+validation before push). Without this flag the agent stops "
-             "at each gate for confirmation; non-interactive runs stop safely.",
+        help="With --resolve: skip the two operator prompts (fix plan, and "
+             "diff+validation before push). The policy gate still runs before "
+             "every push and is never skipped. Without this flag the agent stops "
+             "at each prompt; non-interactive runs stop safely.",
+    ),
+    gate_env: Optional[str] = typer.Option(
+        None, "--env",
+        help="With --resolve: policy-gate environment for the fix (default: the one "
+             "whose `match` block names --iac-root or the profile).",
+    ),
+    approval_id: Optional[str] = typer.Option(
+        None, "--approval",
+        help="With --resolve: id of a signed approval (`cloudctl gate approve <id>`), "
+             "when the environment needs one.",
     ),
     base_branch: Optional[str] = typer.Option(
         None, "--base-branch",
@@ -673,6 +684,18 @@ def debug_issue(
                             return False
                         return ans in ("y", "yes")
 
+                    from cloudctl.gate.models import ConfigError as _GateConfigError  # noqa: PLC0415
+                    try:
+                        from cloudctl.gate.config import load_config as _load_gate  # noqa: PLC0415
+                        from cloudctl.gate.gate import PolicyGate as _PolicyGate  # noqa: PLC0415
+                        _gate = _PolicyGate.from_config(_load_gate())
+                    except _GateConfigError as e:
+                        _gate = None
+                        warn(f"Not running the resolution agent: the policy gate is not usable ({e}). "
+                             "Set it up with `cloudctl gate init`, then `cloudctl gate validate`.")
+                    if _gate is None:
+                        raise typer.Exit(1)
+
                     # No status spinner here: the approval gates prompt for
                     # input mid-run, which conflicts with a live status display.
                     console.print(f"\n[bold]Resolution agent starting (base: {base})...[/bold]")
@@ -684,6 +707,9 @@ def debug_issue(
                         profile=account,
                         region=region or "us-east-1",
                         approve=_approve,
+                        gate=_gate,
+                        gate_env=gate_env,
+                        approval_id=approval_id,
                     )
 
                     status = result.get("status", "error")

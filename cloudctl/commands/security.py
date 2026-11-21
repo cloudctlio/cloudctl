@@ -110,7 +110,9 @@ def _gcp_public_resource_rows(account) -> list[dict]:
 def security_audit(
     cloud:   str           = _CLOUD,
     account: Optional[str] = _ACCOUNT,
-    fix:     bool          = typer.Option(False, "--fix", help="Propose and apply AI-generated fixes (requires AI configured)."),
+    fix:     bool          = typer.Option(False, "--fix", help="Propose AI-generated fixes and apply confirmed ones through the policy gate (requires AI and `cloudctl gate init`)."),
+    env:     Optional[str] = typer.Option(None, "--env", help="Gate environment for --fix (default: matched from the account)."),
+    approval: Optional[str] = typer.Option(None, "--approval", help="Signed approval request id to use for --fix."),
 ) -> None:
     """Run security checks: public buckets, open security groups, IAM users without MFA."""
     cfg = require_init()
@@ -131,10 +133,11 @@ def security_audit(
     print_table(rows, title=f"Security Audit Findings ({len(rows)})")
 
     if fix and rows:
-        _apply_fixes(cfg, rows)
+        _apply_fixes(cfg, rows, env_name=env, approval_id=approval)
 
 
-def _apply_fixes(cfg, raw_findings: list[dict]) -> None:
+def _apply_fixes(cfg, raw_findings: list[dict], env_name: Optional[str] = None,
+                 approval_id: Optional[str] = None) -> None:
     """Propose and apply AI fixes for security findings (requires AI configured)."""
     try:
         from cloudctl.ai.fixer import AIFixer  # noqa: PLC0415
@@ -156,7 +159,7 @@ def _apply_fixes(cfg, raw_findings: list[dict]) -> None:
     fixer     = AIFixer(cfg)
     proposals = fixer.propose(issues)
     proposals = fixer.present_and_confirm(proposals)
-    fixer.apply(proposals)
+    fixer.apply(proposals, env_name=env_name, approval_id=approval_id)
 
 
 @app.command("certs")

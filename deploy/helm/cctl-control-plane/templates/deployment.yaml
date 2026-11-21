@@ -1,0 +1,135 @@
+{{- if not .Values.iac.repo }}{{ fail "iac.repo is required" }}{{ end }}
+{{- if not (regexMatch "^[0-9a-f]{40}$" .Values.iac.ref) }}{{ fail "iac.ref must be a full 40-character commit SHA" }}{{ end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cctl.fullname" . }}
+  labels: {{- include "cctl.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {{- include "cctl.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cctl.selector" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        - name: checkout-iac
+          image: {{ include "cctl.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              cd {{ .Values.iac.mountPath }}
+              git init -q .
+              if [ -f /var/run/iac-token/token ]; then
+                git -c credential.helper= -c "http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$(cat /var/run/iac-token/token)" | base64 -w0)" \
+                  fetch -q --depth 1 "$IAC_REPO" "$IAC_REF"
+              else
+                git fetch -q --depth 1 "$IAC_REPO" "$IAC_REF"
+              fi
+              git -c advice.detachedHead=false checkout -q FETCH_HEAD
+              test "$(git rev-parse HEAD)" = "$IAC_REF"
+              rm -rf .git
+          env:
+            - {name: IAC_REPO, value: {{ .Values.iac.repo | quote }}}
+            - {name: IAC_REF, value: {{ .Values.iac.ref | quote }}}
+            - {name: HOME, value: /tmp}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: iac, mountPath: {{ .Values.iac.mountPath }}}
+            - {name: tmp, mountPath: /tmp}
+            {{- if .Values.iac.tokenSecret }}
+            - {name: iac-token, mountPath: /var/run/iac-token, readOnly: true}
+            {{- end }}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
+      containers:
+        - name: api
+          image: {{ include "cctl.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--host", "0.0.0.0", "--port", "8080", "--trusted-proxies", {{ .Values.trustedProxies | quote }}]
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+          env:
+            - {name: CLOUDCTL_SERVICE_CONFIG, value: /etc/cctl/service.yaml}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/cctl, readOnly: true}
+            - {name: iac, mountPath: {{ .Values.iac.mountPath }}}   # writable: terraform init writes .terraform here
+            - {name: tmp, mountPath: /tmp}
+            - {name: home, mountPath: /home/cctl}
+      volumes:
+        - name: config
+          configMap: {name: {{ include "cctl.fullname" . }}}
+        - name: iac
+          emptyDir: {sizeLimit: 2Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 4Gi}
+        - name: home
+          emptyDir: {sizeLimit: 4Gi}
+        {{- if .Values.iac.tokenSecret }}
+        - name: iac-token
+          secret: {secretName: {{ .Values.iac.tokenSecret | quote }}, defaultMode: 0400}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "cctl.selector" . | nindent 14 }}
+      {{- end }}

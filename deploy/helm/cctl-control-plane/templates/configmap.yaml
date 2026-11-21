@@ -1,0 +1,15 @@
+{{- if not (has .Values.cloud (list "aws" "azure" "gcp")) }}{{ fail "cloud must be aws, azure or gcp (use values-eks/aks/gke.yaml)" }}{{ end }}
+{{- if not .Values.gateConfig }}{{ fail "gateConfig is required" }}{{ end }}
+{{- if not .Values.settings.auth }}{{ fail "settings.auth is required" }}{{ end }}
+{{- if not .Values.settings.state }}{{ fail "settings.state is required" }}{{ end }}
+{{- if eq (.Values.settings.state.backend | default "") "memory" }}{{ fail "memory state cannot run in the cluster" }}{{ end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cctl.fullname" . }}
+  labels: {{- include "cctl.labels" . | nindent 4 }}
+data:
+  service.yaml: |
+{{ toYaml (merge (dict "gate_config" "/etc/cctl/controlplane.yaml") (omit .Values.settings "allow_memory_state")) | indent 4 }}
+  controlplane.yaml: |
+{{ toYaml .Values.gateConfig | indent 4 }}
