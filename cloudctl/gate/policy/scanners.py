@@ -42,12 +42,19 @@ from cloudctl.gate.policy.engine import PolicyContext
 DEFAULT_TIMEOUT = 600
 _SAFE_ENV_KEYS = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
                   "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
+# Windows programs (Python-based scanners above all) fail to start without these.
+# None of them carries a credential.
+_WINDOWS_ENV_KEYS = ("SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+                     "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA")
 
 
 def scanner_env(extra: Optional[Mapping[str, str]] = None) -> dict[str, str]:
     """A minimal environment: no cloud credentials, nothing inherited beyond
     what a static scanner needs to find itself, its cache and a proxy."""
-    env = {k: os.environ[k] for k in _SAFE_ENV_KEYS if k in os.environ}
+    keys = _SAFE_ENV_KEYS + (_WINDOWS_ENV_KEYS if os.name == "nt" else ())
+    env = {k: os.environ[k] for k in keys if k in os.environ}
+    if os.name == "nt":
+        env["PYTHONUTF8"] = "1"     # scanner output is read as UTF-8, not the ANSI code page
     env.update(extra or {})
     return env
 
@@ -58,7 +65,8 @@ def run_scanner(argv: Sequence[str], *, what: str, timeout: int, ok_codes: Itera
     try:
         p = subprocess.run(  # noqa: S603 — argv list, no shell
             list(argv), cwd=str(cwd) if cwd else None, env=dict(env if env is not None else scanner_env()),
-            capture_output=True, text=True, timeout=timeout, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
         )
     except FileNotFoundError as e:
         raise EngineError(f"{what}: binary not found ({e})") from e
