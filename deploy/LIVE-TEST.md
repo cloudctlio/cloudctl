@@ -29,6 +29,8 @@ done
 
 Helm and Docker checks are optional. They are not needed for this run.
 
+`bash deploy/smoke/laptop-check.sh` runs these checks in one go (read-only), plus the stage 1 policy gate on a planned, never-applied open-SSH security group.
+
 ## 3. Create the stores in AWS
 
 This creates four things, and nothing else (no IAM roles, no ECR, no EKS):
