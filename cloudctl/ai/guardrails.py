@@ -1003,33 +1003,36 @@ def check_rate_limit() -> GuardrailResult:
 
 # ── Guardrail 7 — Audit Logging (SOC2 CC6) ────────────────────────────────────
 #
-# Append-only JSONL audit trail at ~/.cloudctl/audit.log.
+# Hash-chained JSONL audit trail at ~/.cloudctl/audit/diagnosis.jsonl (chain
+# "cctl-diagnosis"), written by the same chained sink the policy gate uses.
+# Each record carries seq, prev and hash, so a deleted or edited line breaks the
+# chain (`cloudctl gate audit verify --diagnosis`). The file is rotated into
+# segments, never truncated. The old unchained ~/.cloudctl/audit.log is no
+# longer written; it is left in place, untouched.
 # Records agent call start/end and every tool dispatch.
 # NEVER logs fetched data values — only tool names, resource names, and status.
-# Log entries are safe to retain; they contain no secrets or PII.
 
-_AUDIT_LOG_PATH = Path.home() / ".cloudctl" / "audit.log"
-# Cap audit log at 10 MB — rotate by truncating oldest entries
+_AUDIT_LOG_PATH = Path.home() / ".cloudctl" / "audit" / "diagnosis.jsonl"
+_AUDIT_CHAIN = "cctl-diagnosis"
+# Rotate the live segment at 10 MB (older segments are kept).
 _AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 
+def _audit_log():  # -> cloudctl.gate.audit.chain.AuditLog
+    from cloudctl.gate.audit.chain import AuditLog  # noqa: PLC0415
+    from cloudctl.gate.audit.local import LocalFileSink  # noqa: PLC0415
+    return AuditLog(LocalFileSink(_AUDIT_LOG_PATH, max_bytes=_AUDIT_LOG_MAX_BYTES), chain=_AUDIT_CHAIN)
+
+
 def _write_audit_entry(entry: dict) -> None:
-    """Append one JSON line to the audit log. Never raises."""
+    """Append one record to the chained diagnosis audit log. Never raises:
+    diagnosis is read-only, so an audit failure must not block it. (The
+    policy gate's own audit, which guards changes, fails closed instead.)"""
     try:
-        _makedirs_secure(_AUDIT_LOG_PATH.parent)
-        line = json.dumps(entry, separators=(",", ":")) + "\n"
-        # Rotate if over size limit (keep last ~9 MB)
-        if _AUDIT_LOG_PATH.exists() and _AUDIT_LOG_PATH.stat().st_size > _AUDIT_LOG_MAX_BYTES:
-            existing = _AUDIT_LOG_PATH.read_bytes()
-            _AUDIT_LOG_PATH.write_bytes(existing[-9 * 1024 * 1024:])
-        with _AUDIT_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(line)
-        try:
-            _AUDIT_LOG_PATH.chmod(_FILE_MODE)
-        except Exception:
-            pass
+        data = {k: v for k, v in entry.items() if k not in ("ts", "event")}
+        _audit_log().append(str(entry.get("event", "event")), data)
     except Exception:
-        pass  # audit failure must never block the tool
+        pass  # audit failure must never block the read-only tool
 
 
 def audit_log_agent_call(

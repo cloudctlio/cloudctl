@@ -201,6 +201,10 @@ def run(
     region:      str,
     max_turns:   int = 14,
     approve=None,
+    gate=None,
+    gate_env:    Optional[str] = None,
+    approval_id: Optional[str] = None,
+    requester:   Optional[str] = None,
 ) -> dict:
     """
     Drive the resolution agent.
@@ -219,6 +223,14 @@ def run(
                  fresh validation result). Returning False blocks that gate;
                  the agent is told to stop and emit manual steps instead.
                  None = no gates (library/test use).
+    gate:        Optional cloudctl.gate.gate.PolicyGate. When set (the CLI
+                 always sets it), the push gate first runs the change through
+                 the policy gate: scoped credentials, the IaC tool's own plan,
+                 policy engines and signed approval. The commit/push runs only
+                 inside the gate's single-use authorization, and every model
+                 call and tool call is written to the audit chain.
+    gate_env:    Gate environment name (default: matched from --iac-root or profile).
+    approval_id: Signed approval request id, when the environment requires one.
     """
     from pathlib import Path
     from cloudctl.ai.model_providers import default_model, make_model_client
@@ -251,6 +263,11 @@ def run(
                  "fix as detailed manual_steps for the operator to apply."
     })
     gates = {"plan": approve is None, "push": approve is None}   # True = passed
+    if gate is not None:
+        gates["push"] = False      # the policy gate always runs before a push
+    from cloudctl.gate.usage import ModelUsage
+    usage = ModelUsage()
+    holder: dict = {"auth": None}
     # What the TOOLS actually did. The final report is reconciled against this,
     # never taken from the model's own claim (a model can say "success" after a
     # failed commit, push or PR).
@@ -289,8 +306,8 @@ def run(
         return gates["plan"]
 
     def _gate_push(directory: str) -> bool:
-        if gates["push"]:
-            return True
+        if gates["push"] and gate is None:
+            return True       # with a policy gate, every push is gated again
         import subprocess
         try:
             diff = subprocess.run(
@@ -308,8 +325,52 @@ def run(
         if not _ok(validation)[0]:
             actual["errors"].append("validation failed at the push gate; nothing was pushed")
             return False   # never push an invalid change, regardless of answer
+        if gate is not None:
+            verdict = _policy_gate(directory)
+            if verdict is None:
+                return False
+            detail += f"\n--- policy gate ---\n{verdict}"
+        if approve is None:
+            gates["push"] = True
+            return True
         gates["push"] = bool(approve("push", detail))
+        if not gates["push"] and holder["auth"] is not None:
+            holder["auth"].close()
+            holder["auth"] = None
         return gates["push"]
+
+    def _policy_gate(directory: str) -> Optional[str]:
+        """Run the change through the policy gate. Returns a summary when
+        authorized (the authorization is kept for the push), else None."""
+        from cloudctl.gate.gate import default_requester
+        from cloudctl.gate.models import ChangeRequest, GateError
+        from cloudctl.gate.plan import detect_iac_planner
+        try:
+            env = gate.config.resolve_environment(name=gate_env, iac_root=directory, profile=profile)
+            planner = detect_iac_planner(directory, env=env)
+            req = ChangeRequest(kind="iac_pr", environment=env.name,
+                                summary=f"IaC fix: {str(diagnosis.get('root_cause', ''))[:300]}",
+                                requester=requester or default_requester(),
+                                context={**usage.context(), "files": list(actual["files_written"])})
+            res = gate.evaluate(req, planner, approval_id=approval_id)
+        except GateError as e:
+            actual["errors"].append(f"policy gate: {e}; nothing was pushed")
+            return None
+        d = res.decision
+        actual["gate"] = d.to_dict()
+        if not res.authorized:
+            msg = f"policy gate {d.outcome.value} at {d.stage}: " + "; ".join(d.reasons)
+            if d.outcome.value == "pending_approval":
+                msg += (f". An approver runs `cloudctl gate approve {d.request_id}`, then re-run with "
+                        f"--approval {d.request_id}")
+            top = [f"[{f.severity.name}] {f.rule_id} {f.resource}" for f in d.findings[:5]]
+            actual["errors"].append(msg + (f" ({', '.join(top)})" if top else "") + "; nothing was pushed")
+            return None
+        holder["auth"] = res.authorization
+        counts = d.plan_counts
+        return (f"authorized (request {d.request_id}): +{counts.get('add', 0)} ~{counts.get('modify', 0)} "
+                f"-{counts.get('destroy', 0)}, {len(d.findings)} non-blocking finding(s)"
+                + (f", approved by {d.approver}" if d.approver else ""))
 
     def _dispatch(tool_name: str, tool_input: dict) -> str:
         directory = tool_input.get("directory") or str(root)
@@ -349,11 +410,20 @@ def run(
         if tool_name == "git_commit_push":
             if not _gate_push(directory):
                 return _DECLINED
-            res = git_commit_push(
+            push_args = (
                 tool_input["message"],
                 [p if Path(p).is_absolute() else str(root / p) for p in tool_input.get("paths", [])],
                 directory,
             )
+            if holder["auth"] is not None:
+                auth, holder["auth"] = holder["auth"], None
+                with auth:
+                    res = auth.execute(lambda _creds, _plan: git_commit_push(*push_args),
+                                       what="git_commit_push")
+            elif gate is not None:
+                return _DECLINED      # never push without the policy gate's authorization
+            else:
+                res = git_commit_push(*push_args)
             ok, d = _ok(res)
             actual["pushed"] = ok
             if not ok:
@@ -379,6 +449,22 @@ def run(
     def _finish(claimed: dict) -> dict:
         return _reconcile(claimed, actual)
 
+    def _audit(event: str, data: dict) -> None:
+        if gate is not None:
+            gate.record(event, data)      # AuditError propagates: fail closed
+
+    from cloudctl.gate.models import AuditError
+    try:
+        return _loop(client, model_id, messages, _dispatch, _finish, _audit, usage, max_turns)
+    except AuditError as e:
+        actual["errors"].append(f"audit log unavailable, stopped: {e}")
+        return _finish({"status": "error"})
+    finally:
+        if holder["auth"] is not None:
+            holder["auth"].close()
+
+
+def _loop(client, model_id, messages, _dispatch, _finish, _audit, usage, max_turns):
     for _ in range(max_turns):
         resp = client.converse(
             modelId=model_id,
@@ -386,6 +472,10 @@ def run(
             messages=messages,
             toolConfig={"tools": _RESOLUTION_TOOLS},
         )
+        usage.add(resp)
+        _audit("model.call", {"model": model_id, "stop_reason": resp.get("stopReason", ""),
+                              "input_tokens": (resp.get("usage") or {}).get("inputTokens", 0),
+                              "output_tokens": (resp.get("usage") or {}).get("outputTokens", 0)})
         stop_reason = resp["stopReason"]
         msg = resp["output"]["message"]
         messages.append(msg)
@@ -414,6 +504,7 @@ def run(
                 if "toolUse" in block:
                     tu = block["toolUse"]
                     result_str = _dispatch(tu["name"], tu["input"])
+                    _audit("tool.call", {"tool": tu["name"], "result": str(result_str)[:300]})
                     tool_results.append({
                         "toolResult": {
                             "toolUseId": tu["toolUseId"],

@@ -137,3 +137,103 @@ def test_reconcile_is_pure():
     out = ra._reconcile({"status": "success", "pr_url": "fake"},
                         {"pushed": True, "pr_url": "", "errors": ["create_pull_request: gh missing"]})
     assert out["status"] == "error" and "PR was not created" in out["detail"]
+
+
+# ── policy gate on the push ──────────────────────────────────────────────────
+
+class _FakeGate:
+    """Stands in for PolicyGate: real decisions and a real single-use
+    Authorization, with an in-memory audit trail."""
+
+    def __init__(self, tmp_path, outcome="authorized", fail_record_at=None):
+        from cloudctl.gate.audit.chain import AuditLog
+        from cloudctl.gate.audit.local import LocalFileSink
+        self.audit = AuditLog(LocalFileSink(tmp_path / "audit.jsonl"), chain="t")
+        self.outcome = outcome
+        self.events = []
+        self.requests = []
+        self.fail_record_at = fail_record_at
+        env = MagicMock()
+        env.name = "staging"
+        self.config = MagicMock()
+        self.config.resolve_environment.return_value = env
+
+    def record(self, event, data):
+        from cloudctl.gate.models import AuditError
+        if self.fail_record_at is not None and len(self.events) >= self.fail_record_at:
+            raise AuditError("sink down")
+        self.events.append(event)
+        self.audit.append(event, data)
+
+    def evaluate(self, request, planner, approval_id=None):
+        from cloudctl.gate.gate import Authorization, GateResult
+        from cloudctl.gate.models import Finding, GateDecision, Outcome, Plan, Severity
+        self.requests.append((request, planner, approval_id))
+        out = Outcome(self.outcome)
+        findings = (Finding(rule_id="CCTL-NET-001", severity=Severity.HIGH, message="open",
+                            resource="aws_security_group.x", engine="rego"),) if out == Outcome.REJECTED else ()
+        d = GateDecision(request_id=request.request_id, outcome=out, stage="policy" if findings else "approval",
+                         reasons=("blocked",) if out != Outcome.AUTHORIZED else ("all stages passed",),
+                         findings=findings, plan_counts={"add": 0, "modify": 1, "destroy": 0})
+        if out != Outcome.AUTHORIZED:
+            return GateResult(d)
+        plan = Plan(platform="terraform", environment="staging", source=".", changes=())
+        auth = Authorization(decision=d, request=request, plan=plan, creds=None, audit=self.audit, workdir=None)
+        return GateResult(d, auth)
+
+
+def _gated_run(repo, gate, **kw):
+    with patch("cloudctl.gate.plan.detect_iac_planner", return_value="planner"):
+        return _run(repo, _full_script(repo), gate=gate, **kw)
+
+
+def test_gate_authorized_push_runs_inside_the_authorization(repo, tmp_path):
+    gate = _FakeGate(tmp_path)
+    out, _ = _gated_run(repo, gate, approval_id="ap1")
+    assert out["status"] == "success", out
+    req, planner, approval = gate.requests[0]
+    assert req.kind == "iac_pr" and req.environment == "staging" and approval == "ap1"
+    assert planner == "planner"
+    events = [r["event"] for r in gate.audit.sink.read_all()]
+    assert "model.call" in events and "tool.call" in events
+    assert events.index("execution.start") < events.index("execution.end")
+    assert gate.audit.verify().ok
+
+
+def test_gate_rejection_blocks_the_push_and_says_why(repo, tmp_path):
+    gate = _FakeGate(tmp_path, outcome="rejected")
+    out, _ = _gated_run(repo, gate)
+    assert out["status"] != "success"
+    assert "CCTL-NET-001" in out["detail"] and "nothing was pushed" in out["detail"]
+    remote = subprocess.run("git ls-remote origin", cwd=repo, shell=True, capture_output=True, text=True).stdout
+    assert "fix/wcu" not in remote
+
+
+def test_gate_pending_approval_tells_how_to_approve(repo, tmp_path):
+    gate = _FakeGate(tmp_path, outcome="pending_approval")
+    out, _ = _gated_run(repo, gate)
+    assert out["status"] != "success"
+    assert "cloudctl gate approve" in out["detail"] and "--approval" in out["detail"]
+
+
+def test_gate_runs_even_with_no_operator_prompts(repo, tmp_path):
+    gate = _FakeGate(tmp_path, outcome="rejected")
+    out, _ = _gated_run(repo, gate)          # approve=None: no operator prompts
+    assert gate.requests, "the policy gate must run before a push even without prompts"
+    assert out["status"] != "success"
+
+
+def test_operator_no_after_gate_releases_the_authorization(repo, tmp_path):
+    gate = _FakeGate(tmp_path)
+    out, _ = _gated_run(repo, gate, approve=lambda stage, d: stage == "plan")
+    assert out["status"] != "success"
+    events = [r["event"] for r in gate.audit.sink.read_all()]
+    assert "execution.start" not in events
+
+
+def test_audit_failure_stops_the_agent(repo, tmp_path):
+    gate = _FakeGate(tmp_path, fail_record_at=0)
+    out, client = _gated_run(repo, gate)
+    assert out["status"] == "error"
+    assert "audit log unavailable" in out["detail"]
+    assert client.converse.call_count == 1
