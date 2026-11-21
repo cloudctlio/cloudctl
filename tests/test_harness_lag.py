@@ -453,3 +453,39 @@ def test_live_pass_script_is_valid_bash_and_always_tears_down():
     assert text.index("expected $want") < first_aws and text.index("tracked edits") < first_aws
     for s in ("s1", "s3", "s4", "s5"):
         assert s in text.split("for s in", 1)[1].split("\n", 1)[0]
+
+
+def _load_harness(name, rel):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).parent.parent / rel)
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(Path(spec.origin).parent))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_pause_watch_counts_a_wall_clock_jump_as_sleep(monkeypatch):
+    """A jump in wall time between ticks (laptop suspended) is counted; normal ticks are not."""
+    mod = _load_harness("cx_run2", "e2e/complex-app/run.py")
+    clock = {"t": 1000.0, "n": 0}
+
+    def fake_time():
+        clock["n"] += 1
+        clock["t"] += 0.05 + (300.0 if clock["n"] == 4 else 0.0)
+        return clock["t"]
+    monkeypatch.setattr(mod.time, "time", fake_time)
+    with mod.PauseWatch(tick_s=0.05, slack_s=1.0) as pw:
+        while clock["n"] < 8:
+            time.sleep(0.02)
+    assert 299 <= pw.paused_s <= 301
+
+
+def test_score_takes_host_sleep_out_of_the_time_and_says_so():
+    mod = _load_harness("cx_score2", "e2e/complex-app/score.py")
+    cfg = mod.load_cfg()
+    res = {"root_cause": "x", "confidence": "LOW"}
+    slept = mod.score_one(mod.by_id(cfg, "s5"), res, {"wall_seconds": 3371.7, "host_paused_s": 2940.0}, cfg)
+    assert slept["seconds"] == 431.7 and slept["time_ok"]
+    assert any("host asleep 2940 s" in n for n in slept["notes"])
+    awake = mod.score_one(mod.by_id(cfg, "s5"), res, {"wall_seconds": 912.0}, cfg)
+    assert awake["seconds"] == 912.0 and not awake["time_ok"]

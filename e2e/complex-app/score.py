@@ -10,7 +10,8 @@ Checks per scenario (each fault, for two-fault scenarios):
   root_cause   root_cause text names the actual cause (all regex groups match)
   localized    root_cause names the blamed resource
   confidence   HIGH / MEDIUM / LOW (and 'overconfident' if HIGH on a wrong answer)
-  time         wall clock (runs/<id>.meta.json) or _timing.elapsed_s; pass <= 600 s
+  time         wall clock (runs/<id>.meta.json) minus host_paused_s (time the
+               machine slept), or _timing.elapsed_s; pass <= 600 s
   iac_resource iac_fix.resource is the resource the fix belongs on
   iac_fix      iac_fix.diff removes the bad value and adds a correct one
   drift_safe   remediation doesn't tell you to change AWS directly without going through IaC
@@ -69,10 +70,15 @@ def score_one(scen: dict, result: dict, meta: dict, cfg: dict) -> dict:
     wall = meta.get("wall_seconds")
     if wall is None:
         wall = (result.get("_timing") or {}).get("elapsed_s")
+    # Time the host was asleep is not cctl's time: score wall time without it.
+    paused = float(meta.get("host_paused_s") or 0)
+    secs = round(wall - paused, 1) if wall is not None and paused > 0 else wall
     out: dict = {"scenario": scen["id"], "name": scen["name"], "confidence": conf or "?",
-                 "seconds": wall, "time_ok": wall is not None and wall <= TIME_LIMIT_S,
+                 "seconds": secs, "time_ok": secs is not None and secs <= TIME_LIMIT_S,
                  "iac_fix_status": fix_status or "absent", "iac_fix_resource": fix_res or None,
                  "iac_fix_check": (fix.get("check") or {}).get("status"), "notes": []}
+    if paused > 0:
+        out["notes"].append(f"host asleep {paused:.0f} s during the run; time is {wall} s wall minus that")
     if meta.get("symptom_seen") is False:
         out["notes"].append("fault did not manifest before cctl ran; result may not be cctl's fault")
     if result.get("error") and not rc:

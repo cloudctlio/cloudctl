@@ -330,6 +330,37 @@ def cctl_cmd(sid: str, out_json: Path) -> list[str]:
     return cmd
 
 
+class PauseWatch:
+    """Counts time the host spent asleep while cctl ran.
+
+    A thread wakes every few seconds; when the wall clock jumped much further
+    than that between wakes, the machine was suspended (a sleeping thread does
+    not run). The gap beyond the tick counts as paused time.
+    """
+
+    def __init__(self, tick_s: float = 5.0, slack_s: float = 25.0) -> None:
+        self.tick_s, self.slack_s, self.paused_s = tick_s, slack_s, 0.0
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        last = time.time()
+        while not self._stop.wait(self.tick_s):
+            now = time.time()
+            gap = now - last - self.tick_s
+            if gap > self.slack_s:
+                self.paused_s += gap
+            last = now
+
+    def __enter__(self) -> "PauseWatch":
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._t.join(timeout=self.tick_s * 2)
+
+
 def diagnose(sid: str) -> dict:
     RUNS.mkdir(exist_ok=True)
     out_json = RUNS / f"{sid}.json"
@@ -348,11 +379,12 @@ def diagnose(sid: str) -> dict:
     else:
         env.pop("CLOUDCTL_DIFF_FIRST_RECORD", None)
     start = time.time()
-    with open(log_path, "w", encoding="utf-8") as fh:
+    with open(log_path, "w", encoding="utf-8") as fh, PauseWatch() as pw:
         r = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                            env=env)
     wall = round(time.time() - start, 1)
-    meta = {"scenario": sid, "wall_seconds": wall, "exit_code": r.returncode, "command": cmd,
+    meta = {"scenario": sid, "wall_seconds": wall, "host_paused_s": round(pw.paused_s, 1),
+            "exit_code": r.returncode, "command": cmd,
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             # What the shell asked for, and what cctl says it called.
             "model_env": {k: os.environ[k] for k in ("CLOUDCTL_MODEL", "CLOUDCTL_CRITIC_MODEL",
@@ -367,7 +399,8 @@ def diagnose(sid: str) -> dict:
     st = APP / "terraform.tfstate"
     if st.exists():
         (RUNS / f"{sid}.tfstate.json").write_bytes(st.read_bytes())
-    log(f"{sid}: cctl finished in {wall} s (exit {r.returncode})")
+    log(f"{sid}: cctl finished in {wall} s (exit {r.returncode})"
+        + (f"; the host was asleep {pw.paused_s:.0f} s of that" if pw.paused_s else ""))
     if not out_json.exists():
         log(f"{sid}: cctl wrote no JSON; see {log_path}")
     else:
@@ -462,7 +495,8 @@ def summary(runs: Path) -> str:
             continue
         meta, res, sc = meta or {}, res if isinstance(res, dict) else {}, card.get(sid) or {}
         lines.append(f"{sid}: verdict {sc.get('verdict', '?')}, confidence {sc.get('confidence', '?')}, "
-                     f"cctl {meta.get('wall_seconds', '?')} s (exit {meta.get('exit_code', '?')}), "
+                     f"cctl {meta.get('wall_seconds', '?')} s wall, {meta.get('host_paused_s', 0)} s asleep "
+                     f"(exit {meta.get('exit_code', '?')}), "
                      f"scenario {meta.get('scenario_total_s', '?')} s, symptom seen {meta.get('symptom_seen', '?')}")
         if sc.get("notes"):
             lines.append(f"  notes: {'; '.join(sc['notes'])}")
