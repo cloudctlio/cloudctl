@@ -415,3 +415,41 @@ def test_replay_script_works_after_teardown(tmp_path):
     assert "likely_reverts: UpdateFunctionConfiguration" in r.stdout
     assert "one_off_actions: PurgeQueue" in r.stdout
     assert "unplaced_drift:" in r.stdout
+
+
+def test_harness_summary_prints_models_and_diff_first_groups(tmp_path):
+    """run.py summary reads only runs/ files and shows verdict, models and diff-first groups."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cx_run", Path(__file__).parent.parent / "e2e/complex-app/run.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    (tmp_path / "scorecard.json").write_text(json.dumps([{"scenario": "s5", "verdict": "PASS",
+                                                           "confidence": "LOW", "notes": ["n1"]}]))
+    (tmp_path / "s5.meta.json").write_text(json.dumps({"wall_seconds": 200.3, "exit_code": 0,
+                                                        "model_env": {"CLOUDCTL_MODEL": "m-env"},
+                                                        "models": {"investigator": "m-used"}}))
+    (tmp_path / "s5.json").write_text(json.dumps({"diff_first": {
+        "ran": True, "window": {"onset": "t1"}, "causes": [{"summary": "ESM disabled", "explains": ["S1"]}],
+        "likely_reverts": ["api route restored"], "one_off_actions": ["queue purged"]}}))
+    (tmp_path / "s3.json").write_text(json.dumps({"diff_first": {"ran": False, "error": "boom"}}))
+    out = mod.summary(tmp_path)
+    assert "s5: verdict PASS" in out and "200.3 s" in out
+    assert "m-env" in out and "m-used" in out
+    assert "diff_first keys: causes, likely_reverts, one_off_actions, ran, window" in out
+    assert "likely_reverts (1): api route restored" in out and "causes (1): ESM disabled" in out
+    assert "s3: verdict ?" in out and "DID NOT RUN: boom" in out
+    assert mod.summary(tmp_path / "missing").endswith("no results in " + str(tmp_path / "missing"))
+
+
+def test_live_pass_script_is_valid_bash_and_always_tears_down():
+    """The one-shot laptop pass parses, stops before AWS on a wrong head, and traps teardown."""
+    import subprocess
+    sh = Path(__file__).parent.parent / "e2e/complex-app/live_pass.sh"
+    assert subprocess.run(["bash", "-n", str(sh)]).returncode == 0
+    text = sh.read_text()
+    assert "trap finish EXIT" in text and "python run.py teardown" in text
+    # Guards come before the first AWS or terraform call.
+    first_aws = min(text.index("aws sts"), text.index("run.py deploy"))
+    assert text.index("expected $want") < first_aws and text.index("tracked edits") < first_aws
+    for s in ("s1", "s3", "s4", "s5"):
+        assert s in text.split("for s in", 1)[1].split("\n", 1)[0]

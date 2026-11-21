@@ -441,6 +441,54 @@ def score(sid: str | None) -> None:
     subprocess.run(cmd)
 
 
+_DF_GROUPS = ("causes", "likely_reverts", "one_off_actions", "unchecked_leads", "may_be_over", "unexplained")
+
+
+def summary(runs: Path) -> str:
+    """Per scenario: verdict, time, model ids and the diff-first keys and groups.
+
+    Reads only files in runs/ (scorecard.json, s*.meta.json, s*.json); no AWS calls.
+    """
+    def read(p: Path):
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    card = {r.get("scenario"): r for r in read(runs / "scorecard.json") or [] if isinstance(r, dict)}
+    lines = [f"== summary of {runs}"]
+    for sid in FAULT_IDS:
+        meta, res = read(runs / f"{sid}.meta.json"), read(runs / f"{sid}.json")
+        if meta is None and res is None:
+            continue
+        meta, res, sc = meta or {}, res if isinstance(res, dict) else {}, card.get(sid) or {}
+        lines.append(f"{sid}: verdict {sc.get('verdict', '?')}, confidence {sc.get('confidence', '?')}, "
+                     f"cctl {meta.get('wall_seconds', '?')} s (exit {meta.get('exit_code', '?')}), "
+                     f"scenario {meta.get('scenario_total_s', '?')} s, symptom seen {meta.get('symptom_seen', '?')}")
+        if sc.get("notes"):
+            lines.append(f"  notes: {'; '.join(sc['notes'])}")
+        lines.append(f"  model asked: {json.dumps(meta.get('model_env') or {})}")
+        lines.append(f"  models used: {json.dumps(meta.get('models') or res.get('_models'))}")
+        df = res.get("diff_first")
+        if not isinstance(df, dict):
+            lines.append("  diff_first: missing" + ("" if res else " (no result JSON)"))
+            continue
+        lines.append(f"  diff_first keys: {', '.join(sorted(df))}")
+        if df.get("window"):
+            lines.append(f"  window: {json.dumps(df['window'])}")
+        if df.get("ran") is False:
+            lines.append(f"  diff_first DID NOT RUN: {df.get('error')}")
+        for g in _DF_GROUPS:
+            items = df.get(g)
+            if items is None:
+                continue
+            names = ([str(c.get("summary") if isinstance(c, dict) else c)[:100] for c in items]
+                     if isinstance(items, list) else [str(items)[:100]])
+            lines.append(f"  {g} ({len(names)}): {' | '.join(names) or '-'}")
+    if len(lines) == 1:
+        lines.append(f"no results in {runs}")
+    return "\n".join(lines)
+
+
 def preflight() -> None:
     import boto3  # noqa: PLC0415
     v = subprocess.run([tf_bin(), "version", "-json"], capture_output=True, text=True)
@@ -494,7 +542,8 @@ def teardown() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["preflight", "deploy", "inject", "load", "check", "diagnose",
-                                        "revert", "score", "scenario", "all", "teardown", "cmd"])
+                                        "revert", "score", "scenario", "all", "teardown", "cmd",
+                                        "summary"])
     ap.add_argument("sid", nargs="?")
     ap.add_argument("--minutes", type=float, default=3.0, help="load: how long to run")
     ap.add_argument("--warmup-max", type=float, default=6.0, help="scenario: max minutes to wait for the symptom")
@@ -536,6 +585,8 @@ def main() -> None:
         score(None)
     elif a.command == "teardown":
         teardown()
+    elif a.command == "summary":
+        print(summary(RUNS))
 
 
 if __name__ == "__main__":
