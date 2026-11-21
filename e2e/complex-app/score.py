@@ -10,11 +10,13 @@ Checks per scenario (each fault, for two-fault scenarios):
   root_cause   root_cause text names the actual cause (all regex groups match)
   localized    root_cause names the blamed resource
   confidence   HIGH / MEDIUM / LOW (and 'overconfident' if HIGH on a wrong answer)
-  time         wall clock (runs/<id>.meta.json) or _timing.elapsed_s; pass <= 600 s
+  time         wall clock (runs/<id>.meta.json) minus host_paused_s (time the
+               machine slept), or _timing.elapsed_s; pass <= 600 s
   iac_resource iac_fix.resource is the resource the fix belongs on
   iac_fix      iac_fix.diff removes the bad value and adds a correct one
   drift_safe   remediation doesn't tell you to change AWS directly without going through IaC
-Extra: red herring (s3) not blamed; no-fault control (s0) not given a confident false cause.
+Extra: red herring (s3) not blamed; no-fault control (s0) not given a confident false cause;
+  root cause does not also blame another scenario's fault (a leftover from an earlier scenario).
 
 Verdict: PASS = root cause + localized + time + IaC resource + fix all pass (drift: no IaC change
 and drift-safe); PARTIAL = root cause right but something else misses; FAIL = root cause wrong.
@@ -68,10 +70,15 @@ def score_one(scen: dict, result: dict, meta: dict, cfg: dict) -> dict:
     wall = meta.get("wall_seconds")
     if wall is None:
         wall = (result.get("_timing") or {}).get("elapsed_s")
+    # Time the host was asleep is not cctl's time: score wall time without it.
+    paused = float(meta.get("host_paused_s") or 0)
+    secs = round(wall - paused, 1) if wall is not None and paused > 0 else wall
     out: dict = {"scenario": scen["id"], "name": scen["name"], "confidence": conf or "?",
-                 "seconds": wall, "time_ok": wall is not None and wall <= TIME_LIMIT_S,
+                 "seconds": secs, "time_ok": secs is not None and secs <= TIME_LIMIT_S,
                  "iac_fix_status": fix_status or "absent", "iac_fix_resource": fix_res or None,
                  "iac_fix_check": (fix.get("check") or {}).get("status"), "notes": []}
+    if paused > 0:
+        out["notes"].append(f"host asleep {paused:.0f} s during the run; time is {wall} s wall minus that")
     if meta.get("symptom_seen") is False:
         out["notes"].append("fault did not manifest before cctl ran; result may not be cctl's fault")
     if result.get("error") and not rc:
@@ -132,6 +139,27 @@ def score_one(scen: dict, result: dict, meta: dict, cfg: dict) -> dict:
     out["iac_fix_ok"] = any(f["iac_fix_ok"] for f in faults)
     out["overconfident"] = found == 0 and conf == "HIGH"
 
+    # Scenarios run back to back in one deployment, so an earlier scenario's
+    # fault (reverted before this one) can still show in logs and metrics. A
+    # root-cause sentence that names another scenario's fault, and not this
+    # scenario's, blames a leftover: at best PARTIAL.
+    own = [f["root_cause_all"] for f in gt["faults"]]
+    leftovers = []
+    for other in cfg.get("scenarios", []):
+        if other["id"] == scen["id"]:
+            continue
+        for of in other["ground_truth"].get("faults", []):
+            for sent in _sentences(rc):
+                if NEGATION.search(sent) or any(all(_rx(g).search(sent) for g in gs) for gs in own):
+                    continue
+                if all(_rx(g).search(sent) for g in of["root_cause_all"]):
+                    leftovers.append(f"{other['id']}{of['id']}")
+                    break
+    out["blames_other_fault"] = sorted(set(leftovers))
+    if leftovers:
+        out["notes"].append("root cause also blames another scenario's fault ("
+                            + ", ".join(out["blames_other_fault"]) + ")")
+
     rh = gt.get("red_herring_regex")
     if rh:
         blamed = [s for s in _sentences(rc) if _rx(rh).search(s) and not NEGATION.search(s)]
@@ -143,7 +171,8 @@ def score_one(scen: dict, result: dict, meta: dict, cfg: dict) -> dict:
             out["notes"].append("IaC diff only touches the red herring")
 
     core = [out["root_cause_ok"], out["localized_ok"], out["time_ok"], out["iac_resource_ok"],
-            out["iac_fix_ok"], out["drift_safe"], out.get("red_herring_avoided", True)]
+            out["iac_fix_ok"], out["drift_safe"], out.get("red_herring_avoided", True),
+            not out["blames_other_fault"]]
     if all(core):
         out["verdict"] = "PASS"
     elif found > 0:

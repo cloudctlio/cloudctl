@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -49,10 +49,13 @@ def match_resources(row: dict, rs: Resolver) -> list[str]:
 
 
 def _value_keys(params: dict) -> dict[str, Any]:
-    """Request parameters minus the ones that only identify the target."""
+    """Request parameters minus the ones that only identify the target. Only
+    top-level parameters identify it (as in ``_id_params``): a nested
+    ``Environment.Variables.QUEUE_URL`` or ``VpcConfig.SubnetIds`` is a setting
+    even though its name ends like an identifier."""
     flat = flatten(params or {})
     return {k: v for k, v in flat.items()
-            if not k.split(".")[-1].endswith(_ID_SUFFIXES)}
+            if "." in k or not k.endswith(_ID_SUFFIXES)}
 
 
 def to_changes(rows: list[dict], resources: dict[str, Resource]) -> list[Change]:
@@ -78,13 +81,35 @@ def to_changes(rows: list[dict], resources: dict[str, Resource]) -> list[Change]
     return sorted(out, key=lambda c: c.time or "")
 
 
+# A change needs a couple of metric buckets before an anomaly from it can be
+# seen (the detector wants 2 of the last 3 points abnormal). Anything newer than
+# (metrics end - this) can't show in the metrics yet.
+SHOW_DELAY_S = 120
+
+
+def too_new(t: datetime | None, metrics_end: datetime | None) -> bool:
+    return bool(t and metrics_end and t > metrics_end - timedelta(seconds=SHOW_DELAY_S))
+
+
+# Verbs that take something away. A call like this can leave a lasting fault
+# without setting any value, so it is never treated as a one-off action.
+_TAKES_AWAY = ("Delete", "Remove", "Detach", "Revoke", "Disassociate", "Deregister")
+
+
 def classify(changes: list[Change], window: IncidentWindow,
-             live_configs: dict[str, dict] | None = None) -> list[Change]:
-    """Set ``status`` and ``reason`` on every change (in place) and return them."""
+             live_configs: dict[str, dict] | None = None,
+             in_line: set[str] | None = None) -> list[Change]:
+    """Set ``status`` and ``reason`` on every change (in place) and return them.
+
+    ``in_line`` holds the resources whose live config was read and matches
+    what is declared. Without it (no declared state) no change is called a
+    revert or a one-off action, because nothing shows where things should be."""
     start, end = to_dt(window.start), to_dt(window.end)
+    metrics_end = to_dt(getattr(window, "metrics_end", None))
     live_configs = live_configs or {}
     for i, c in enumerate(changes):
         t = to_dt(c.time)
+        c.restores = c.one_off = False
         if c.error_code:
             c.status, c.reason = "failed_call", f"the call failed ({c.error_code}), so it changed nothing"
             continue
@@ -96,7 +121,10 @@ def classify(changes: list[Change], window: IncidentWindow,
             c.reason = (f"made at {c.time}, before the system was last seen healthy "
                         f"({window.last_healthy}); a cause has to come after that")
             continue
-        if end and t and t > end:
+        # CloudWatch lags: a change this recent can't show in the metrics yet, so
+        # they can't say what it did. Not "after the symptom": too recent to judge.
+        newer = bool(t and (end is None or t > end) and too_new(t, metrics_end))
+        if not newer and end and t and t > end:
             c.status = "after_onset"
             c.reason = f"made at {c.time}, after the symptom started ({window.onset})"
             continue
@@ -119,10 +147,61 @@ def classify(changes: list[Change], window: IncidentWindow,
             c.status = "reverted"
             c.reason = "live config no longer has the values this change set"
             continue
+        settled = in_line is not None and mine <= in_line
+        back = settled and _restores(c, changes[:i], mine, keys)
+        c.one_off = bool(settled and not keys and not c.event_name.startswith(_TAKES_AWAY))
+        if newer and back:
+            # A recent change that puts back the values in force before an
+            # earlier change undoes that change: a revert or a fix, not a fault.
+            c.status = "restored"
+            c.reason = (f"made at {c.time}; puts back the values in force before an earlier "
+                        "change on the same settings, so it undoes that change")
+            continue
+        if newer:
+            c.status = "after_metrics"
+            c.reason = (f"made at {c.time}, too close to the latest metric point ({window.metrics_end}) "
+                        "for the metrics to show its effect yet, so timing can't rule it out"
+                        + ("; live config still has its values" if verdict else ""))
+            continue
         c.status = "candidate"
         c.reason = ("inside the incident window and live config still has its values"
                     if verdict else "inside the incident window; nothing later undid it")
+        if back:
+            # Timing alone can't clear it, but A -> B -> A with live now as
+            # declared is what a revert or a fix looks like. Kept as a lead to
+            # check, never ranked as a cause on timing alone.
+            c.restores = True
+            c.reason += ("; it puts back the values in force before an earlier change and live "
+                         "now matches what is declared, so it is most likely a revert or a fix")
+        elif c.one_off:
+            c.reason += ("; it sets no settings and live config matches what is declared, so it "
+                         "left nothing behind that could keep a symptom going")
     return changes
+
+
+def _restores(c: Change, earlier: list[Change], mine: set[str], keys: set[str]) -> bool:
+    """True when ``c`` sets its settings back to what they were before the
+    latest earlier change of them (A -> B, then this sets A again)."""
+    if not keys:
+        return False
+    want = _value_keys(c.params)
+    hist = [d for d in earlier if not d.error_code and d.resource_key
+            and mine & set(d.resource_key.split(","))]
+    by_leaf = lambda vals: {k.split(".")[-1]: v for k, v in vals.items()}  # noqa: E731
+    w = by_leaf(want)
+    seen_other = False
+    for d in reversed(hist):
+        dv = by_leaf(_value_keys(d.params))
+        shared = set(w) & set(dv)
+        if not shared:
+            continue
+        if any(dv[k] != w[k] for k in shared):
+            seen_other = True
+            continue
+        if seen_other:
+            return True
+        return False
+    return False
 
 
 def _holds_live(c: Change, keys: set[str], live_configs: dict[str, dict]) -> bool | None:
@@ -203,7 +282,8 @@ def set_active_window(window: IncidentWindow | None) -> None:
         _ACTIVE.clear()
         if window and window.start:
             _ACTIVE.update({"start": window.start, "end": window.end, "onset": window.onset,
-                            "last_healthy": window.last_healthy})
+                            "last_healthy": window.last_healthy,
+                            "metrics_end": getattr(window, "metrics_end", None)})
 
 
 def annotate_rows(rows: list[dict]) -> list[dict]:
@@ -212,6 +292,7 @@ def annotate_rows(rows: list[dict]) -> list[dict]:
     if not w or not rows:
         return rows
     start, end = to_dt(w.get("start")), to_dt(w.get("end"))
+    metrics_end = to_dt(w.get("metrics_end"))
     # newest-first input; group by resource to spot later calls on the same thing
     ordered = sorted(rows, key=lambda r: str(r.get("time") or r.get("event_time") or ""))
     for i, r in enumerate(ordered):
@@ -221,6 +302,10 @@ def annotate_rows(rows: list[dict]) -> list[dict]:
         if start and t < start:
             r["incident_window"] = (f"BEFORE: made before the last healthy point "
                                     f"({w.get('last_healthy')}); cannot have started this incident")
+        elif (end is None or t > end) and too_new(t, metrics_end):
+            r["incident_window"] = (f"NEWER THAN THE METRICS: made too close to the latest metric "
+                                    f"point ({w.get('metrics_end')}) for the metrics to show its "
+                                    "effect yet, so timing can't rule it out")
         elif end and t > end:
             r["incident_window"] = f"AFTER: made after the symptom began ({w.get('onset')})"
         else:

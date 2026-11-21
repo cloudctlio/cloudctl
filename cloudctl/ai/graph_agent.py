@@ -26,8 +26,9 @@ import logging
 import os
 import re
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from botocore.config import Config as _BotoConfig
 
@@ -143,6 +144,12 @@ _LOG_INTEL_MODEL = os.environ.get(
 # model (safe out of the box); set CLOUDCTL_CRITIC_MODEL to a different model
 # id (e.g. an Opus/Haiku inference profile) to actually decorrelate.
 _CRITIC_MODEL = os.environ.get("CLOUDCTL_CRITIC_MODEL", _MODEL)
+
+
+def _models_used() -> dict:
+    """The model ids this run called, recorded in the report so a run can be
+    checked afterwards (which model produced this answer?)."""
+    return {"investigator": _MODEL, "critic": _CRITIC_MODEL, "log_intelligence": _LOG_INTEL_MODEL}
 
 # Prompt caching. A cachePoint marks a prefix boundary Bedrock may reuse across
 # calls; it does NOT change the tokens the model sees, so at temperature 0 the
@@ -940,6 +947,54 @@ def _ensure_anchor_hypothesis(
     return hypotheses
 
 
+_DIFF_FIRST_KEY = "diff_first"
+_POST_PROBE_S = 30.0
+_CEILING_POLL_S = 5.0     # how often the run's deadline is checked
+# Set when the outer ceiling abandons a graph run: the command can then exit
+# without waiting for leftover worker threads (see debug_cmd).
+_ABANDONED = threading.Event()
+
+
+def abandoned_work() -> bool:
+    return _ABANDONED.is_set()
+
+
+def _start_diff_first(b, state: dict) -> None:
+    """Bounded runs: start the diff-first checks in their own thread as the run
+    starts, so they overlap observe instead of running after it, and give them
+    a budget inside the run's own (they used to run serially, outside the plan)."""
+    if not b.bounded or _DIFF_FIRST_KEY in b.background:
+        return
+    from cloudctl.debug.diff_first.run import run_for_agent
+    holder: dict = {}
+    done = threading.Event()
+    budget_s = max(10.0, b.left("triage") - 2 * b.est_call_s())
+
+    def _bg():
+        try:
+            holder["value"] = run_for_agent(state.get("profile"), state["region"],
+                                            state.get("iac_root"),
+                                            account=state.get("account_id") or "",
+                                            budget_s=budget_s)
+        except Exception as exc:  # noqa: BLE001 — run_for_agent never raises; belt and braces
+            holder["value"] = {"error": f"diff-first checks failed: {type(exc).__name__}: {exc}"[:300]}
+        finally:
+            done.set()
+
+    threading.Thread(target=_bg, daemon=True, name="cctl-diff-first").start()
+    b.background[_DIFF_FIRST_KEY] = (done, holder)
+
+
+def _diff_first_result(b, wait_s: float | None) -> dict | None:
+    bg = b.background.get(_DIFF_FIRST_KEY)
+    if bg is None:
+        return None
+    done, holder = bg
+    if done.wait(timeout=wait_s):
+        return holder.get("value") or {}
+    return None
+
+
 def diff_first_node(state: GraphState) -> dict:
     """DIFF-FIRST: deterministic, read-only checks that run before any
     hypothesis: expected-state diff (any IaC, or a baseline), the incident
@@ -948,12 +1003,25 @@ def diff_first_node(state: GraphState) -> dict:
     from cloudctl.debug.diff_first.run import run_for_agent
     from cloudctl.debug.diff_first.changes import set_active_window
     from cloudctl.debug.diff_first.model import IncidentWindow
-    d = run_for_agent(state.get("profile"), state["region"], state.get("iac_root"),
-                      account=state.get("account_id") or "")
+    b = _budget(state.get("session_id"))
+    _t = time.monotonic()
+    if _DIFF_FIRST_KEY in b.background:
+        # Started with the run, in parallel with observe: wait only as long as
+        # triage can spare, so the checks never push the verdict back.
+        wait = max(0.0, b.left("triage") - 2 * b.est_call_s()) if b.bounded else None
+        d = _diff_first_result(b, wait_s=wait)
+        if d is None:
+            d = {"error": "diff-first checks did not finish within the time budget"}
+            b.skip("diff-first: did not finish in time")
+    else:
+        d = run_for_agent(state.get("profile"), state["region"], state.get("iac_root"),
+                          account=state.get("account_id") or "")
+    if b.bounded:
+        b.mark("diff_first_wait", time.monotonic() - _t)
     w = (d or {}).get("window") or {}
     if w.get("start"):
         set_active_window(IncidentWindow(**{k: w.get(k) for k in
-                                            ("onset", "last_healthy", "start", "end")}))
+                                            ("onset", "last_healthy", "start", "end", "metrics_end")}))
     return {"diff_first": d or {}}
 
 
@@ -4190,6 +4258,7 @@ def debug_incident_graph(
     run_budget = _budget_mod.RunBudget.from_env()
     _budget_mod.register(session_id, run_budget)
     _ceiling_s = _budget_mod.ceiling_s(run_budget)
+    _ceiling_at = time.monotonic() + _ceiling_s
 
     initial_state = None if resume_thread else {
         "symptom": symptom,
@@ -4210,6 +4279,9 @@ def debug_incident_graph(
         "iac_root": iac_root or _os.environ.get("CLOUDCTL_IAC_ROOT") or None,
         "diff_first": {},
     }
+    _ABANDONED.clear()
+    if initial_state is not None:
+        _start_diff_first(run_budget, initial_state)
     from cloudctl.mcp.tools.recorder import reset_usage_stats, usage_report
     reset_usage_stats()
     from cloudctl.mcp.tools.probe import reset_probe_budget
@@ -4224,54 +4296,56 @@ def debug_incident_graph(
         """Run one graph invocation under the wall-clock ceiling AND the spend
         budget. On breach, return None so the caller emits a best-effort partial
         report from the last checkpoint rather than blocking or overspending.
-        Per-call timeouts mean the abandoned worker thread finishes shortly."""
-        import concurrent.futures
-        # Manually managed executor: a `with` block calls shutdown(wait=True) on
-        # exit, which JOINS the still-running graph worker and defeats the whole
-        # ceiling (the process blocks until the graph finishes anyway). Detach the
-        # worker on breach instead — per-call boto/Bedrock timeouts bound its life.
-        _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        fut = _ex.submit(graph.invoke, arg, invoke_config)
-        try:
-            return fut.result(timeout=_ceiling_s)
-        except concurrent.futures.TimeoutError:
-            _stop_reason["why"] = f"exceeded the {_ceiling_s}s time ceiling"
+
+        The graph runs in a daemon thread, not a ThreadPoolExecutor worker of
+        our own. Python joins executor workers when the interpreter exits, so
+        an abandoned graph kept the process alive until it finished (the
+        ceiling bounded the verdict but not the command). The graph's own
+        parallel nodes still run in pool workers; on a breach this sets
+        _ABANDONED so the command can end the process once its output is
+        written (debug_cmd._exit_if_abandoned)."""
+        import queue as _queue
+        import threading as _threading
+        box: "_queue.Queue[tuple[bool, Any]]" = _queue.Queue(maxsize=1)
+
+        def _target():
+            try:
+                box.put((True, graph.invoke(arg, invoke_config)))
+            except BaseException as exc:  # noqa: BLE001 — re-raised below
+                box.put((False, exc))
+
+        _threading.Thread(target=_target, daemon=True, name="cctl-graph").start()
+        # One deadline for the whole run, the resume after a clarify question
+        # included, checked against the clock every few seconds. A single long
+        # wait is not enough: on Windows a wait's timeout stops counting while
+        # the machine sleeps, and a resume would otherwise get a fresh ceiling.
+        while True:
+            left = _ceiling_at - time.monotonic()
+            if left <= 0:
+                _stop_reason["why"] = f"exceeded the {_ceiling_s}s time ceiling"
+                return None
+            try:
+                ok, value = box.get(timeout=min(_CEILING_POLL_S, left))
+                break
+            except _queue.Empty:
+                continue
+        if ok:
+            return value
+        if isinstance(value, BudgetExceededError):
+            _stop_reason["why"] = str(value)
             return None
-        except BudgetExceededError as exc:
-            _stop_reason["why"] = str(exc)
-            return None
-        except _budget_mod.BudgetSpent as exc:
+        if isinstance(value, _budget_mod.BudgetSpent):
             # A node let a time-budget stop escape: same as the ceiling.
-            _stop_reason["why"] = f"time budget: {exc}"
+            _stop_reason["why"] = f"time budget: {value}"
             return None
-        finally:
-            _ex.shutdown(wait=False, cancel_futures=True)
+        raise value
 
     final_state = _invoke_bounded(initial_state)
-    if final_state is None:
-        # Ceiling or budget breached. Stop the abandoned worker first: every
-        # node checks this flag, so it stops calling the model and AWS instead
-        # of running on in the background (and competing with the next run).
-        run_budget.cancel()
-        try:
-            snap = graph.get_state(invoke_config)
-            checkpointed = dict(snap.values) if snap and snap.values else {}
-        except Exception:  # noqa: BLE001
-            checkpointed = {}
-        report = _ceiling_report(checkpointed, run_budget, _stop_reason["why"])
-        report.update({
-            "_timed_out": True,
-            "_thread_id": thread_id,
-            "_usage": usage_report(),
-            "_timing": run_budget.report(),
-        })
-        _budget_mod.unregister(session_id)
-        return json.dumps(report), checkpointed.get("all_fetched", {}) or {}
-
-    # Human-in-the-loop: clarify_node may interrupt when no hypothesis
-    # survived. Prompt the operator on a real terminal and resume from the
-    # checkpoint; otherwise resume with an empty answer (no-op).
-    if final_state.get("__interrupt__"):
+    if final_state is not None and final_state.get("__interrupt__"):
+        # Human-in-the-loop: clarify_node may interrupt when no hypothesis
+        # survived. Prompt the operator on a real terminal and resume from the
+        # checkpoint; otherwise resume with an empty answer (no-op). The resume
+        # runs under the same deadline; if it breaches, report as below.
         from langgraph.types import Command
         answer = ""
         try:
@@ -4281,12 +4355,42 @@ def debug_incident_graph(
             import sys as _sys
             if _sys.stdin.isatty():
                 print(f"\n[agent] {question}")
-                answer = input("> ").strip()
+                _asked = time.monotonic()
+                try:
+                    answer = input("> ").strip()
+                finally:
+                    # Time a person spends answering is not the agent's time.
+                    _ceiling_at += time.monotonic() - _asked
         except Exception:  # noqa: BLE001
             answer = ""
-        resumed = _invoke_bounded(Command(resume=answer))
-        if resumed is not None:
-            final_state = resumed
+        final_state = _invoke_bounded(Command(resume=answer))
+    if final_state is None:
+        # Ceiling or budget breached. Stop the abandoned worker first: every
+        # node checks this flag, so it stops calling the model and AWS instead
+        # of running on in the background (and competing with the next run).
+        run_budget.cancel()
+        _ABANDONED.set()
+        try:
+            snap = graph.get_state(invoke_config)
+            checkpointed = dict(snap.values) if snap and snap.values else {}
+        except Exception:  # noqa: BLE001
+            checkpointed = {}
+        report = _ceiling_report(checkpointed, run_budget, _stop_reason["why"])
+        try:
+            from cloudctl.debug.diff_first.run import apply_to_report as _df_apply_c
+            _df = checkpointed.get("diff_first") or _diff_first_result(run_budget, wait_s=0) or {}
+            report = _df_apply_c(report, _df)
+        except Exception:  # noqa: BLE001
+            pass
+        report.update({
+            "_timed_out": True,
+            "_thread_id": thread_id,
+            "_usage": usage_report(),
+            "_timing": run_budget.report(),
+            "_models": _models_used(),
+        })
+        _budget_mod.unregister(session_id)
+        return json.dumps(report), checkpointed.get("all_fetched", {}) or {}
 
     parsed = final_state["final_report"]
     all_fetched = final_state.get("all_fetched", {})
@@ -4313,6 +4417,7 @@ def debug_incident_graph(
     parsed["_usage"] = usage_report()
     # Where the time went, and what the budget skipped to finish in time.
     parsed["_timing"] = run_budget.report()
+    parsed["_models"] = _models_used()
     _budget_mod.unregister(session_id)
 
     # Resolution plumbing: lift deployment_source/iac_file_hint from any
@@ -4332,11 +4437,14 @@ def debug_incident_graph(
         # (CloudTrail user-agent detection works for any resource name).
         try:
             from cloudctl.mcp.tools.debug import get_deployment_info
+            _probe_until = time.monotonic() + _POST_PROBE_S
             for res in (parsed.get("resources_investigated") or [])[:2]:
-                info = json.loads(get_deployment_info(
-                    resource_name=str(res).split(" ")[0],
-                    service_type="unknown", profile=profile, region=region,
-                ))
+                # Bounded: this runs after the graph, outside its budget.
+                info = json.loads(_budget_mod.run_with_timeout(
+                    lambda res=res: get_deployment_info(
+                        resource_name=str(res).split(" ")[0],
+                        service_type="unknown", profile=profile, region=region),
+                    _probe_until - time.monotonic()))
                 src = info.get("deployment_source")
                 if src and src not in ("unknown", "manual"):
                     parsed["deployment_source"] = src
@@ -4410,8 +4518,14 @@ def debug_incident_graph(
     # caps confidence). No-op when the checks did not run.
     from cloudctl.debug.diff_first.run import apply_to_report as _df_apply
     from cloudctl.debug.diff_first.changes import set_active_window as _df_clear
-    parsed = _df_apply(parsed, final_state.get("diff_first") or {})
-    _df_clear(None)
+    try:
+        parsed = _df_apply(parsed, final_state.get("diff_first") or {})
+    except Exception as _df_exc:  # noqa: BLE001
+        # The checks support the answer; a bug in them must not lose it.
+        logging.getLogger(__name__).warning("diff-first could not be applied: %r", _df_exc)
+        parsed["diff_first"] = {"ran": False, "error": f"could not be applied: {_df_exc!r}"}
+    finally:
+        _df_clear(None)
 
     parsed = redact_output(parsed)
 

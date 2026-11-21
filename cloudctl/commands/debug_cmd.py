@@ -455,10 +455,55 @@ def _ground_remediation(d: dict, fix: Optional[dict], iac_root: Optional[str], a
                                                   "replaced_with_iac_step", "target")}
 
 
-def _iac_fix(diagnosis: dict, iac_dir: str, account: Optional[str], region: Optional[str]) -> dict:
+def _iac_fix(diagnosis: dict, iac_dir: str, account: Optional[str], region: Optional[str],
+            deadline: Optional[float] = None) -> dict:
     from cloudctl.debug.iac_fix import suggest_fix  # noqa: PLC0415
     with console.status("[dim]Looking up the blamed resource in your IaC...[/dim]"):
-        return suggest_fix(diagnosis, iac_dir, profile=account, region=region or "us-east-1")
+        return suggest_fix(diagnosis, iac_dir, profile=account, region=region or "us-east-1",
+                           deadline=deadline)
+
+
+DEFAULT_POST_BUDGET_S = 45.0
+
+
+def _command_deadline(t0: float) -> Optional[float]:
+    """When the whole agent command must be done: the investigation's outer
+    ceiling plus a short allowance for the steps after it (the IaC fix and its
+    check). None when the time budget is off."""
+    import os as _os  # noqa: PLC0415
+    from cloudctl.ai import budget as _b  # noqa: PLC0415
+    rb = _b.RunBudget.from_env()
+    if not rb.bounded:
+        return None
+    try:
+        post = float(_os.environ.get("CLOUDCTL_POST_BUDGET_S", "") or DEFAULT_POST_BUDGET_S)
+    except ValueError:
+        post = DEFAULT_POST_BUDGET_S
+    return t0 + _b.ceiling_s(rb) + max(0.0, post)
+
+
+def _exit_if_abandoned() -> None:
+    """After a run the time ceiling stopped, leftover worker threads (a model or
+    AWS call still in flight) would hold the process open until they finish.
+    Everything is written by now, so end the process instead of waiting."""
+    try:
+        from cloudctl.ai.graph_agent import abandoned_work  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return
+    import threading as _threading  # noqa: PLC0415
+    # Any live worker can hold the exit: Python joins thread-pool workers at
+    # exit even when they are daemon threads.
+    others = [t for t in _threading.enumerate()
+              if t is not _threading.main_thread() and t.is_alive()]
+    if abandoned_work() and others:
+        import os as _os  # noqa: PLC0415
+        import sys as _sys  # noqa: PLC0415
+        try:
+            console.file.flush()
+            _sys.stdout.flush()
+            _sys.stderr.flush()
+        finally:
+            _os._exit(0)
 
 
 @app.command()
@@ -539,6 +584,10 @@ def debug_issue(
     cfg = require_init()
 
     if agent:
+        import time as _time  # noqa: PLC0415
+        _t_cmd0 = _time.monotonic()
+        from cloudctl.ai.graph_agent import _ABANDONED  # noqa: PLC0415
+        _ABANDONED.clear()
         import json as _json  # noqa: PLC0415
         from cloudctl.ai.graph_agent import debug_incident_graph  # noqa: PLC0415
         from cloudctl.ai.live_learner  import (  # noqa: PLC0415
@@ -582,7 +631,12 @@ def debug_issue(
 
         fix = None
         if iac_root and d.get("root_cause"):
-            fix = _iac_fix(d, iac_root, account, region)
+            _deadline = _command_deadline(_t_cmd0)
+            if _deadline is not None:
+                # Whatever the investigation left, plus a floor so a fix can
+                # still be located and proposed after a run that used it all.
+                _deadline = max(_deadline, _time.monotonic() + 20)
+            fix = _iac_fix(d, iac_root, account, region, deadline=_deadline)
             d["iac_fix"] = fix
             # The located resource is better evidence of how it is deployed
             # than CloudTrail (which lags and only covers 24 h): let --resolve
@@ -730,6 +784,7 @@ def debug_issue(
                 region=region or "us-east-1",
             )
 
+        _exit_if_abandoned()
         return
 
     if dry_run:

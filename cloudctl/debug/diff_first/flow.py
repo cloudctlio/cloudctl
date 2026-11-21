@@ -121,7 +121,7 @@ def build_symptoms(topo: Topology, anomalies: list[Anomaly], series: dict[str, d
             symptoms.append(Symptom(
                 id=f"S{len(symptoms) + 1}", kind="errors_up", node=a.node, onset=iso(a.onset),
                 detail=f"{a.metric} on {label(a.node)} rose from {a.ref_mean:.1f} to {a.win_mean:.1f} per bucket",
-                scope=sorted(_errors_scope(topo, a.node))))
+                scope=sorted(_errors_scope(topo, a.node)), standing=a.standing))
         else:
             symptoms.append(Symptom(
                 id=f"S{len(symptoms) + 1}", kind="backlog_up", node=a.node, onset=iso(a.onset),

@@ -1,0 +1,23 @@
+{
+ "root_cause": "The worker's SQS event source mapping was disabled outside Terraform at 23:44:08Z (State=Disabled), so nothing invokes the worker and orders stay PENDING. The worker role is also missing s3:PutObject on the receipts bucket, so workers fail with AccessDenied before writing receipts.",
+ "evidence": [
+  "evidence item"
+ ],
+ "remediation_steps": [
+  "Run terraform plan to confirm the drift, then terraform apply to re-enable the mapping."
+ ],
+ "severity": "HIGH",
+ "confidence": "HIGH",
+ "resources_investigated": [],
+ "alternatives_considered": [],
+ "deployment_source": "terraform",
+ "_timing": {
+  "budget_s": 480,
+  "elapsed_s": 212.4
+ },
+ "iac_fix": {
+  "status": "no_edit",
+  "resource": "aws_lambda_event_source_mapping.worker",
+  "detail": "IaC already enabled"
+ }
+}

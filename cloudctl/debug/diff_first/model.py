@@ -97,9 +97,15 @@ class Change:
     params: dict = field(default_factory=dict)
     error_code: str = ""
     origin: str = "cloudtrail"         # cloudtrail | iac_commit
-    status: str = ""                   # candidate | before_window | after_onset | superseded | reverted | failed_call | unmatched
+    status: str = ""                   # candidate | after_metrics | before_window | after_onset | superseded | reverted | failed_call | unmatched
     reason: str = ""
     superseded_by: str = ""
+    # Set for an in-window change that puts back the values in force before an
+    # earlier change while live now matches what is declared: likely a revert.
+    restores: bool = False
+    # Set for a call that sets no settings (a purge, a restart) on a resource
+    # whose live config matches what is declared: it left nothing behind.
+    one_off: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -114,6 +120,9 @@ class IncidentWindow:
     method: str = ""                   # metrics | observation | override | unknown
     signals: list[dict] = field(default_factory=list)   # the series that defined it
     note: str = ""
+    # Last bucket the metrics cover (CloudWatch lags a few minutes). A change
+    # after it is too recent for the metrics to show, so timing can't rule it out.
+    metrics_end: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -134,6 +143,14 @@ class Symptom:
     # Nothing known feeds this node (topology incomplete): a change that
     # re-pointed a reference of this service may explain it.
     open_service: str = ""
+    # Set when a change inside this symptom's scope landed after it began and
+    # live config now matches what's declared: the metrics end before that
+    # change, so the symptom may already be over. Not required to be explained.
+    may_be_over: str = ""
+    # Set when the node was failing in every minute it had work, back to its
+    # first work: a standing condition, not this incident's onset. Reported,
+    # not required to be explained by a change in the window.
+    standing: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

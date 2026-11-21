@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -604,15 +605,29 @@ def _app_argv(app: str) -> list[str] | None:
     return argv
 
 
-def _check(root: Path, kind: str, changed: dict[str, tuple[str, str]]) -> dict:
+_CHECK_TIMEOUT_S = 240.0
+
+
+def _check(root: Path, kind: str, changed: dict[str, tuple[str, str]],
+           deadline: float | None = None) -> dict:
+    """Validate the edited copy. ``deadline`` (a time.monotonic() value) bounds
+    the whole check, so it can't push the command past its time limit."""
     if os.environ.get("CLOUDCTL_IAC_FIX_CHECK", "1") == "0":
         return {"status": "not_run", "detail": "checks turned off (CLOUDCTL_IAC_FIX_CHECK=0)"}
+    fallback: list[list[str]] = []
     if kind == "terraform":
         tf = os.environ.get("CLOUDCTL_TERRAFORM_BIN") or shutil.which("terraform")
         if not tf:
             return {"status": "not_run", "detail": "terraform not found on PATH"}
-        cmds = [[tf, "init", "-backend=false", "-input=false", "-no-color"],
-                [tf, "validate", "-no-color"]]
+        init = [tf, "init", "-backend=false", "-input=false", "-no-color"]
+        cmds = [init, [tf, "validate", "-no-color"]]
+        installed = root / ".terraform" / "providers"
+        if installed.is_dir():
+            # Reuse the providers the IaC root already installed instead of
+            # downloading them again into the temporary copy (slow, and it
+            # needs the network). Fall back to a normal init if that fails.
+            cmds[0] = init + [f"-plugin-dir={installed}"]
+            fallback = init
         label = "terraform validate"
     else:
         cdk = os.environ.get("CLOUDCTL_CDK_BIN") or shutil.which("cdk")
@@ -641,17 +656,27 @@ def _check(root: Path, kind: str, changed: dict[str, tuple[str, str]]) -> dict:
         for f, (_, after) in changed.items():
             (work / f).write_text(after, encoding="utf-8")
         env = {**os.environ, "CDK_OUTDIR": str(Path(tmp) / "cdk.out")}
-        for cmd in cmds:
-            try:
-                # Always an argv list, never a shell: the cdk.json app string is
-                # split by _app_argv, which refuses anything that needs a shell.
-                r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, timeout=240,
-                                   env=env)  # nosec B603 - argv list, no shell
-            except FileNotFoundError:
-                return {"status": "not_run", "detail": f"{cmd[0]} not found"}
-            except subprocess.TimeoutExpired:
-                return {"status": "not_run", "detail": f"{label} timed out"}
-            if r.returncode != 0:
+        for i, cmd in enumerate(cmds):
+            r = None
+            for attempt in ([cmd, fallback] if i == 0 and fallback else [cmd]):
+                timeout = _CHECK_TIMEOUT_S
+                if deadline is not None:
+                    timeout = min(timeout, deadline - time.monotonic())
+                    if timeout < 5:
+                        return {"status": "not_run",
+                                "detail": f"{label} skipped: no time left in the run's time limit"}
+                try:
+                    # Always an argv list, never a shell: the cdk.json app string is
+                    # split by _app_argv, which refuses anything that needs a shell.
+                    r = subprocess.run(attempt, cwd=work, capture_output=True, text=True,
+                                       timeout=timeout, env=env)  # nosec B603 - argv list, no shell
+                except FileNotFoundError:
+                    return {"status": "not_run", "detail": f"{attempt[0]} not found"}
+                except subprocess.TimeoutExpired:
+                    return {"status": "not_run", "detail": f"{label} timed out"}
+                if r.returncode == 0:
+                    break
+            if r is not None and r.returncode != 0:
                 return {"status": "failed", "detail": f"{label} failed: "
                         + (r.stderr or r.stdout).strip()[-800:]}
     return {"status": "passed", "detail": f"{label} passed on a temporary copy"}
@@ -660,7 +685,8 @@ def _check(root: Path, kind: str, changed: dict[str, tuple[str, str]]) -> dict:
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def suggest_fix(diagnosis: dict, iac_root: str, client=None, model_id: str | None = None,
-                profile: str | None = None, region: str = "us-east-1") -> dict:
+                profile: str | None = None, region: str = "us-east-1",
+                deadline: float | None = None) -> dict:
     """Read-only IaC fix suggestion for a diagnosis. Never raises; never writes
     to iac_root. Result keys:
       status   suggested | not_found | ambiguous | no_edit | error | no_iac
@@ -698,7 +724,13 @@ def suggest_fix(diagnosis: dict, iac_root: str, client=None, model_id: str | Non
         if model_id is None:
             from cloudctl.ai.model_providers import default_model  # noqa: PLC0415
             model_id = default_model()
-        proposal = _propose(diagnosis, loc, client, model_id)
+        if deadline is None:
+            proposal = _propose(diagnosis, loc, client, model_id)
+        else:
+            # Leave a little time for the check; abandon a call that runs past it.
+            from cloudctl.ai.budget import run_with_timeout  # noqa: PLC0415
+            proposal = run_with_timeout(lambda: _propose(diagnosis, loc, client, model_id),
+                                        deadline - time.monotonic() - 10)
     except Exception as exc:  # noqa: BLE001
         return {**found, "status": "error", "detail": f"could not get a proposal: {type(exc).__name__}: {str(exc)[:200]}"}
     steps = [str(x) for x in proposal.get("remediation_steps") or [] if str(x).strip()]
@@ -715,7 +747,7 @@ def suggest_fix(diagnosis: dict, iac_root: str, client=None, model_id: str | Non
         "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                      fromfile=f"a/{f}", tofile=f"b/{f}"))
         for f, (before, after) in changed.items())
-    check = _check(root, loc.kind, changed)
+    check = _check(root, loc.kind, changed, deadline=deadline)
     edited = _edited_addresses(loc, edits, problems)
     return {**found, "status": "suggested", "diff": diff, "summary": proposal.get("summary", ""),
             "edited_resources": edited,
