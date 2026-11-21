@@ -341,6 +341,15 @@ def _mentioned(names: list[str], text: str) -> bool:
     return False
 
 
+def _add_causes(out: dict, summaries: list[str]) -> None:
+    """Add diff-first causes to ``additional_causes``. The agent's report sets
+    that field itself: None, or a list of its own confirmed faults (dicts).
+    Keep what it holds and add each summary once."""
+    have = out.get("additional_causes")
+    have = list(have) if isinstance(have, (list, tuple)) else ([have] if have else [])
+    out["additional_causes"] = have + [s for s in summaries if s not in have]
+
+
 def apply_to_report(report: dict, d: dict | None) -> dict:
     """Attach the checks to the agent's answer and cap confidence when the
     answer leaves a found cause out, leaves a symptom unexplained, or rests on
@@ -385,7 +394,7 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
         # that moves work: the answer must at least look at it.
         _cap(out, "MEDIUM", "the diagnosis does not address a lead the metrics can't place yet: "
                             + "; ".join(c["summary"] for c in ignored))
-        out["additional_causes"] = [c["summary"] for c in ignored]
+        _add_causes(out, [c["summary"] for c in ignored])
     if not causes and not unexplained:
         return out
     root = str(out.get("root_cause", "")).lower()
@@ -393,11 +402,11 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
     if causes and len(missed) == len(causes):
         _cap(out, "LOW", "diff-first checks found a cause the diagnosis does not mention: "
                          + "; ".join(c["summary"] for c in missed))
-        out["additional_causes"] = out.get("additional_causes", []) + [c["summary"] for c in missed]
+        _add_causes(out, [c["summary"] for c in missed])
     elif missed:
         _cap(out, "MEDIUM", "the diagnosis leaves out a cause the diff-first checks found: "
                             + "; ".join(c["summary"] for c in missed))
-        out["additional_causes"] = out.get("additional_causes", []) + [c["summary"] for c in missed]
+        _add_causes(out, [c["summary"] for c in missed])
     if unexplained:
         _cap(out, "MEDIUM", f"{len(unexplained)} observed symptom(s) are not explained by any "
                             "cause found; the search is not finished")

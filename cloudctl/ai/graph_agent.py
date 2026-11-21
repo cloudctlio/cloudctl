@@ -4510,8 +4510,14 @@ def debug_incident_graph(
     # caps confidence). No-op when the checks did not run.
     from cloudctl.debug.diff_first.run import apply_to_report as _df_apply
     from cloudctl.debug.diff_first.changes import set_active_window as _df_clear
-    parsed = _df_apply(parsed, final_state.get("diff_first") or {})
-    _df_clear(None)
+    try:
+        parsed = _df_apply(parsed, final_state.get("diff_first") or {})
+    except Exception as _df_exc:  # noqa: BLE001
+        # The checks support the answer; a bug in them must not lose it.
+        logging.getLogger(__name__).warning("diff-first could not be applied: %r", _df_exc)
+        parsed["diff_first"] = {"ran": False, "error": f"could not be applied: {_df_exc!r}"}
+    finally:
+        _df_clear(None)
 
     parsed = redact_output(parsed)
 

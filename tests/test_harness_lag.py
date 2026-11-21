@@ -133,6 +133,29 @@ def test_s4_once_the_metrics_catch_up_both_faults_are_causes(tmp_path):
     assert not d["explanation"]["newer_than_metrics"]
 
 
+def test_s4_answer_shaped_like_the_agents_report_does_not_crash(tmp_path):
+    # PR 47's laptop rerun: s3 and s4 crashed with a TypeError in run.py. The
+    # agent's report sets additional_causes to None (IncidentReport default),
+    # and apply_to_report appended to it when the answer missed a cause.
+    from cloudctl.ai.graph_agent import IncidentReport
+    d = _run("s4", 6, tmp_path)
+    assert d["explanation"]["causes"]
+    wrong = IncidentReport(
+        root_cause=f"The worker role lost s3:PutObject on {fx.P}-receipts", evidence=["AccessDenied"],
+        remediation_steps=[], severity="HIGH", confidence="HIGH",
+        resources_investigated=[f"{fx.P}-receipts"]).model_dump()
+    assert wrong["additional_causes"] is None
+    out = apply_to_report(wrong, d)
+    assert out["confidence"] == "LOW"
+    assert {c for c in out["additional_causes"] if isinstance(c, str)} == {
+        c["summary"] for c in d["explanation"]["causes"]}
+    # The agent's own confirmed faults are kept, not overwritten.
+    own = {"cause": "worker timeout"}
+    wrong["additional_causes"] = [own]
+    out = apply_to_report(wrong, d)
+    assert out["additional_causes"][0] == own and len(out["additional_causes"]) == 3
+
+
 # ── the generic rules underneath ─────────────────────────────────────────────
 
 def _change(ago, name, params, key):
