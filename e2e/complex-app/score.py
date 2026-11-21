@@ -14,7 +14,8 @@ Checks per scenario (each fault, for two-fault scenarios):
   iac_resource iac_fix.resource is the resource the fix belongs on
   iac_fix      iac_fix.diff removes the bad value and adds a correct one
   drift_safe   remediation doesn't tell you to change AWS directly without going through IaC
-Extra: red herring (s3) not blamed; no-fault control (s0) not given a confident false cause.
+Extra: red herring (s3) not blamed; no-fault control (s0) not given a confident false cause;
+  root cause does not also blame another scenario's fault (a leftover from an earlier scenario).
 
 Verdict: PASS = root cause + localized + time + IaC resource + fix all pass (drift: no IaC change
 and drift-safe); PARTIAL = root cause right but something else misses; FAIL = root cause wrong.
@@ -132,6 +133,27 @@ def score_one(scen: dict, result: dict, meta: dict, cfg: dict) -> dict:
     out["iac_fix_ok"] = any(f["iac_fix_ok"] for f in faults)
     out["overconfident"] = found == 0 and conf == "HIGH"
 
+    # Scenarios run back to back in one deployment, so an earlier scenario's
+    # fault (reverted before this one) can still show in logs and metrics. A
+    # root-cause sentence that names another scenario's fault, and not this
+    # scenario's, blames a leftover: at best PARTIAL.
+    own = [f["root_cause_all"] for f in gt["faults"]]
+    leftovers = []
+    for other in cfg.get("scenarios", []):
+        if other["id"] == scen["id"]:
+            continue
+        for of in other["ground_truth"].get("faults", []):
+            for sent in _sentences(rc):
+                if NEGATION.search(sent) or any(all(_rx(g).search(sent) for g in gs) for gs in own):
+                    continue
+                if all(_rx(g).search(sent) for g in of["root_cause_all"]):
+                    leftovers.append(f"{other['id']}{of['id']}")
+                    break
+    out["blames_other_fault"] = sorted(set(leftovers))
+    if leftovers:
+        out["notes"].append("root cause also blames another scenario's fault ("
+                            + ", ".join(out["blames_other_fault"]) + ")")
+
     rh = gt.get("red_herring_regex")
     if rh:
         blamed = [s for s in _sentences(rc) if _rx(rh).search(s) and not NEGATION.search(s)]
@@ -143,7 +165,8 @@ def score_one(scen: dict, result: dict, meta: dict, cfg: dict) -> dict:
             out["notes"].append("IaC diff only touches the red herring")
 
     core = [out["root_cause_ok"], out["localized_ok"], out["time_ok"], out["iac_resource_ok"],
-            out["iac_fix_ok"], out["drift_safe"], out.get("red_herring_avoided", True)]
+            out["iac_fix_ok"], out["drift_safe"], out.get("red_herring_avoided", True),
+            not out["blames_other_fault"]]
     if all(core):
         out["verdict"] = "PASS"
     elif found > 0:

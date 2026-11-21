@@ -279,13 +279,14 @@ _EXIT_SCRIPT = textwrap.dedent("""
     t0 = time.monotonic()
     raw, _ = g.debug_incident_graph("orders fail", profile=None)
     print(json.dumps({"timed_out": json.loads(raw).get("_timed_out"),
+                      "models": json.loads(raw).get("_models"),
                       "elapsed": round(time.monotonic() - t0, 1)}), flush=True)
     debug_cmd._exit_if_abandoned()
 """)
 
 
 def test_command_exits_at_the_ceiling_instead_of_waiting_for_the_abandoned_graph(tmp_path):
-    env = {**__import__("os").environ, "CLOUDCTL_TIME_BUDGET_S": "2",
+    env = {**__import__("os").environ, "CLOUDCTL_TIME_BUDGET_S": "2", "CLOUDCTL_MODEL": "test-model-id",
            "CLOUDCTL_TIME_GRACE_S": "1", "CLOUDCTL_HOME": str(tmp_path / "home"),
            "CLOUDCTL_DIFF_FIRST": "0", "HOME": str(tmp_path)}
     t0 = time.monotonic()
@@ -295,6 +296,8 @@ def test_command_exits_at_the_ceiling_instead_of_waiting_for_the_abandoned_graph
     out = json.loads(r.stdout.strip().splitlines()[-1])
     assert out["timed_out"] is True
     assert out["elapsed"] < 5
+    # The model ids are recorded even on a timed-out run (the rerun couldn't say which model ran).
+    assert out["models"]["investigator"] == "test-model-id"
     # The process used to stay until the 30 s worker finished.
     assert wall < 15, (wall, r.stderr[-500:])
 
@@ -381,3 +384,12 @@ def test_iac_fix_check_reuses_installed_providers(tmp_path, monkeypatch):
     monkeypatch.setattr(iac_fix.subprocess, "run", fake_run)
     assert iac_fix._check(tmp_path, "terraform", {})["status"] == "passed"
     assert any(a.startswith("-plugin-dir=") for a in seen[0])
+
+
+def test_scorer_flags_a_root_cause_that_also_blames_a_leftover_fault():
+    # PR 47 rerun: s5 named the disabled mapping but also blamed s1's missing
+    # s3:PutObject grant (reverted long before), and the scorer passed it.
+    score = Path(__file__).resolve().parents[1] / "e2e" / "complex-app" / "score.py"
+    r = subprocess.run([sys.executable, str(score), "--selftest"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout[-1500:]
+    assert "s5.partial-blames-leftover.json: want PARTIAL, got PARTIAL" in r.stdout

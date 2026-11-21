@@ -353,8 +353,20 @@ def diagnose(sid: str) -> dict:
                            env=env)
     wall = round(time.time() - start, 1)
     meta = {"scenario": sid, "wall_seconds": wall, "exit_code": r.returncode, "command": cmd,
-            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            # What the shell asked for, and what cctl says it called.
+            "model_env": {k: os.environ[k] for k in ("CLOUDCTL_MODEL", "CLOUDCTL_CRITIC_MODEL",
+                                                      "CLOUDCTL_LOG_MODEL") if os.environ.get(k)}}
+    try:
+        meta["models"] = json.loads(out_json.read_text(encoding="utf-8")).get("_models")
+    except (OSError, ValueError, AttributeError):
+        meta["models"] = None
     (RUNS / f"{sid}.meta.json").write_text(json.dumps(meta, indent=1))
+    # The declared state cctl compared against, so the diff-first recording can
+    # be replayed after teardown (terraform destroy empties the state file).
+    st = APP / "terraform.tfstate"
+    if st.exists():
+        (RUNS / f"{sid}.tfstate.json").write_bytes(st.read_bytes())
     log(f"{sid}: cctl finished in {wall} s (exit {r.returncode})")
     if not out_json.exists():
         log(f"{sid}: cctl wrote no JSON; see {log_path}")
@@ -414,6 +426,11 @@ def run_scenario(sid: str, warmup_max_min: float, load_after_s: int) -> None:
         revert(sid)
     meta["scenario_total_s"] = round(time.time() - t0, 1)
     (RUNS / f"{sid}.meta.json").write_text(json.dumps(meta, indent=1))
+    # The declared state cctl compared against, so the diff-first recording can
+    # be replayed after teardown (terraform destroy empties the state file).
+    st = APP / "terraform.tfstate"
+    if st.exists():
+        (RUNS / f"{sid}.tfstate.json").write_bytes(st.read_bytes())
     score(sid)
 
 

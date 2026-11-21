@@ -145,6 +145,12 @@ _LOG_INTEL_MODEL = os.environ.get(
 # id (e.g. an Opus/Haiku inference profile) to actually decorrelate.
 _CRITIC_MODEL = os.environ.get("CLOUDCTL_CRITIC_MODEL", _MODEL)
 
+
+def _models_used() -> dict:
+    """The model ids this run called, recorded in the report so a run can be
+    checked afterwards (which model produced this answer?)."""
+    return {"investigator": _MODEL, "critic": _CRITIC_MODEL, "log_intelligence": _LOG_INTEL_MODEL}
+
 # Prompt caching. A cachePoint marks a prefix boundary Bedrock may reuse across
 # calls; it does NOT change the tokens the model sees, so at temperature 0 the
 # generated output is byte-identical with or without it. We cache only content
@@ -4381,6 +4387,7 @@ def debug_incident_graph(
             "_thread_id": thread_id,
             "_usage": usage_report(),
             "_timing": run_budget.report(),
+            "_models": _models_used(),
         })
         _budget_mod.unregister(session_id)
         return json.dumps(report), checkpointed.get("all_fetched", {}) or {}
@@ -4410,6 +4417,7 @@ def debug_incident_graph(
     parsed["_usage"] = usage_report()
     # Where the time went, and what the budget skipped to finish in time.
     parsed["_timing"] = run_budget.report()
+    parsed["_models"] = _models_used()
     _budget_mod.unregister(session_id)
 
     # Resolution plumbing: lift deployment_source/iac_file_hint from any
