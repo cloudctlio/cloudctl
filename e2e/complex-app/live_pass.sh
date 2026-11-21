@@ -17,15 +17,21 @@ want="${1:?usage: bash live_pass.sh <expected-sha-prefix> [branch]}"
 branch="${2:-fix/s5-s4-lag-and-budget}"
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-  git status --short --untracked-files=no
-  echo "STOP: the clone has tracked edits (above). Nothing was run."; exit 1
-fi
 head="$(git rev-parse "origin/$branch" 2>/dev/null)"
 case "$head" in
   "$want"*) ;;
   *) echo "STOP: origin/$branch is '${head:-missing}', expected $want. Run: git fetch origin $branch"; exit 1 ;;
 esac
+# Tracked edits block the run, except files already identical to the branch's
+# copy (such as a script checked out from it earlier).
+dirty=""
+for f in $(git diff --name-only HEAD); do
+  git diff --quiet "origin/$branch" -- "$f" || dirty="$dirty $f"
+done
+if [ -n "$dirty" ]; then
+  echo "tracked edits:$dirty"
+  echo "STOP: the clone has tracked edits (above). Nothing was run."; exit 1
+fi
 git checkout -q -B "$branch" "origin/$branch" || exit 1
 echo "== cctl at $(git log --oneline -1)"
 
