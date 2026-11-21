@@ -1,8 +1,25 @@
-"""GCP cost fixers — stop idle GCE instances, delete orphaned persistent disks."""
+"""GCP cost fixers — stop idle GCE instances, delete orphaned persistent disks.
+
+Deleting a disk destroys data: the policy gate rejects it in production.
+"""
 from __future__ import annotations
 
-from cloudctl.fixers.base import BaseFixer
+import re
+from typing import Any
+
+from cloudctl.fixers.base import BaseFixer, gcp_project
+from cloudctl.fixers.gcp.security import _act, _build, _project_for_apply, _rc
 from cloudctl.fixers.registry import register
+
+
+def _name(issue: dict, pattern: str) -> str:
+    resource = issue.get("resource", "")
+    m = re.search(pattern, resource, re.IGNORECASE)
+    return (m.group(1) or m.group(2)) if m else resource.split("/")[-1]
+
+
+def _zone(issue: dict, fix_proposal: dict) -> str:
+    return fix_proposal.get("zone") or issue.get("region", "us-central1-a")
 
 
 @register
@@ -19,20 +36,20 @@ class GCPStopIdleInstanceFixer(BaseFixer):
             "idle" in issue_text or "unused" in issue_text or "low cpu" in issue_text
         )
 
-    def apply(self, issue: dict, fix_proposal: dict) -> None:
-        from googleapiclient import discovery  # noqa: PLC0415
-        import google.auth  # noqa: PLC0415
-        import re  # noqa: PLC0415
+    def plan(self, issue: dict, fix_proposal: dict, *, creds: Any, env: Any) -> list:
+        name = _name(issue, r"instances/([^\s/]+)|instance:([^\s/]+)")
+        project, zone = gcp_project(issue, env), _zone(issue, fix_proposal)
+        return [_rc(address=f"projects/{project}/zones/{zone}/instances/{name}", type="google_compute_instance",
+                    action=_act("update"), name=name, location=zone,
+                    before={"project": project, "status": "RUNNING"},
+                    after={"project": project, "status": "TERMINATED"},
+                    operations=("compute.instances.stop",))]
 
-        resource      = issue.get("resource", "")
-        project       = issue.get("account", "")
-        zone          = fix_proposal.get("zone") or issue.get("region", "us-central1-a")
-        name_match    = re.search(r"instances/([^\s/]+)|instance:([^\s/]+)", resource, re.IGNORECASE)
-        instance_name = (name_match.group(1) or name_match.group(2)) if name_match else resource.split("/")[-1]
-
-        creds, _ = google.auth.default()
-        svc      = discovery.build("compute", "v1", credentials=creds)
-        svc.instances().stop(project=project, zone=zone, instance=instance_name).execute()
+    def apply(self, issue: dict, fix_proposal: dict, creds: Any = None) -> None:
+        instance_name = _name(issue, r"instances/([^\s/]+)|instance:([^\s/]+)")
+        svc = _build("compute", creds)
+        svc.instances().stop(project=_project_for_apply(issue, creds), zone=_zone(issue, fix_proposal),
+                             instance=instance_name).execute()
 
 
 @register
@@ -49,17 +66,15 @@ class GCPDeleteOrphanedDiskFixer(BaseFixer):
             "orphan" in issue_text or "unattached" in issue_text or "unused" in issue_text
         )
 
-    def apply(self, issue: dict, fix_proposal: dict) -> None:
-        from googleapiclient import discovery  # noqa: PLC0415
-        import google.auth  # noqa: PLC0415
-        import re  # noqa: PLC0415
+    def plan(self, issue: dict, fix_proposal: dict, *, creds: Any, env: Any) -> list:
+        name = _name(issue, r"disks/([^\s/]+)|disk:([^\s/]+)")
+        project, zone = gcp_project(issue, env), _zone(issue, fix_proposal)
+        return [_rc(address=f"projects/{project}/zones/{zone}/disks/{name}", type="google_compute_disk",
+                    action=_act("delete"), name=name, location=zone, before={"project": project}, after=None,
+                    operations=("compute.disks.delete",))]
 
-        resource   = issue.get("resource", "")
-        project    = issue.get("account", "")
-        zone       = fix_proposal.get("zone") or issue.get("region", "us-central1-a")
-        disk_match = re.search(r"disks/([^\s/]+)|disk:([^\s/]+)", resource, re.IGNORECASE)
-        disk_name  = (disk_match.group(1) or disk_match.group(2)) if disk_match else resource.split("/")[-1]
-
-        creds, _ = google.auth.default()
-        svc      = discovery.build("compute", "v1", credentials=creds)
-        svc.disks().delete(project=project, zone=zone, disk=disk_name).execute()
+    def apply(self, issue: dict, fix_proposal: dict, creds: Any = None) -> None:
+        disk_name = _name(issue, r"disks/([^\s/]+)|disk:([^\s/]+)")
+        svc = _build("compute", creds)
+        svc.disks().delete(project=_project_for_apply(issue, creds), zone=_zone(issue, fix_proposal),
+                           disk=disk_name).execute()

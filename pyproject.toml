@@ -89,6 +89,20 @@ gcp = [
 all-clouds = [
     "cctl[azure,gcp]",
 ]
+all = ["cctl[gate-azure,gate-gcp,ai,mcp]"]
+# Policy gate (every cloud change goes through it). Pinned: these decide
+# what is allowed, so an upgrade is a reviewed change, not a resolver choice.
+#   regopy   — OPA Rego evaluator (Microsoft rego-cpp), MIT
+#   cedarpy  — Cedar authorization for approvals, Apache-2.0
+#   cryptography — Ed25519 approval signatures, Apache-2.0/BSD
+gate = [
+    "regopy==1.5.2",
+    "cedarpy==4.12.2",
+    "cryptography>=46,<51",
+]
+# Native cloud guardrail checks and immutable audit sinks for Azure and GCP.
+gate-azure = ["cctl[gate,azure]", "azure-mgmt-policyinsights>=1.0", "azure-storage-blob>=12.19"]
+gate-gcp = ["cctl[gate,gcp]"]
 mcp = ["mcp>=1.0.0"]
 ai  = ["anthropic>=0.30", "openai>=1.0", "requests>=2.31", "pydantic>=2.0", "instructor>=1.0", "langgraph"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0"]
@@ -99,6 +113,8 @@ cloudctl-mcp = "cloudctl.mcp.server:sync_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cloudctl"]
+# The gate's built-in policy (Rego, YAML rules, Cedar) ships inside the package.
+artifacts = ["cloudctl/gate/**/*.rego", "cloudctl/gate/**/*.yaml", "cloudctl/gate/**/*.cedar"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

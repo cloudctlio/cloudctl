@@ -157,8 +157,8 @@ cloudctl debug --agent --verdict skip "..."
 | `cloudctl network vpcs/security-groups/lb` | VPCs, NSGs, load balancers, DNS |
 | `cloudctl containers list/describe` | ECS, AKS, GKE, ECR, ACR |
 | `cloudctl iam roles/users/check` | IAM roles, users, permission checks |
-| `cloudctl security audit/public-resources` | Security posture and misconfigs. `audit --fix` changes AWS directly, see below |
-| `cloudctl cost summary/by-service` | Cost breakdown across clouds. `by-service --fix` changes AWS directly, see below |
+| `cloudctl security audit/public-resources` | Security posture and misconfigs. `audit --fix` changes the cloud directly, through the policy gate, see below |
+| `cloudctl cost summary/by-service` | Cost breakdown across clouds. `by-service --fix` changes the cloud directly, through the policy gate, see below |
 | `cloudctl pipeline list/analyze` | CodePipeline, Azure DevOps, Cloud Build |
 | `cloudctl monitoring alerts/metrics` | CloudWatch, Azure Monitor, GCP Monitoring |
 | `cloudctl messaging topics/queues` | SQS/SNS, Service Bus, Pub/Sub |
@@ -174,11 +174,38 @@ cloudctl debug --agent --verdict skip "..."
 | `cloudctl debug --agent "<symptom>"` | Full agentic mode: triage → investigate → synthesize → critique |
 | `cloudctl debug --agent --verdict y/n "<symptom>"` | Diagnose and record whether the answer was correct (trains the learning loop) |
 | `cloudctl debug --agent --json-out result.json "<symptom>"` | Save structured JSON output alongside the rendered result |
-| `cloudctl debug --agent --resolve --iac-root <dir> "<symptom>"` | After a confirmed diagnosis: write the minimal IaC fix on a branch, validate, open a PR — with two operator approval gates (fix plan; diff + validation) |
-| `cloudctl debug ... --resolve --yes` | Skip the approval gates (CI use). Non-interactive runs without `--yes` stop safely at the first gate |
+| `cloudctl debug --agent --resolve --iac-root <dir> "<symptom>"` | After a confirmed diagnosis: write the minimal IaC fix on a branch, validate, open a PR — with two operator approval gates (fix plan; diff + validation), and the push goes through the [policy gate](docs/policy-gate.md) |
+| `cloudctl debug ... --resolve --yes` | Skip the operator prompts (CI use). The policy gate still runs. Non-interactive runs without `--yes` stop safely at the first gate |
+| `cloudctl debug ... --resolve --env <name> --approval <id>` | Pick the gate environment, and pass a signed approval for a large prod change |
 | `cloudctl ask "<question>"` | Answer cloud questions from live data |
 | `cloudctl ask --interactive` | Multi-turn chat, context preserved |
 | `cloudctl feedback list/accuracy` | Review AI answer history and accuracy |
+
+### Policy gate (requires `pip install "cctl[gate]"`)
+
+Every `--fix` and `--resolve` change goes through a five-stage gate: short-lived scoped credentials, the platform's own plan, policy engines (OPA/Rego, Checkov, Trivy, cfn-guard, Kyverno, Infracost, AWS/Azure/GCP native guardrails), signed approval for large prod changes, then a one-time authorization. Everything is written to a hash-chained audit log. See [docs/policy-gate.md](docs/policy-gate.md).
+
+| Command | What it does |
+|---|---|
+| `cloudctl gate init --cloud aws\|azure\|gcp ...` | Write a starter control-plane config |
+| `cloudctl gate validate` | Check the config, including the production rules |
+| `cloudctl gate engines` | Which engines are on, pinned and installed |
+| `cloudctl gate policy eval plan.json --env <name>` | Run the engines on a Terraform plan JSON (exit 2 on HIGH/CRITICAL) |
+| `cloudctl gate keygen --approver <name>` | Make an approver's Ed25519 key |
+| `cloudctl gate approvals list` / `cloudctl gate approve <id>` | Review and sign approval requests |
+| `cloudctl gate audit verify` | Check the audit hash chain |
+
+### Change requests (requires `pip install "cctl[gate]"`)
+
+Compile a plain-language request into a change graph (validated against a fixed schema; ambiguous requests get questions back), then run it node by node through the policy gate. A failed node is never retried: everything after it is skipped and a targeted rollback request is queued. See [docs/control-plane.md](docs/control-plane.md).
+
+| Command | What it does |
+|---|---|
+| `cloudctl change compile "<request>" -o graph.json` | Ask the model for a change graph; applies nothing |
+| `cloudctl change run graph.json` | Run the graph through the gate, in dependency order |
+| `cloudctl change resume <run> --approval <node>=<id>` | Carry on after approvals |
+| `cloudctl change status <run>` / `cloudctl change list` | Where runs stand |
+| `cloudctl change rollbacks` | Rollback requests waiting for the drift repair loop |
 
 ### Setup
 
@@ -216,7 +243,7 @@ Once connected, your AI client can query your cloud directly:
 - **Multi-cloud** — `--cloud all` queries AWS + Azure + GCP in parallel
 - **AI is optional** — all CLI commands work without `cctl[ai]`; only `debug` and `ask` need it
 - **Read-only by default** — `cloudctl debug` and its agent cannot mutate anything; `--resolve` writes only to your local IaC repo and git, behind operator approvals
-- **Commands that change your cloud directly** — `compute stop/start`, the MCP `stop_compute`/`start_compute` tools (dry run unless `dry_run=false`), and `--fix` on `cost by-service` and `security audit`. After a per-item confirmation, `--fix` calls the cloud API itself: it can stop EC2 instances, **delete** EBS volumes and snapshots, revoke security-group rules, turn on S3 public-access blocks and deactivate IAM access keys (and the Azure/GCP equivalents). These changes are not made through your IaC, so the next `terraform apply` / `cdk deploy` may revert them or show drift
+- **Commands that change your cloud directly** — `compute stop/start`, the MCP `stop_compute`/`start_compute` tools (dry run unless `dry_run=false`), and `--fix` on `cost by-service` and `security audit`. After a per-item confirmation and a pass through the [policy gate](docs/policy-gate.md), `--fix` calls the cloud API itself with the gate's short-lived credentials: it can stop EC2 instances, **delete** EBS volumes and snapshots, revoke security-group rules, turn on S3 public-access blocks and deactivate IAM access keys (and the Azure/GCP equivalents). `compute stop/start` and the MCP tools do not go through the gate yet. These changes are not made through your IaC, so the next `terraform apply` / `cdk deploy` may revert them or show drift
 - **Secrets stay out of context** — secret material is scrubbed from tool output before the model or your terminal sees it
 - **Crash-safe investigations** — an investigation killed mid-flight (expired credentials, Ctrl-C) resumes from its last completed step instead of starting over
 
