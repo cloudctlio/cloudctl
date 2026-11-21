@@ -25,13 +25,17 @@ def series(fn, born=None):
         out.append([t(ago), round(max(fn(ago), 0.0), 3)])
     return out
 
-def build(last="s5", deploy_ago=60, inj_ago=2.5, run3=False):
+def build(last="s5", deploy_ago=60, inj_ago=2.5, run3=False, busy_api=False):
     """(terraform state, RecordedLive data) for a run started ``inj_ago``
     minutes after the last scenario's fault was injected.
 
     ``run3`` matches live run 3 more closely: the s4 load hit the Lambda
     concurrency limit, so the api returned 5xx all through it, and the s3
-    revert and its queue purge landed seconds after that load began."""
+    revert and its queue purge landed seconds after that load began.
+
+    ``busy_api`` matches the second PR 47 rerun: the api sat at the Lambda
+    concurrency limit from its very first traffic, so its 5xx were never zero
+    while load ran (a standing condition, not an incident onset)."""
     # load windows (from_ago, to_ago, profile)
     if last == "s5":
         loads = {"s1": (55, 46), "s3": (44, 35), "s4": (33, 4), "s5": (inj_ago, 0)}
@@ -50,6 +54,7 @@ def build(last="s5", deploy_ago=60, inj_ago=2.5, run3=False):
     def post(ago): return 0.6 * api_count(ago)
     def api_5xx(ago):
         if in_load(ago, "s3"): return post(ago)
+        if busy_api: return 0.3 * post(ago)
         # run 3: the api stayed at the concurrency limit from the s4 load on
         return 0.3 * post(ago) if run3 and (in_load(ago, "s4") or in_load(ago, "s5")) else 0
     def q_sent(ago): return 0 if in_load(ago, "s3") else post(ago)
@@ -57,7 +62,9 @@ def build(last="s5", deploy_ago=60, inj_ago=2.5, run3=False):
         if in_load(ago, "s5"): return 0
         return q_sent(ago) * (1.3 if in_load(ago, "s4") or in_load(ago, "s1") else 1)
     def w_err(ago):
-        if in_load(ago, "s1"): return 0.2 * q_sent(ago) * 3
+        # The second rerun's replay showed no worker Lambda errors during s1
+        # (baseline 0, first rise at s4), so busy_api leaves them out.
+        if in_load(ago, "s1"): return 0 if busy_api else 0.2 * q_sent(ago) * 3
         if in_load(ago, "s4"): return 0.35 * q_sent(ago) * 3
         return 0
     def deleted(ago): return 0 if in_load(ago, "s5") else q_sent(ago) * 0.8

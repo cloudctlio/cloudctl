@@ -195,7 +195,9 @@ def mark_may_be_over(symptoms: list[Symptom], changes: list[Change], cands: list
 def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology) -> dict:
     # A symptom that a later change may already have fixed is reported, not required.
     over = [s for s in symptoms if s.may_be_over]
-    symptoms = [s for s in symptoms if not s.may_be_over]
+    # Failing since it first got work: reported, not required (no onset to place a cause).
+    standing = [s for s in symptoms if s.standing and not s.may_be_over]
+    symptoms = [s for s in symptoms if not s.may_be_over and not s.standing]
     cover_map: dict[str, dict[str, str]] = {}      # cand id -> {symptom id: how}
     for c in cands:
         cover_map[c.id] = {s.id: how for s in symptoms if (how := explains(c, s, topo))}
@@ -250,6 +252,7 @@ def explain_all(symptoms: list[Symptom], cands: list[Candidate], topo: Topology)
         "changes_explaining_nothing": [c.to_dict() for c in idle],
         "unexplained_symptoms": [s.to_dict() for s in unexplained],
         "may_be_over": [s.to_dict() for s in over],
+        "standing_symptoms": [s.to_dict() for s in standing],
         "newer_than_metrics": [c.to_dict() for c in newer],
         "unplaced_drift": [c.to_dict() for c in unplaced],
         "likely_reverts": [{**c.to_dict(), "explains": cover_map[c.id]} for c in reverts],

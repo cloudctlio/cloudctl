@@ -39,8 +39,8 @@ def _isolate(monkeypatch, tmp_path):
     set_active_window(None)
 
 
-def _run(last: str, inj_ago: float, tmp_path: Path, run3: bool = False) -> dict:
-    state, data = ht.build(last, inj_ago=inj_ago, run3=run3)
+def _run(last: str, inj_ago: float, tmp_path: Path, run3: bool = False, busy_api: bool = False) -> dict:
+    state, data = ht.build(last, inj_ago=inj_ago, run3=run3, busy_api=busy_api)
     (tmp_path / "main.tf").write_text("# app\n")
     (tmp_path / "terraform.tfstate").write_text(json.dumps(state))
     return run_diff_first(RecordedLive(data), iac_root=str(tmp_path), account=fx.ACCT,
@@ -415,6 +415,7 @@ def test_replay_script_works_after_teardown(tmp_path):
     assert "likely_reverts: UpdateFunctionConfiguration" in r.stdout
     assert "one_off_actions: PurgeQueue" in r.stdout
     assert "unplaced_drift:" in r.stdout
+    assert "cloudctl code: " + str(Path(__file__).resolve().parent.parent / "cloudctl" / "debug" / "diff_first") in r.stdout
 
 
 def test_harness_summary_prints_models_and_diff_first_groups(tmp_path):
@@ -489,3 +490,71 @@ def test_score_takes_host_sleep_out_of_the_time_and_says_so():
     assert any("host asleep 2940 s" in n for n in slept["notes"])
     awake = mod.score_one(mod.by_id(cfg, "s5"), res, {"wall_seconds": 912.0}, cfg)
     assert awake["seconds"] == 912.0 and not awake["time_ok"]
+
+
+
+# ── second PR 47 rerun: the api failed from its first request ───────────────
+
+def test_s5_busy_api_from_first_traffic_does_not_open_the_window_at_deploy(tmp_path):
+    """Replay of the second rerun's s5: the api sat at the concurrency limit from
+    its first request, so its errors were never zero while load ran. That signal
+    has no healthy-then-broken edge and must not anchor the window, or every
+    later change is "after the onset" and the deploy's Create calls are blamed."""
+    d = _run("s5", 2.5, tmp_path, busy_api=True)
+    w, ex = d["window"], d["explanation"]
+    assert w["onset"] > "2026-11-18T21:10:00Z"           # not the first load at 21:05
+    assert not [c for c in ex["causes"] + ex["alternatives"] if c["summary"].startswith("Create")]
+    standing = {s["node"]: s for s in d["symptoms"] if s.get("standing")}
+    assert "aws_lambda_function.api" in standing
+    assert "never seen healthy" in standing["aws_lambda_function.api"]["standing"]
+    assert [s["id"] for s in ex["standing_symptoms"]] == [standing["aws_lambda_function.api"]["id"]]
+    assert [c["resource_key"] for c in ex["unplaced_drift"]] == [ESM]
+    assert not ex["unexplained_symptoms"]
+    txt = prompt_text(d)
+    assert "STANDING" in txt and "not required to be explained" in txt
+    # Same answer as the quiet-api replay: the busy api changes nothing.
+    quiet = _run("s5", 2.5, tmp_path)
+    assert quiet["window"]["onset"] == w["onset"]
+    assert [c["resource_key"] for c in quiet["explanation"]["unplaced_drift"]] == [ESM]
+
+
+def test_s5_busy_api_report_lists_standing_symptoms(tmp_path):
+    from cloudctl.debug.diff_first.run import apply_to_report
+    d = _run("s5", 2.5, tmp_path, busy_api=True)
+    out = apply_to_report({"root_cause": "event source mapping disabled", "confidence": "HIGH"}, d)
+    assert out["diff_first"]["standing"] and out["diff_first"]["standing"][0].startswith("S")
+
+
+def _anom(node, onset_min, thr=1.0):
+    from datetime import datetime, timezone
+    from cloudctl.debug.diff_first.window import Anomaly
+    base = datetime(2026, 11, 18, 21, 0, tzinfo=timezone.utc)
+    ts = [base.replace(minute=m) for m in range(0, 20)]
+    a = Anomaly(node=node, metric="Errors", role="errors", onset=ts[onset_min], last_normal=ts[onset_min - 1],
+                ref_mean=0.0, win_mean=5.0, threshold=thr)
+    return a, ts
+
+
+def test_mark_standing_needs_a_busy_healthy_minute_before_the_onset():
+    from cloudctl.debug.diff_first.window import mark_standing
+    # api: work starts at minute 5 and errors from then on -> standing
+    api, ts = _anom("api", 5)
+    api.series = [(t, 0.0 if i < 5 else 9.0) for i, t in enumerate(ts)]
+    api_in = [(t, 0.0 if i < 5 else 50.0) for i, t in enumerate(ts)]
+    # worker: work from minute 2, healthy until minute 12 -> a real edge
+    wk, _ = _anom("worker", 12)
+    wk.series = [(t, 0.0 if i < 12 else 9.0) for i, t in enumerate(ts)]
+    wk_in = [(t, 0.0 if i < 2 else 40.0) for i, t in enumerate(ts)]
+    mark_standing([api, wk], {"api": api_in, "worker": wk_in})
+    assert api.standing and not wk.standing
+    assert "21:05:00" in api.standing
+    # When every signal is like that, nothing is marked: the deploy may be the cause.
+    api2, _ = _anom("api", 5)
+    api2.series = api.series
+    mark_standing([api2], {"api": api_in})
+    assert not api2.standing
+    # A node with no traffic series is left alone.
+    other, _ = _anom("other", 5)
+    other.series = api.series
+    mark_standing([other, wk], {"worker": wk_in})
+    assert not other.standing

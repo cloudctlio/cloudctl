@@ -147,6 +147,10 @@ class Symptom:
     # live config now matches what's declared: the metrics end before that
     # change, so the symptom may already be over. Not required to be explained.
     may_be_over: str = ""
+    # Set when the node was failing in every minute it had work, back to its
+    # first work: a standing condition, not this incident's onset. Reported,
+    # not required to be explained by a change in the window.
+    standing: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

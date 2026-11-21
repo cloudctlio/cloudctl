@@ -96,12 +96,20 @@ class Anomaly:
     win_mean: float
     detail: str = ""
     series: list = field(default_factory=list, repr=False)
+    threshold: float = 0.0             # a bucket at or past this is abnormal ("in": below it)
+    # Set when the node was never seen working normally before the onset: it
+    # has been failing since it first got work, so the onset is not when an
+    # incident began (see mark_standing).
+    standing: str = ""
 
     def to_dict(self) -> dict:
-        return {"node": self.node, "metric": self.metric, "role": self.role,
-                "onset": iso(self.onset), "last_normal": iso(self.last_normal),
-                "baseline_mean": round(self.ref_mean, 3), "now_mean": round(self.win_mean, 3),
-                "detail": self.detail}
+        d = {"node": self.node, "metric": self.metric, "role": self.role,
+             "onset": iso(self.onset), "last_normal": iso(self.last_normal),
+             "baseline_mean": round(self.ref_mean, 3), "now_mean": round(self.win_mean, 3),
+             "detail": self.detail}
+        if self.standing:
+            d["standing"] = self.standing
+        return d
 
 
 def detect_anomaly(series: list[tuple[datetime, float | None]], role: str,
@@ -118,6 +126,7 @@ def detect_anomaly(series: list[tuple[datetime, float | None]], role: str,
     if role in ("in", "out"):
         if ref_mean <= 0:
             return None
+        thr = 0.2 * ref_mean
         def bad(v: float) -> bool:
             return v < 0.2 * ref_mean
     elif role == "errors":
@@ -157,7 +166,37 @@ def detect_anomaly(series: list[tuple[datetime, float | None]], role: str,
     return Anomaly(node=node, metric=metric, role=role, onset=onset, last_normal=last_normal,
                    ref_mean=ref_mean, win_mean=statistics.fmean(win) if win else 0.0,
                    detail="" if start_i > 0 else "abnormal since the start of the lookback",
-                   series=pts)
+                   series=pts, threshold=thr)
+
+
+def mark_standing(anomalies: list[Anomaly], traffic: dict[str, list]) -> None:
+    """Mark error signals that carry no onset information.
+
+    An error count of 0 in a minute with no work says nothing about health:
+    nothing ran, so nothing could fail (and CloudWatch reports no Sum before a
+    resource exists, which is filled as 0). A node whose errors were already
+    abnormal in every minute it had work, back to its first work, was never
+    seen healthy: the "onset" is just when work first arrived (often right
+    after a deploy), not when something broke. Such a signal is still a
+    symptom, but it must not set the incident window for the others, or every
+    later change lands "after the onset" and the deploy is blamed.
+
+    ``traffic`` maps node -> its "in" series. Only applied when at least one
+    other current signal has a real healthy-then-abnormal edge; when every
+    signal is like this, nothing is marked (the deploy may be the cause)."""
+    for a in anomalies:
+        a.standing = ""
+        if a.role != "errors" or not traffic.get(a.node):
+            continue
+        errs = {t: v for t, v in a.series}
+        busy = [(t, v) for t, v in traffic[a.node] if (v or 0) > 0 and t < a.onset]
+        if not any((errs.get(t) or 0.0) < a.threshold for t, _ in busy):
+            first = min((t for t, v in traffic[a.node] if (v or 0) > 0), default=a.onset)
+            a.standing = (f"abnormal in every minute it had work since it first got work at {iso(first)}; "
+                          "never seen healthy, so this is not when the incident began")
+    if all(a.standing for a in anomalies):
+        for a in anomalies:
+            a.standing = ""
 
 
 def incident_window(anomalies: list[Anomaly], components: list[set[str]] | None,
@@ -186,11 +225,17 @@ def incident_window(anomalies: list[Anomaly], components: list[set[str]] | None,
                     best, best_n = comp, n
             if best:
                 group = [a for a in anomalies if a.node in best]
+        # A signal that was never seen healthy has no onset to offer; anchor on
+        # the ones that were, when there are any.
+        group = [a for a in group if not a.standing] or group
         first = min(group, key=lambda a: a.onset)
         onset = first.onset
         lh = first.last_normal or lookback_start
         w.onset, w.last_healthy, w.method = iso(onset), iso(lh), "metrics"
         w.signals = [a.to_dict() for a in sorted(group, key=lambda a: a.onset)][:12]
+        standing = [a for a in anomalies if a.standing]
+        if standing:
+            w.signals += [a.to_dict() for a in standing][:4]
         if not first.last_normal:
             w.note = ("the first signal was already abnormal at the start of the lookback: "
                       "the last healthy point is unknown, so older changes stay in play")

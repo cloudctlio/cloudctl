@@ -23,6 +23,11 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+# Replay the diff-first code of the checkout this script sits in, not whatever
+# cloudctl the venv has installed (that may be another branch).
+if (REPO / "cloudctl" / "debug" / "diff_first").is_dir():
+    sys.path.insert(0, str(REPO))
 
 
 def _has_resources(p: Path) -> bool:
@@ -65,10 +70,12 @@ def show(r: dict) -> str:
     lines.append("window " + json.dumps({k: w.get(k) for k in
                                          ("last_healthy", "onset", "start", "end", "metrics_end", "method")}))
     for s in w.get("signals") or []:
-        lines.append(f"  signal {s.get('node')} {s.get('metric')} onset {s.get('onset')} last_normal {s.get('last_normal')}")
+        lines.append(f"  signal {s.get('node')} {s.get('metric')} onset {s.get('onset')} last_normal {s.get('last_normal')}"
+                     + (" [STANDING]" if s.get("standing") else ""))
     for s in r.get("symptoms") or []:
         lines.append(f"symptom {s['id']} {s['kind']} {s['node']}: {s['detail'][:110]}"
-                     + (" [MAY BE OVER]" if s.get("may_be_over") else ""))
+                     + (" [MAY BE OVER]" if s.get("may_be_over") else "")
+                     + (" [STANDING]" if s.get("standing") else ""))
     for c in (r.get("changes") or [])[-40:]:
         flags = ",".join(f for f in ("restores", "one_off") if c.get(f))
         lines.append(f"  {c['time']} {c['event_name'][:30]:30} {c['resource_name'][:30]:30} {c['status']} {flags}")
@@ -95,6 +102,8 @@ def main() -> int:
     if state is None:
         sys.exit("no Terraform state with resources found (tried --state, runs/<id>.tfstate.json, "
                  "app/terraform.tfstate, app/terraform.tfstate.backup)")
+    import cloudctl.debug.diff_first as df  # noqa: PLC0415
+    print(f"cloudctl code: {Path(df.__file__).resolve().parent}")
     print(f"state: {state}")
     print(show(replay(a.scenario, runs, app, state)))
     return 0

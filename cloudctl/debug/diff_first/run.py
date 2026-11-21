@@ -26,7 +26,8 @@ from cloudctl.debug.diff_first.iac import BaselineAdapter, load_expected_state
 from cloudctl.debug.diff_first.live import NOT_FOUND
 from cloudctl.debug.diff_first.model import to_dt
 from cloudctl.debug.diff_first.topology import build_topology
-from cloudctl.debug.diff_first.window import METRICS, detect_anomaly, fill, incident_window, metric_queries
+from cloudctl.debug.diff_first.window import (METRICS, detect_anomaly, fill, incident_window, mark_standing,
+                                              metric_queries)
 
 log = logging.getLogger("cloudctl.diff_first")
 
@@ -125,6 +126,7 @@ def run_diff_first(live: Any, iac_root: str | None = None, account: str = "", re
             a = detect_anomaly(s, role, node=node, metric=metric)
             if a:
                 anomalies.append(a)
+    mark_standing(anomalies, {n: roles["in"] for n, roles in series.items() if roles.get("in")})
     window = incident_window(anomalies, topo.components(), period, start,
                              override_onset=onset_override, metrics_end=metric_end)
     rep.window = window.to_dict()
@@ -246,6 +248,9 @@ def prompt_text(d: dict, max_chars: int = 3500) -> str:
         if s.get("may_be_over"):
             lines.append(f"- Symptom {s['id']} ({s['kind']}), MAY BE OVER: {s['detail']}. "
                          f"{s['may_be_over']}")
+        elif s.get("standing"):
+            lines.append(f"- Symptom {s['id']} ({s['kind']}), STANDING: {s['detail']}; {s['standing']}. "
+                         "It is not required to be explained by a change in the window.")
         else:
             lines.append(f"- Symptom {s['id']} ({s['kind']}): {s['detail']}")
     for c in ex.get("causes") or []:
@@ -385,6 +390,9 @@ def apply_to_report(report: dict, d: dict | None) -> dict:
     over = [s for s in d.get("symptoms") or [] if s.get("may_be_over")]
     if over:
         out["diff_first"]["may_be_over"] = [f"{s['id']}: {s['detail']}" for s in over]
+    standing = [s for s in d.get("symptoms") or [] if s.get("standing") and not s.get("may_be_over")]
+    if standing:
+        out["diff_first"]["standing"] = [f"{s['id']}: {s['detail']}" for s in standing]
     if d.get("recording_error"):
         out["diff_first"]["recording_error"] = d["recording_error"]
     text = " ".join([str(out.get("root_cause", ""))] + [str(e) for e in out.get("evidence") or []]).lower()

@@ -474,7 +474,8 @@ def score(sid: str | None) -> None:
     subprocess.run(cmd)
 
 
-_DF_GROUPS = ("causes", "likely_reverts", "one_off_actions", "unchecked_leads", "may_be_over", "unexplained")
+_DF_GROUPS = ("causes", "likely_reverts", "one_off_actions", "unchecked_leads", "may_be_over", "standing",
+              "unexplained")
 
 
 def summary(runs: Path) -> str:
