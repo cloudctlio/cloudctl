@@ -174,3 +174,11 @@ def test_audit_verify_detects_tampering(tmp_path):
     log.write_text("\n".join(lines) + "\n")
     r = _run("audit", "verify")
     assert r.exit_code == 1 and "BROKEN" in r.output
+
+
+def test_engines_honours_a_configured_binary_path(tmp_path):
+    from cloudctl.commands.gate_cmd import _installed
+    exe = tmp_path / "checkov.exe"
+    exe.write_text("")
+    assert _installed("checkov", str(exe)) == "yes"
+    assert _installed("checkov", str(tmp_path / "missing")).startswith("no (")

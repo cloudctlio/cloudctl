@@ -165,8 +165,10 @@ _MODULES = {"rego": "regopy", "aws_native": "boto3", "azure_native": "azure.mgmt
             "gcp_native": "googleapiclient"}
 
 
-def _installed(name: str) -> str:
+def _installed(name: str, binary: str = "") -> str:
     if name in _BINARIES:
+        if binary:                                    # a configured path wins over PATH
+            return "yes" if os.path.isfile(binary) else f"no ({binary} not found)"
         return "yes" if shutil.which(_BINARIES[name]) else "no (binary not on PATH)"
     mod = _MODULES.get(name)
     if name == "rego" and shutil.which("opa"):
@@ -191,7 +193,8 @@ def engines(path: Optional[str] = _CONFIG_OPT) -> None:
     for n in ENGINE_NAMES:
         e = cfg.policy.engines.get(n)
         pin = str(e.params.get("version", "")) if e else ""
-        t.add_row(n, "yes" if engine_enabled(cfg.policy, n) else "no", pin or "-", _installed(n),
+        binary = str(e.params.get("binary", "")) if e else ""
+        t.add_row(n, "yes" if engine_enabled(cfg.policy, n) else "no", pin or "-", _installed(n, binary),
                   ENGINE_LICENCES.get(n, ""))
     console.print(t)
 
