@@ -28,7 +28,7 @@ jobs:
 
       - name: Install package and run tests
         run: |
-          pip install -e . pytest pytest-cov
+          pip install -e ".[gate]" pytest pytest-cov
           pytest tests/ -q --no-header
 
       - name: Build package
