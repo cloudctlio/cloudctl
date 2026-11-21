@@ -393,3 +393,25 @@ def test_scorer_flags_a_root_cause_that_also_blames_a_leftover_fault():
     r = subprocess.run([sys.executable, str(score), "--selftest"], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stdout[-1500:]
     assert "s5.partial-blames-leftover.json: want PARTIAL, got PARTIAL" in r.stdout
+
+
+def test_replay_script_works_after_teardown(tmp_path):
+    # e2e/complex-app/replay_diff_first.py replays a run's recorded diff-first
+    # inputs offline. After teardown terraform.tfstate lists nothing, so it
+    # falls back to terraform.tfstate.backup.
+    state, data = ht.build("s5", inj_ago=2.5, run3=True)
+    runs, app = tmp_path / "runs", tmp_path / "app"
+    runs.mkdir(), app.mkdir()
+    (runs / "s5.diff-first.json").write_text(json.dumps(data))
+    (app / "main.tf").write_text("# app\n")
+    (app / "terraform.tfstate").write_text(json.dumps({**state, "resources": []}))
+    (app / "terraform.tfstate.backup").write_text(json.dumps(state))
+    script = Path(__file__).resolve().parents[1] / "e2e" / "complex-app" / "replay_diff_first.py"
+    env = {**__import__("os").environ, "CLOUDCTL_HOME": str(tmp_path / "home"), "HOME": str(tmp_path)}
+    r = subprocess.run([sys.executable, str(script), "s5", "--runs", str(runs), "--app", str(app)],
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 0, r.stderr[-1500:]
+    assert "terraform.tfstate.backup" in r.stdout
+    assert "likely_reverts: UpdateFunctionConfiguration" in r.stdout
+    assert "one_off_actions: PurgeQueue" in r.stdout
+    assert "unplaced_drift:" in r.stdout
