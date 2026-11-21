@@ -236,3 +236,16 @@ esac
     assert "--strict-builtin-errors" in log.read_text()
     with pytest.raises(EngineError, match="version mismatch"):
         OpaBinaryBackend(binary_path=str(d / "opa"), pinned_version="0.60.0")
+
+
+def test_scanner_env_keeps_windows_startup_vars_and_no_credentials(monkeypatch):
+    from cloudctl.gate.policy import scanners as sc
+    for k, v in {"SYSTEMROOT": r"C:\\Windows", "TEMP": r"C:\\t", "AWS_SECRET_ACCESS_KEY": "x",
+                 "AZURE_CLIENT_SECRET": "y"}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(sc.os, "name", "nt")
+    env = sc.scanner_env()
+    assert env["SYSTEMROOT"] and env["TEMP"] and env["PYTHONUTF8"] == "1"
+    assert "AWS_SECRET_ACCESS_KEY" not in env and "AZURE_CLIENT_SECRET" not in env
+    monkeypatch.setattr(sc.os, "name", "posix")
+    assert "SYSTEMROOT" not in sc.scanner_env() and "PYTHONUTF8" not in sc.scanner_env()

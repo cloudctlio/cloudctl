@@ -45,7 +45,7 @@ def run_tool(argv: Sequence[str], *, cwd: Path | str, env: Mapping[str, str],
     try:
         p = subprocess.run(  # noqa: S603 — argv list, no shell
             list(argv), cwd=str(cwd), env=dict(env), capture_output=True, text=True,
-            timeout=timeout, check=False,
+            encoding="utf-8", errors="replace", timeout=timeout, check=False,
         )
     except FileNotFoundError as e:
         raise PlanError(f"{what or argv[0]}: binary not found ({e})") from e
