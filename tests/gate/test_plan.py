@@ -67,6 +67,7 @@ def test_bad_terraform_plans_are_refused(doc, msg):
         parse_show_json(doc, environment="dev")
 
 
+@pytest.mark.posix_only
 def test_terraform_planner_runs_the_tool_with_scoped_env_only(tmp_path, monkeypatch):
     root = tmp_path / "iac"
     root.mkdir()

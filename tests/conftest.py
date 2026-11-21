@@ -1,12 +1,31 @@
 """Shared fixtures for cloudctl tests."""
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from cloudctl.config.manager import ConfigManager
+
+# Tests that run a "#!/bin/sh" stand-in for a CLI, or check POSIX file modes,
+# cannot work on Windows. Mark them @pytest.mark.posix_only; they are skipped
+# there with this reason instead of failing.
+POSIX_ONLY_REASON = "needs POSIX: runs a /bin/sh stand-in or checks chmod modes"
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", f"posix_only: {POSIX_ONLY_REASON}; skipped on Windows")
+
+
+def pytest_collection_modifyitems(config, items):
+    if os.name != "nt":
+        return
+    skip = pytest.mark.skip(reason=POSIX_ONLY_REASON)
+    for item in items:
+        if "posix_only" in item.keywords:
+            item.add_marker(skip)
 
 
 # ── Fake data factories ────────────────────────────────────────────────────────

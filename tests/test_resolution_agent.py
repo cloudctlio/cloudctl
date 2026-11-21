@@ -22,13 +22,15 @@ def _sh(cmd, cwd):
 
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("needs POSIX: puts /bin/sh stand-ins for terraform and gh on PATH")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for name, body in {"terraform": "echo ok", "gh": "echo https://example.invalid/pr/1"}.items():
         f = bin_dir / name
         f.write_text(f"#!/bin/sh\n{body}\n")
         f.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("CLOUDCTL_TERRAFORM_BIN", str(bin_dir / "terraform"))
     for k, v in _GIT_ENV.items():
         monkeypatch.setenv(k, v)

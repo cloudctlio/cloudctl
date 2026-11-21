@@ -161,10 +161,10 @@ resource "azurerm_cosmosdb_sql_role_assignment" "service" {
   scope               = "${azurerm_cosmosdb_account.state.id}/dbs/${azurerm_cosmosdb_sql_database.state.name}/colls/${azurerm_cosmosdb_sql_container.state.name}"
 }
 
+# Owner, scoped to this one container: setting a per-blob immutability policy on upload
+# needs blobs/* data actions that Data Contributor lacks. Immutability still stops deletes.
 resource "azurerm_role_assignment" "audit" {
-  scope                = azurerm_storage_container.audit.resource_manager_id
-  # Owner, scoped to this one container: setting a per-blob immutability policy on upload
-  # needs blobs/* data actions that Data Contributor lacks. Immutability still stops deletes.
+  scope                = azurerm_storage_container.audit.id # the ARM id when storage_account_id is used
   role_definition_name = "Storage Blob Data Owner"
   principal_id         = azurerm_user_assigned_identity.service.principal_id
 }

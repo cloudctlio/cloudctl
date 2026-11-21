@@ -102,6 +102,7 @@ def _with_path(monkeypatch, d):
     monkeypatch.setenv("PATH", f"{d}{os.pathsep}{os.environ['PATH']}")
 
 
+@pytest.mark.posix_only
 def test_trivy_adapter_runs_with_pin_and_no_cloud_creds(tmp_path, monkeypatch):
     out = tmp_path / "trivy.json"
     out.write_text(json.dumps(TRIVY))
@@ -126,6 +127,7 @@ cat {out}
         TrivyEngine.from_params({"version": "0.50.0"}).evaluate(ctx)
 
 
+@pytest.mark.posix_only
 def test_checkov_adapter_scans_the_plan_json(tmp_path, monkeypatch):
     out = tmp_path / "ck.json"
     out.write_text(json.dumps(CHECKOV))
@@ -146,6 +148,7 @@ cat {out}
     assert "--skip-download" in argv and "MAP=TRUE" in argv
 
 
+@pytest.mark.posix_only
 def test_cfn_guard_adapter_exit_codes(tmp_path, monkeypatch):
     out = tmp_path / "g.json"
     out.write_text(json.dumps(GUARD))
@@ -164,6 +167,7 @@ def test_cfn_guard_adapter_exit_codes(tmp_path, monkeypatch):
         eng.evaluate(ctx)
 
 
+@pytest.mark.posix_only
 def test_kyverno_adapter(tmp_path, monkeypatch):
     out = tmp_path / "k.yaml"
     out.write_text(KYVERNO)
@@ -178,6 +182,7 @@ def test_kyverno_adapter(tmp_path, monkeypatch):
     assert got[0].severity == Severity.HIGH
 
 
+@pytest.mark.posix_only
 def test_infracost_needs_a_key_and_sets_cost_facts(tmp_path, monkeypatch):
     out = tmp_path / "i.json"
     out.write_text(json.dumps(INFRACOST))
@@ -214,6 +219,7 @@ def test_scanner_config_errors():
         TrivyEngine.from_params({"extra_args": "--oops"})
 
 
+@pytest.mark.posix_only
 def test_opa_binary_backend_restricts_capabilities(tmp_path, monkeypatch):
     from cloudctl.gate.policy.rego import OpaBinaryBackend
     caps = {"builtins": [{"name": "http.send"}, {"name": "concat"}, {"name": "time.now_ns"}], "allow_net": ["*"]}

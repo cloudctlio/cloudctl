@@ -40,7 +40,8 @@ def test_init_writes_valid_private_config_for_each_cloud(tmp_path, args):
     r = _run("init", *args)
     assert r.exit_code == 0, r.output
     path = tmp_path / "cp.yaml"
-    assert os.stat(path).st_mode & 0o077 == 0
+    if os.name != "nt":                                   # Windows has no POSIX modes
+        assert os.stat(path).st_mode & 0o077 == 0
     cfg = parse_config(yaml.safe_load(path.read_text()))
     assert cfg.environment("dev").tier == "dev"
     assert _run("init", *args).exit_code == 1            # refuses to overwrite
@@ -126,7 +127,8 @@ def _approval_setup(tmp_path, approver="bob"):
 def test_keygen_refuses_overwrite(tmp_path):
     key = tmp_path / "k.pem"
     assert _run("keygen", "--approver", "bob", "--out", str(key), "--no-passphrase").exit_code == 0
-    assert os.stat(key).st_mode & 0o077 == 0
+    if os.name != "nt":                                   # Windows has no POSIX modes
+        assert os.stat(key).st_mode & 0o077 == 0
     assert _run("keygen", "--approver", "bob", "--out", str(key), "--no-passphrase").exit_code == 1
 
 

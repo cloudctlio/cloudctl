@@ -18,7 +18,7 @@ git checkout feat/gate-stage4-service        # read-only use: no commits, no pus
 ## 2. Local checks (nothing in AWS)
 
 ```bash
-.venv/Scripts/python -m pytest tests -q                 # 1 known failure: test_time_budget outer ceiling
+.venv/Scripts/python -m pytest tests -q -p no:cacheprovider   # 1 known failure (test_time_budget outer ceiling); POSIX-only tests are skipped on Windows
 .venv/Scripts/bandit -r cloudctl/ -ll -x tests/
 .venv/Scripts/pip-audit --ignore-vuln CVE-2026-4539
 TF=/c/Users/haris/bin/terraform1.exe

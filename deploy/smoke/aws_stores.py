@@ -85,10 +85,24 @@ def s3_audit(bucket: str, kms_key: str | None, region: str, profile: str | None,
     log.append("smoke.second", {"note": "live check"})
     res = log.verify()
     check(f"s3: two records written and the chain verifies ({res.records} records)", res.ok and res.records == 2)
+    # Read the lock back from S3 itself rather than estimating it.
     from datetime import datetime, timedelta, timezone
-    until = (datetime.now(timezone.utc) + timedelta(days=retain_days, minutes=5)).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"NOTE  s3://{bucket}/cctl-smoke/{chain}/ holds 2 objects locked until about {until}; "
-          "the bucket cannot be deleted before then")
+    client = getattr(backend, "client", None)
+    keys = list(backend.list_keys(sink.base))
+    check("s3: two objects stored", len(keys) == 2)
+    if client is not None:
+        latest = None
+        for k in keys:
+            h = client.head_object(Bucket=bucket, Key=k)
+            until = h.get("ObjectLockRetainUntilDate")
+            check(f"s3: {k.rsplit('/', 1)[-1]} is locked in COMPLIANCE mode", h.get("ObjectLockMode") == "COMPLIANCE")
+            expected = datetime.now(timezone.utc) + timedelta(days=retain_days)
+            check(f"s3: {k.rsplit('/', 1)[-1]} retain-until is about {retain_days} day(s) out",
+                  until is not None and abs((until - expected).total_seconds()) < 3600)
+            latest = until if latest is None or until > latest else latest
+        print(f"NOTE  s3://{bucket}/{sink.base} holds 2 objects locked until "
+              f"{latest.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} (read from S3; now is "
+              f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}); the bucket cannot be deleted before then")
 
 
 def delete_smoke_objects(bucket: str, region: str, profile: str | None) -> None:

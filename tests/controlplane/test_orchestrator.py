@@ -72,7 +72,8 @@ def test_failed_node_skips_downstream_queues_targeted_rollback_and_never_retries
     [rb] = QueuedRollback(tmp_path / "rb").pending()
     assert rb["node_id"] == "db" and rb["target"] == {"iac_root": str(roots["db"])}
     assert rb["applied_before"] == ["net"] and n["db"].rollback_id == rb["id"]
-    assert stat.S_IMODE(os.stat(tmp_path / "rb" / f"{rb['id']}.json").st_mode) == 0o600
+    if os.name != "nt":                                   # Windows has no POSIX modes
+        assert stat.S_IMODE(os.stat(tmp_path / "rb" / f"{rb['id']}.json").st_mode) == 0o600
     assert "orchestrator.rollback.requested" in _events(gate)
 
     again = orch.resume(run.run_id)                               # resume does not re-run a failed node
@@ -206,8 +207,9 @@ def test_store_is_private_atomic_and_rejects_bad_ids(tmp_path):
     run = S.RunState.new(g.to_dict(), g.digest(), "alice", g.order())
     store.save(run)
     p = tmp_path / "runs" / f"{run.run_id}.json"
-    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
-    assert stat.S_IMODE(os.stat(tmp_path / "runs").st_mode) == 0o700
+    if os.name != "nt":                                   # Windows has no POSIX modes
+        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(tmp_path / "runs").st_mode) == 0o700
     assert store.load(run.run_id).nodes["a"].status == S.PENDING
     assert [r.run_id for r in store.list()] == [run.run_id]
     assert not list((tmp_path / "runs").glob(".run-*"))

@@ -145,6 +145,7 @@ def test_model_declines_with_reason(tf, no_tools):
     assert out["status"] == "no_edit" and out["detail"] == "fix is in app code"
 
 
+@pytest.mark.posix_only
 def test_terraform_check_passes_or_fails_with_a_stand_in_binary(tf, tmp_path, monkeypatch):
     fake = tmp_path / "terraform"
     edit = {"edits": [{"file": "variables.tf", "old": "  default = 1", "new": "  default = 10"}]}
@@ -174,7 +175,7 @@ _CDK_PY = Path(os.environ.get("CCTL_TEST_CDK_PYTHON", "/nonexistent/python3"))
 
 @pytest.mark.skipif(not _CDK_PY.exists(), reason="set CCTL_TEST_CDK_PYTHON to a python with aws-cdk-lib")
 def test_cdk_synth_check_runs_the_app_on_a_temp_copy(cdk, monkeypatch):
-    monkeypatch.setenv("PATH", f"{_CDK_PY.parent}:{os.environ['PATH']}")
+    monkeypatch.setenv("PATH", f"{_CDK_PY.parent}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.delenv("CLOUDCTL_CDK_BIN", raising=False)
     monkeypatch.setattr(iac_fix.shutil, "which", lambda n: None if n == "cdk" else shutil.which(n))
     good = {"edits": [{"file": "stacks/orders_stack.py", "old": "            write_capacity=1,",
@@ -190,7 +191,7 @@ def test_cdk_synth_check_runs_the_app_on_a_temp_copy(cdk, monkeypatch):
 # ── CLI wiring ────────────────────────────────────────────────────────────────
 
 def test_cli_agent_shows_fix_and_keeps_confidence(tf, tmp_path, no_tools, monkeypatch):
-    monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}:/usr/bin:/bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(Path(sys.executable).parent), "/usr/bin", "/bin"]))
     from typer.testing import CliRunner
     from cloudctl.main import app
     client = _model({"edits": [{"file": "variables.tf", "old": "  default = 1", "new": "  default = 10"}],

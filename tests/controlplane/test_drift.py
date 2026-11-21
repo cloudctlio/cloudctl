@@ -202,7 +202,8 @@ def test_store_is_private_atomic_and_locked(tmp_path):
                       items=[], reasons=[])
     st.save(ev)
     p = tmp_path / "d" / f"{ev.id}.json"
-    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    if os.name != "nt":                                   # Windows has no POSIX modes
+        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
     assert st.load(ev.id).to_dict() == ev.to_dict()
     with pytest.raises(KeyError):
         st.load("../../etc/passwd")
